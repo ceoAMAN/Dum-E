@@ -24,33 +24,52 @@ def _is_colab() -> bool:
 
 HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
 
-EXPERT_MODEL_ID = "Qwen/Qwen2.5-7B-Instruct"
-GATE_MODEL_ID = "meta-llama/Llama-3.3-70B-Instruct"
-CENTRAL_MODEL_ID = "Qwen/Qwen2.5-72B-Instruct"
+EXPERT_MODEL_ID = "Qwen/Qwen2.5-0.5B-Instruct"
+GATE_MODEL_ID = "Qwen/Qwen2.5-1.5B-Instruct"
+CENTRAL_MODEL_ID = "Qwen/Qwen2.5-3B-Instruct"
 
-EXPERT_TRAIN_MODEL_ID = "microsoft/phi-2"
-GATE_TRAIN_MODEL_ID = "microsoft/phi-2"
-CENTRAL_TRAIN_MODEL_ID = "microsoft/phi-2"
+EXPERT_TRAIN_MODEL_ID = "Qwen/Qwen2.5-0.5B-Instruct"
+GATE_TRAIN_MODEL_ID = "Qwen/Qwen2.5-1.5B-Instruct"
+CENTRAL_TRAIN_MODEL_ID = "Qwen/Qwen2.5-3B-Instruct"
 
-NUM_EXPERTS = 50
+NUM_EXPERTS = 240
 EXPERT_GROUPS = {
-    "general": list(range(0, 13)),
-    "reasoning": list(range(13, 26)),
-    "code": list(range(26, 38)),
-    "instruction": list(range(38, 50)),
+    "A": list(range(0, 15)),
+    "B": list(range(15, 30)),
+    "C": list(range(30, 45)),
+    "D": list(range(45, 60)),
+    "E": list(range(60, 75)),
+    "F": list(range(75, 90)),
+    "G": list(range(90, 105)),
+    "H": list(range(105, 120)),
+    "I": list(range(120, 135)),
+    "J": list(range(135, 150)),
+    "K": list(range(150, 165)),
+    "L": list(range(165, 180)),
+    "M": list(range(180, 195)),
+    "N": list(range(195, 210)),
+    "O": list(range(210, 225)),
+    "P": list(range(225, 240)),
 }
 
-EXPERT_D_MODEL = 3584
-GATE_D_MODEL = 8192
-CENTRAL_D_MODEL = 8192
+# The MLX 4-bit config sizes
+QUANT_BITS = 4
+EXPERT_RAM_MB = 125
+
+EXPERT_D_MODEL = 896
+GATE_D_MODEL = 1536
+CENTRAL_D_MODEL = 2048
+
+NATIVE_MODE = os.environ.get('STURNUS_NATIVE', '0') == '1'
 
 K_MIN = 0
 K_MAX = 20
 K_DEFAULT = 4
 FAST_PATH_THRESHOLD = 0.85
 
-X_DEFAULT = 2
-X_MAX = 5
+X_MIN = 19
+X_DEFAULT = 19
+X_MAX = 104
 Y_MAX = 25
 
 TIMELINE_B_BUDGET_SECS = 10.0
@@ -63,17 +82,27 @@ LEARNING_RATE = 2e-4
 MAX_SEQ_LEN = 512
 
 DATASET_WEIGHTS = {
-    "fineweb": 0.50,
-    "arxiv": 0.20,
-    "starcoder": 0.20,
-    "slimorca": 0.10,
+    "fineweb": 0.125,
+    "arxiv": 0.125,
+    "code_search_net": 0.125,
+    "dolma": 0.125,
+    "math": 0.0625,
+    "gsm8k": 0.0625,
+    "openhermes": 0.125,
+    "c4": 0.125,
+    "medqa": 0.125,
 }
 
 DATASET_IDS = {
     "fineweb": ("HuggingFaceFW/fineweb", "default"),
     "arxiv": ("Intelligent-Internet/arxiv", None),
-    "starcoder": ("bigcode/starcoderdata", "python"),
-    "slimorca": ("Open-Orca/SlimOrca", None),
+    "code_search_net": ("code_search_net", "all"),
+    "dolma": ("allenai/dolma", None),
+    "math": ("lighteval/MATH", "all"),
+    "gsm8k": ("gsm8k", "main"),
+    "openhermes": ("teknium/OpenHermes-2.5", None),
+    "c4": ("allenai/c4", "en"),
+    "medqa": ("GBaker/MedQA-USMLE-4-options", None),
 }
 
 UTILIZATION_WINDOW = 1000
@@ -125,8 +154,8 @@ CONFIG_SNAPSHOT = ConfigSnapshot(
 
 
 def validate_config() -> None:
-    if NUM_EXPERTS != 50:
-        raise ValueError("NUM_EXPERTS must be 50.")
+    if NUM_EXPERTS != 240:
+        raise ValueError("NUM_EXPERTS must be 240.")
     total_groups = sum(len(v) for v in EXPERT_GROUPS.values())
     if total_groups != NUM_EXPERTS:
         raise ValueError("EXPERT_GROUPS must cover all experts exactly.")

@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import config
+import configs
 import data
 from scripts.train_common import build_model, resolve_model_id
 
@@ -33,7 +33,7 @@ def _cross_expert_alignment_loss(hidden_batch: torch.Tensor) -> torch.Tensor:
 
 def run() -> None:
     print("[train_phase3] Expert fine-tuning (3 losses)")
-    model_id = resolve_model_id(config.EXPERT_TRAIN_MODEL_ID)
+    model_id = resolve_model_id(configs.EXPERT_TRAIN_MODEL_ID)
     batch_size = int(os.getenv("STURNUS_TRAIN_BATCH_SIZE", "2"))
     max_steps = int(os.getenv("STURNUS_TRAIN_STEPS", "50"))
     grad_accum = int(os.getenv("STURNUS_TRAIN_ACCUM", "4"))
@@ -45,7 +45,7 @@ def run() -> None:
     _group_limit_env = os.getenv("STURNUS_EXPERT_GROUP_LIMIT")
     group_limit: Optional[int] = int(_group_limit_env) if _group_limit_env else None
 
-    for idx, group_name in enumerate(config.EXPERT_GROUPS.keys()):
+    for idx, group_name in enumerate(configs.EXPERT_GROUPS.keys()):
         if group_limit is not None and idx >= group_limit:
             break
         print(f"[train_phase3] training group {group_name}")
@@ -53,7 +53,7 @@ def run() -> None:
             group_name=group_name,
             model_id=model_id,
             batch_size=batch_size,
-            max_length=config.MAX_SEQ_LEN,
+            max_length=configs.MAX_SEQ_LEN,
         )
 
         def _to_torch(batch):  # pyre-ignore[3]
@@ -65,8 +65,8 @@ def run() -> None:
         model.to(device)  # pyre-ignore[16]
         model.train()
 
-        optimizer = torch.optim.AdamW(model.parameters(), lr=config.LEARNING_RATE)
-        out_dir = config.CHECKPOINT_DIR / "experts" / group_name
+        optimizer = torch.optim.AdamW(model.parameters(), lr=configs.LEARNING_RATE)
+        out_dir = configs.CHECKPOINT_DIR / "experts" / group_name
         out_dir.mkdir(parents=True, exist_ok=True)
 
         step = 0

@@ -11,7 +11,7 @@ import torch
 from peft import LoraConfig, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-import config
+import configs
 
 
 @dataclass
@@ -54,9 +54,9 @@ def build_model(model_id: str, lora: bool = True) -> torch.nn.Module:
     model = AutoModelForCausalLM.from_pretrained(model_id, trust_remote_code=True)
     if lora:
         lora_cfg = LoraConfig(
-            r=config.LORA_R,
-            lora_alpha=config.LORA_ALPHA,
-            lora_dropout=config.LORA_DROPOUT,
+            r=configs.LORA_R,
+            lora_alpha=configs.LORA_ALPHA,
+            lora_dropout=configs.LORA_DROPOUT,
             bias="none",
             task_type="CAUSAL_LM",
         )

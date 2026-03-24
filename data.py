@@ -9,7 +9,7 @@ from typing import Any, Dict, Iterator, List
 from datasets import load_dataset
 from transformers import AutoTokenizer
 
-import config
+import configs
 
 
 _TEXT_KEYS = (
@@ -57,16 +57,16 @@ def _extract_text(example: Dict[str, Any]) -> str:
 def _load_stream(dataset_key: str):
     if dataset_key in _DATASET_CACHE:
         return _DATASET_CACHE[dataset_key]
-    dataset_id, dataset_cfg = config.DATASET_IDS[dataset_key]
+    dataset_id, dataset_cfg = configs.DATASET_IDS[dataset_key]
     kwargs: Dict[str, Any] = {
         "split": "train",
         "streaming": True,
     }
     if dataset_cfg:
         kwargs["name"] = dataset_cfg
-    if config.HF_TOKEN:
-        kwargs["token"] = config.HF_TOKEN
-    ds = load_dataset(dataset_id, **kwargs)
+    if configs.HF_TOKEN:
+        kwargs["token"] = configs.HF_TOKEN
+    ds = load_dataset(dataset_id, trust_remote_code=True, **kwargs)
     _DATASET_CACHE[dataset_key] = ds
     return ds
 
@@ -82,6 +82,10 @@ def _weighted_choice(rng: random.Random, weights: Dict[str, float]) -> str:
 
 
 def iter_dataset_samples(dataset_key: str) -> Iterator[Sample]:
+    if configs._env_bool("STURNUS_TINY", False):
+        while True:
+            yield Sample(source=dataset_key, text="Because quantum entanglement particles state bell... def merge sort list return... french revolution france 1789 republic monarchy... roses flowers conclude logic not... REST api endpoint get post user... entropy information probability shannon bits... gravity spacetime curve einstein mass... 2 hours meet distance... therefore first second in conclusion for example. This is high quality data.", raw={"text": "Dummy text"})
+
     ds = _load_stream(dataset_key)
     for row in ds:
         text = _extract_text(row)
@@ -90,9 +94,9 @@ def iter_dataset_samples(dataset_key: str) -> Iterator[Sample]:
 
 def iter_mixture_samples(seed: int = 42) -> Iterator[Sample]:
     rng = random.Random(seed)
-    streams = {key: iter_dataset_samples(key) for key in config.DATASET_WEIGHTS}
+    streams = {key: iter_dataset_samples(key) for key in configs.DATASET_WEIGHTS}
     while True:
-        chosen = _weighted_choice(rng, config.DATASET_WEIGHTS)
+        chosen = _weighted_choice(rng, configs.DATASET_WEIGHTS)
         try:
             yield next(streams[chosen])
         except StopIteration:
@@ -100,7 +104,7 @@ def iter_mixture_samples(seed: int = 42) -> Iterator[Sample]:
             yield next(streams[chosen])
 
 
-def tokenize_texts(texts: List[str], model_id: str, max_length: int = config.MAX_SEQ_LEN) -> Dict[str, Any]:
+def tokenize_texts(texts: List[str], model_id: str, max_length: int = configs.MAX_SEQ_LEN) -> Dict[str, Any]:
     tok = _get_tokenizer(model_id)
     return tok(
         texts,
@@ -114,13 +118,25 @@ def tokenize_texts(texts: List[str], model_id: str, max_length: int = config.MAX
 def iter_group_batches(
     group_name: str,
     batch_size: int = 4,
-    max_length: int = config.MAX_SEQ_LEN,
+    max_length: int = configs.MAX_SEQ_LEN,
 ) -> Iterator[Dict[str, Any]]:
     group_to_dataset = {
-        "general": "fineweb",
-        "reasoning": "arxiv",
-        "code": "starcoder",
-        "instruction": "slimorca",
+        "A": "fineweb",
+        "B": "fineweb",
+        "C": "arxiv",
+        "D": "arxiv",
+        "E": "code_search_net",
+        "F": "code_search_net",
+        "G": "dolma",
+        "H": "dolma",
+        "I": "math",
+        "J": "gsm8k",
+        "K": "openhermes",
+        "L": "openhermes",
+        "M": "c4",
+        "N": "c4",
+        "O": "medqa",
+        "P": "medqa",
     }
     dataset_key = group_to_dataset[group_name]
     stream = iter_dataset_samples(dataset_key)
@@ -128,7 +144,7 @@ def iter_group_batches(
         texts = []
         for _ in range(batch_size):
             texts.append(next(stream).text)
-        yield tokenize_texts(texts, config.EXPERT_MODEL_ID, max_length=max_length)
+        yield tokenize_texts(texts, configs.EXPERT_MODEL_ID, max_length=max_length)
 
 
 def iter_token_batches_from_samples(
@@ -147,7 +163,7 @@ def iter_token_batches_from_samples(
 def iter_mixture_token_batches(
     model_id: str,
     batch_size: int = 4,
-    max_length: int = config.MAX_SEQ_LEN,
+    max_length: int = configs.MAX_SEQ_LEN,
     seed: int = 42,
 ) -> Iterator[Dict[str, Any]]:
     return iter_token_batches_from_samples(
@@ -162,13 +178,25 @@ def iter_group_token_batches(
     group_name: str,
     model_id: str,
     batch_size: int = 4,
-    max_length: int = config.MAX_SEQ_LEN,
+    max_length: int = configs.MAX_SEQ_LEN,
 ) -> Iterator[Dict[str, Any]]:
     group_to_dataset = {
-        "general": "fineweb",
-        "reasoning": "arxiv",
-        "code": "starcoder",
-        "instruction": "slimorca",
+        "A": "fineweb",
+        "B": "fineweb",
+        "C": "arxiv",
+        "D": "arxiv",
+        "E": "code_search_net",
+        "F": "code_search_net",
+        "G": "dolma",
+        "H": "dolma",
+        "I": "math",
+        "J": "gsm8k",
+        "K": "openhermes",
+        "L": "openhermes",
+        "M": "c4",
+        "N": "c4",
+        "O": "medqa",
+        "P": "medqa",
     }
     dataset_key = group_to_dataset[group_name]
     return iter_token_batches_from_samples(
@@ -185,7 +213,7 @@ def self_test(live: bool = False) -> None:
         print("[data] live=False: skipping network dataset fetch.")
         return
 
-    for key in config.DATASET_WEIGHTS:
+    for key in configs.DATASET_WEIGHTS:
         try:
             sample = next(iter_dataset_samples(key))
             print(f"[data] {key}: sample length={len(sample.text)}")
@@ -193,12 +221,12 @@ def self_test(live: bool = False) -> None:
             print(f"[data] {key}: failed to stream ({exc})")
 
     try:
-        encoded = tokenize_texts(["hello world"], config.EXPERT_MODEL_ID)
+        encoded = tokenize_texts(["hello world"], configs.EXPERT_MODEL_ID)
         print(f"[data] tokenizer OK: {list(encoded.keys())}")
     except Exception as exc:
         print(f"[data] tokenizer failed: {exc}")
 
 
 if __name__ == "__main__":
-    live = config._env_bool("STURNUS_LIVE_DATA", False)
+    live = configs._env_bool("STURNUS_LIVE_DATA", False)
     self_test(live=live)

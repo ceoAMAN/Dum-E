@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional, Set
 import aiohttp
 import numpy as np
 
-import config
+import configs
 import inference
 from vectors import VectorBackend
 
@@ -47,9 +47,9 @@ class LRUCache:
 class ExpertPool:
     def __init__(self, max_cache: int = 2048) -> None:
         self.cache = LRUCache(max_size=max_cache)
-        self.utilization_counts = [0 for _ in range(config.NUM_EXPERTS)]
-        self.utilization_window: deque[List[int]] = deque(maxlen=config.UTILIZATION_WINDOW)
-        self.vector_backend = VectorBackend(mode=config.VECTOR_BACKEND, model_id=config.VECTOR_MODEL_ID)
+        self.utilization_counts = [0 for _ in range(configs.NUM_EXPERTS)]
+        self.utilization_window: deque[List[int]] = deque(maxlen=configs.UTILIZATION_WINDOW)
+        self.vector_backend = VectorBackend(mode=configs.VECTOR_BACKEND, model_id=configs.VECTOR_MODEL_ID)
 
     def _hash_input(self, text: str, context: str, expert_idx: int) -> str:
         h = hashlib.sha256()
@@ -80,20 +80,21 @@ class ExpertPool:
                 from_cache=True,
             )
 
-        if config.USE_MOCK_INFERENCE:
+        if configs.USE_MOCK_INFERENCE:
             output_text = text
         else:
             try:
-                output_text = await self._call_hf(config.EXPERT_MODEL_ID, text, session)
+                model_ref = f"expert_{expert_idx:03d}" if configs.NATIVE_MODE else configs.EXPERT_MODEL_ID
+                output_text = await self._call_hf(model_ref, text, session)
             except Exception as exc:
-                if config.DEBUG:
+                if configs.DEBUG:
                     print(f"[experts] HF call failed for expert {expert_idx}: {exc}")
                 output_text = text
 
         vec_result = await self.vector_backend.embed(
             session=session,
             text=output_text,
-            target_dim=config.EXPERT_D_MODEL,
+            target_dim=configs.EXPERT_D_MODEL,
             salt=f"expert-{expert_idx}",
         )
         vector = vec_result.vector
@@ -113,7 +114,7 @@ class ExpertPool:
         expert_indices: List[int],
         text: str,
         context: str,
-        x_concurrency: int = config.X_DEFAULT,
+        x_concurrency: int = configs.X_DEFAULT,
     ) -> List[ExpertOutput]:
         if not expert_indices:
             return []
@@ -141,7 +142,7 @@ class ExpertPool:
         total = sum(self.utilization_counts) or 1
         return [count / total for count in self.utilization_counts]
 
-    def least_used(self, threshold: float = config.UNDERUSE_THRESHOLD) -> List[int]:
+    def least_used(self, threshold: float = configs.UNDERUSE_THRESHOLD) -> List[int]:
         rates = self.utilization_rates()
         return [i for i, r in enumerate(rates) if r < threshold]
 
@@ -283,7 +284,7 @@ def self_test() -> None:
         print(f"[experts] outputs: {len(outs)}")
         print(f"[experts] cache hit: {pool.cache.get(pool._hash_input(text, context, 0)) is not None}")
 
-        central_vec = np.random.randn(config.CENTRAL_D_MODEL).astype(np.float32)
+        central_vec = np.random.randn(configs.CENTRAL_D_MODEL).astype(np.float32)
         comm = pool.expert_communication_phase(outs, central_vec, text, context)
         print(f"[experts] diversity={comm['diversity']:.3f} quality={comm['mean_quality']:.3f}")
 

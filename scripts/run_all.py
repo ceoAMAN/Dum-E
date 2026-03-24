@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import config
+import configs
 import data
 import experts
 import central
@@ -22,7 +22,7 @@ from scripts import validate
 
 def run_all(live_data: bool, train: bool) -> None:
     print("[run_all] Step 2: config validation")
-    config.validate_config()
+    configs.validate_config()
 
     print("[run_all] Step 3: data pipeline")
     data.self_test(live=live_data)
