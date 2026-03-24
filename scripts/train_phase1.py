@@ -12,14 +12,14 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import config
+import configs
 import data
 from scripts.train_common import TrainConfig, build_model, train_loop, resolve_model_id
 
 
 def run() -> None:
     print("[train_phase1] Central fine-tuning")
-    model_id = resolve_model_id(config.CENTRAL_TRAIN_MODEL_ID)
+    model_id = resolve_model_id(configs.CENTRAL_TRAIN_MODEL_ID)
 
     batch_size = int(os.getenv("STURNUS_TRAIN_BATCH_SIZE", "2"))
     max_steps = int(os.getenv("STURNUS_TRAIN_STEPS", "100"))
@@ -29,7 +29,7 @@ def run() -> None:
     batch_iter = data.iter_mixture_token_batches(
         model_id=model_id,
         batch_size=batch_size,
-        max_length=config.MAX_SEQ_LEN,
+        max_length=configs.MAX_SEQ_LEN,
         seed=42,
     )
 
@@ -40,16 +40,16 @@ def run() -> None:
 
     cfg = TrainConfig(
         model_id=model_id,
-        output_dir=config.CHECKPOINT_DIR / "central",
+        output_dir=configs.CHECKPOINT_DIR / "central",
         batch_size=batch_size,
         max_steps=max_steps,
         grad_accum_steps=grad_accum,
-        learning_rate=config.LEARNING_RATE,
-        max_length=config.MAX_SEQ_LEN,
+        learning_rate=configs.LEARNING_RATE,
+        max_length=configs.MAX_SEQ_LEN,
         device=device,
-        lora_r=config.LORA_R,
-        lora_alpha=config.LORA_ALPHA,
-        lora_dropout=config.LORA_DROPOUT,
+        lora_r=configs.LORA_R,
+        lora_alpha=configs.LORA_ALPHA,
+        lora_dropout=configs.LORA_DROPOUT,
         save_every=int(os.getenv("STURNUS_SAVE_EVERY", "0")),
     )
 

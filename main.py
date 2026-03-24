@@ -9,7 +9,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
-import config
+import configs
 from experts import ExpertPool
 from gating import GateRouter
 
@@ -42,7 +42,7 @@ class SturnusEngine:
 
         def _worker() -> None:
             start = time.time()
-            while time.time() - start < config.DEAD_TIME_MIN_SECS:
+            while time.time() - start < configs.DEAD_TIME_MIN_SECS:
                 if cancel_event.is_set():
                     return
                 time.sleep(0.05)
@@ -58,7 +58,7 @@ class SturnusEngine:
                         mode=1,
                         x_concurrency=x_concurrency,
                     ),
-                    timeout=config.TIMELINE_B_BUDGET_SECS,
+                    timeout=configs.TIMELINE_B_BUDGET_SECS,
                 )
 
             try:

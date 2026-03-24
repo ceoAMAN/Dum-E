@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
-import config
+import configs
 import central
 from experts import ExpertPool
 import inference
@@ -46,15 +46,15 @@ class RoutingEMA:
         self.decay = decay
         self.fast_path_rate = 0.0
         self.entropy = 0.0
-        self.per_expert_freq = np.zeros(config.NUM_EXPERTS, dtype=np.float64)
+        self.per_expert_freq = np.zeros(configs.NUM_EXPERTS, dtype=np.float64)
 
     def update(self, fast_path: bool, entropy: float, expert_indices: Optional[List[int]] = None) -> None:
         self.fast_path_rate = self.decay * self.fast_path_rate + (1 - self.decay) * float(fast_path)
         self.entropy = self.decay * self.entropy + (1 - self.decay) * entropy
         if expert_indices:
-            indicator = np.zeros(config.NUM_EXPERTS, dtype=np.float64)
+            indicator = np.zeros(configs.NUM_EXPERTS, dtype=np.float64)
             for idx in expert_indices:
-                if 0 <= idx < config.NUM_EXPERTS:
+                if 0 <= idx < configs.NUM_EXPERTS:
                     indicator[idx] = 1.0
             self.per_expert_freq = self.decay * self.per_expert_freq + (1 - self.decay) * indicator
 
@@ -62,25 +62,25 @@ class RoutingEMA:
 class GateRouter:
     def __init__(self, expert_pool: ExpertPool) -> None:
         self.expert_pool = expert_pool
-        self.fast_path_threshold = config.FAST_PATH_THRESHOLD
-        self.ema = RoutingEMA(decay=config.EMA_DECAY)
-        self.expert_bias = np.zeros(config.NUM_EXPERTS, dtype=np.float32)
+        self.fast_path_threshold = configs.FAST_PATH_THRESHOLD
+        self.ema = RoutingEMA(decay=configs.EMA_DECAY)
+        self.expert_bias = np.zeros(configs.NUM_EXPERTS, dtype=np.float32)
         self.memory = RoutingMemory()
-        mem_path = config.CHECKPOINT_DIR / "routing_memory.json"
+        mem_path = configs.CHECKPOINT_DIR / "routing_memory.json"
         self.memory.load(mem_path)
 
     def _mock_logits(self, text: str) -> np.ndarray:
         seed = int(hashlib.sha256(text.encode("utf-8")).hexdigest(), 16) % (2**32)
         rng = np.random.default_rng(seed)
-        return rng.standard_normal(config.NUM_EXPERTS).astype(np.float32)
+        return rng.standard_normal(configs.NUM_EXPERTS).astype(np.float32)
 
     def forward(self, text: str, context: str) -> GateOutput:
-        if not config.USE_MOCK_INFERENCE and config.GATE_MODE == "llm":
+        if not configs.USE_MOCK_INFERENCE and configs.GATE_MODE == "llm":
             llm_decision = self._call_gate_llm(text, context)
             if llm_decision is not None:
-                logits = np.full(config.NUM_EXPERTS, -3.0, dtype=np.float32)
+                logits = np.full(configs.NUM_EXPERTS, -3.0, dtype=np.float32)
                 for idx in llm_decision.expert_indices:
-                    if 0 <= idx < config.NUM_EXPERTS:
+                    if 0 <= idx < configs.NUM_EXPERTS:
                         logits[idx] = 2.0
                 return GateOutput(logits=logits, confidence=llm_decision.confidence)
 
@@ -90,7 +90,7 @@ class GateRouter:
         return GateOutput(logits=logits, confidence=confidence)
 
     def _call_gate_llm(self, text: str, context: str) -> Optional[GateLLMDecision]:
-        if not config.HF_TOKEN:
+        if not configs.HF_TOKEN:
             return None
         prompt = (
             "You are the Sturnus Gate. Return ONLY JSON with keys: "
@@ -99,14 +99,14 @@ class GateRouter:
             f"Input: {text}\\nContext: {context}"
         )
         generated = inference.hf_generate_sync(
-            model_id=config.GATE_MODEL_ID,
+            model_id=configs.GATE_MODEL_ID,
             prompt=prompt,
             max_new_tokens=128,
             temperature=0.0,
             do_sample=False,
         )
         if not generated:
-            if config.DEBUG:
+            if configs.DEBUG:
                 print("[gating] HF gate returned empty response")
             return None
         parsed = _parse_gate_json(generated)
@@ -132,8 +132,8 @@ class GateRouter:
             + 0.25 * entropy
             + 0.10 * (1.0 - context_signal)
         )
-        k = int(round(config.K_MIN + score * (config.K_MAX - config.K_MIN)))
-        return int(np.clip(k, config.K_MIN, config.K_MAX))
+        k = int(round(configs.K_MIN + score * (configs.K_MAX - configs.K_MIN)))
+        return int(np.clip(k, configs.K_MIN, configs.K_MAX))
 
     def select_experts(self, logits: np.ndarray, k: int, confidence: float, prompt: str = "") -> List[int]:
         if k <= 0:
@@ -146,14 +146,14 @@ class GateRouter:
             memory_suggestion = self.memory.suggest_experts(prompt, k)
             if memory_suggestion:
                 for idx in memory_suggestion[:k // 2]:
-                    if 0 <= idx < config.NUM_EXPERTS:
+                    if 0 <= idx < configs.NUM_EXPERTS:
                         adjusted[idx] += 1.0
 
         top_indices = list(np.argsort(adjusted)[-k:][::-1])
 
-        mask_slots = max(1, int(round(k * config.MASKING_RATE))) if k > 0 else 0
+        mask_slots = max(1, int(round(k * configs.MASKING_RATE))) if k > 0 else 0
         if mask_slots > 0:
-            available = [i for i in range(config.NUM_EXPERTS) if i not in top_indices]
+            available = [i for i in range(configs.NUM_EXPERTS) if i not in top_indices]
             rng = np.random.default_rng(int(confidence * 1000) + k)
             rng.shuffle(available)
             for i in range(min(mask_slots, len(top_indices), len(available))):
@@ -179,15 +179,15 @@ class GateRouter:
     def _apply_anti_collapse(self, expert_indices: List[int], k: int, confidence: float) -> List[int]:
         if k <= 0:
             return []
-        indices = [int(i) for i in expert_indices if 0 <= int(i) < config.NUM_EXPERTS]
+        indices = [int(i) for i in expert_indices if 0 <= int(i) < configs.NUM_EXPERTS]
         if len(indices) < k:
-            remaining = [i for i in range(config.NUM_EXPERTS) if i not in indices]
+            remaining = [i for i in range(configs.NUM_EXPERTS) if i not in indices]
             remaining_sorted = sorted(remaining, key=lambda i: float(self.expert_bias[i]), reverse=True)
             indices.extend(remaining_sorted[: k - len(indices)])
 
-        mask_slots = max(1, int(round(k * config.MASKING_RATE))) if k > 0 else 0
+        mask_slots = max(1, int(round(k * configs.MASKING_RATE))) if k > 0 else 0
         if mask_slots > 0:
-            available = [i for i in range(config.NUM_EXPERTS) if i not in indices]
+            available = [i for i in range(configs.NUM_EXPERTS) if i not in indices]
             rng = np.random.default_rng(int(confidence * 1000) + k)
             rng.shuffle(available)
             for i in range(min(mask_slots, len(indices), len(available))):
@@ -211,15 +211,15 @@ class GateRouter:
         return deduped[:k]
 
     def route(self, text: str, context: str) -> RoutingDecision:
-        if not config.USE_MOCK_INFERENCE and config.GATE_MODE == "llm":
+        if not configs.USE_MOCK_INFERENCE and configs.GATE_MODE == "llm":
             llm_decision = self._call_gate_llm(text, context)
             if llm_decision is not None:
-                k = int(np.clip(llm_decision.k, config.K_MIN, config.K_MAX))
+                k = int(np.clip(llm_decision.k, configs.K_MIN, configs.K_MAX))
                 confidence = float(np.clip(llm_decision.confidence, 0.0, 1.0))
                 expert_indices = self._apply_anti_collapse(llm_decision.expert_indices, k, confidence)
                 x, y = _determine_xy(k, confidence)
                 timeline = "A" if confidence >= self.fast_path_threshold or k == 0 else "B"
-                entropy = min(1.0, k / max(config.K_MAX, 1))
+                entropy = min(1.0, k / max(configs.K_MAX, 1))
                 self.ema.update(fast_path=(timeline == "A"), entropy=entropy, expert_indices=expert_indices)
                 self._self_stabilize()
                 return RoutingDecision(k=k, expert_indices=expert_indices, timeline=timeline, confidence=confidence, x=x, y=y)
@@ -269,7 +269,7 @@ class GateRouter:
             expert_indices,
             text,
             context,
-            x_concurrency=x_concurrency or config.X_DEFAULT,
+            x_concurrency=x_concurrency or configs.X_DEFAULT,
         )
 
         central_out = await central.central_forward(text)
@@ -346,11 +346,11 @@ def _determine_xy(k: int, confidence: float) -> Tuple[int, int]:
     if k <= 0:
         return 0, 0
     complexity = 1.0 - float(np.clip(confidence, 0.0, 1.0))
-    x = int(round(config.X_DEFAULT + complexity * (config.X_MAX - config.X_DEFAULT)))
-    x = int(np.clip(x, 1, config.X_MAX))
+    x = int(round(configs.X_DEFAULT + complexity * (configs.X_MAX - configs.X_DEFAULT)))
+    x = int(np.clip(x, 1, configs.X_MAX))
     y = int(math.ceil(k / x)) if x > 0 else 0
-    if y > config.Y_MAX:
-        x = int(np.clip(math.ceil(k / config.Y_MAX), 1, config.X_MAX))
+    if y > configs.Y_MAX:
+        x = int(np.clip(math.ceil(k / configs.Y_MAX), 1, configs.X_MAX))
         y = int(math.ceil(k / x)) if x > 0 else 0
     return x, y
 

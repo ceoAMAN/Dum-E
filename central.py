@@ -7,7 +7,7 @@ import numpy as np
 from dataclasses import dataclass
 from typing import Any, Dict, List, Union
 
-import config
+import configs
 import inference
 from vectors import VectorBackend
 
@@ -18,31 +18,31 @@ class CentralOutput:
     vector: np.ndarray
 
 
-_vector_backend = VectorBackend(mode=config.VECTOR_BACKEND, model_id=config.VECTOR_MODEL_ID)
+_vector_backend = VectorBackend(mode=configs.VECTOR_BACKEND, model_id=configs.VECTOR_MODEL_ID)
 
 
 async def central_forward(text: str) -> CentralOutput:
     async with aiohttp.ClientSession() as session:
-        if config.USE_MOCK_INFERENCE:
+        if configs.USE_MOCK_INFERENCE:
             output_text = text
         else:
             try:
                 output_text = await inference.hf_generate_async(
                     session=session,
-                    model_id=config.CENTRAL_MODEL_ID,
+                    model_id=configs.CENTRAL_MODEL_ID,
                     prompt=text,
                     max_new_tokens=128,
                     temperature=0.2,
                     do_sample=False,
                 )
             except Exception as exc:
-                if config.DEBUG:
+                if configs.DEBUG:
                     print(f"[central] HF call failed: {exc}")
                 output_text = text
         vec_result = await _vector_backend.embed(
             session=session,
             text=output_text,
-            target_dim=config.CENTRAL_D_MODEL,
+            target_dim=configs.CENTRAL_D_MODEL,
             salt="central",
         )
         return CentralOutput(output_text=output_text, vector=vec_result.vector)
@@ -159,7 +159,7 @@ def self_test() -> None:
         print(f"[central] output_text_len={len(out.output_text)}")
 
         expert_vecs = [
-            np.random.randn(config.CENTRAL_D_MODEL).astype(np.float32)
+            np.random.randn(configs.CENTRAL_D_MODEL).astype(np.float32)
             for _ in range(4)
         ]
         synth = attention_synthesis(expert_vecs, out.vector)

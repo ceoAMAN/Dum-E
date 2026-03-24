@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
-import config
+import configs
 
 
 @dataclass
@@ -27,7 +27,7 @@ class RoutingRecord:
 
 
 class ExpertRewardTracker:
-    def __init__(self, num_experts: int = config.NUM_EXPERTS, decay: float = 0.95) -> None:
+    def __init__(self, num_experts: int = configs.NUM_EXPERTS, decay: float = 0.95) -> None:
         self.num_experts = num_experts
         self.decay = decay
         self.reward_scores = np.zeros(num_experts, dtype=np.float64)

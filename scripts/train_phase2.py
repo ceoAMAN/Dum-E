@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import config
+import configs
 import data
 from scripts.train_common import resolve_model_id
 
@@ -26,8 +26,8 @@ class GatePolicyModel(nn.Module):
     def __init__(self, base_model: nn.Module, hidden_size: int) -> None:
         super().__init__()
         self.base = base_model
-        self.expert_head = nn.Linear(hidden_size, config.NUM_EXPERTS)
-        self.k_head = nn.Linear(hidden_size, config.K_MAX + 1)
+        self.expert_head = nn.Linear(hidden_size, configs.NUM_EXPERTS)
+        self.k_head = nn.Linear(hidden_size, configs.K_MAX + 1)
 
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor):
         outputs = self.base(
@@ -44,14 +44,14 @@ class GatePolicyModel(nn.Module):
 
 def _target_k(attention_mask: torch.Tensor) -> torch.Tensor:
     lengths = attention_mask.sum(dim=1).float()
-    ratios = lengths / float(config.MAX_SEQ_LEN)
-    ks = torch.clamp((ratios * config.K_MAX).round(), config.K_MIN, config.K_MAX).long()
+    ratios = lengths / float(configs.MAX_SEQ_LEN)
+    ks = torch.clamp((ratios * configs.K_MAX).round(), configs.K_MIN, configs.K_MAX).long()
     return ks
 
 
 def _routing_quality_loss(expert_logits: torch.Tensor) -> torch.Tensor:
     probs = F.softmax(expert_logits, dim=-1)
-    top_vals, _ = torch.topk(probs, k=min(config.K_DEFAULT, config.NUM_EXPERTS), dim=-1)
+    top_vals, _ = torch.topk(probs, k=min(configs.K_DEFAULT, configs.NUM_EXPERTS), dim=-1)
     concentration = top_vals.sum(dim=-1)
     ideal = torch.ones_like(concentration) * 0.8
     return F.mse_loss(concentration, ideal)
@@ -64,7 +64,7 @@ def _adaptive_context_loss(hidden: torch.Tensor) -> torch.Tensor:
 
 def run() -> None:
     print("[train_phase2] Gate fine-tuning (4 losses)")
-    model_id = resolve_model_id(config.GATE_TRAIN_MODEL_ID)
+    model_id = resolve_model_id(configs.GATE_TRAIN_MODEL_ID)
     batch_size = int(os.getenv("STURNUS_TRAIN_BATCH_SIZE", "2"))
     max_steps = int(os.getenv("STURNUS_TRAIN_STEPS", "100"))
     grad_accum = int(os.getenv("STURNUS_TRAIN_ACCUM", "4"))
@@ -77,7 +77,7 @@ def run() -> None:
     batch_iter = data.iter_mixture_token_batches(
         model_id=model_id,
         batch_size=batch_size,
-        max_length=config.MAX_SEQ_LEN,
+        max_length=configs.MAX_SEQ_LEN,
         seed=123,
     )
 
@@ -88,20 +88,20 @@ def run() -> None:
 
     base = AutoModelForCausalLM.from_pretrained(model_id, trust_remote_code=True)
     lora_cfg = LoraConfig(
-        r=config.LORA_R,
-        lora_alpha=config.LORA_ALPHA,
-        lora_dropout=config.LORA_DROPOUT,
+        r=configs.LORA_R,
+        lora_alpha=configs.LORA_ALPHA,
+        lora_dropout=configs.LORA_DROPOUT,
         bias="none",
         task_type="CAUSAL_LM",
     )
     base = get_peft_model(base, lora_cfg)
 
-    hidden_size = base.config.hidden_size
+    hidden_size = base.configs.hidden_size
     model = GatePolicyModel(base, hidden_size=hidden_size).to(device)
     model.train()
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config.LEARNING_RATE)
-    out_dir = config.CHECKPOINT_DIR / "gate"
+    optimizer = torch.optim.AdamW(model.parameters(), lr=configs.LEARNING_RATE)
+    out_dir = configs.CHECKPOINT_DIR / "gate"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     step = 0

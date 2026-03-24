@@ -9,7 +9,7 @@ from typing import Optional
 import aiohttp
 import numpy as np
 
-import config
+import configs
 import inference
 
 
@@ -48,7 +48,7 @@ def _pool_feature_array(arr: np.ndarray) -> np.ndarray:
 class VectorBackend:
     def __init__(self, mode: str = "hash", model_id: Optional[str] = None) -> None:
         self.mode = mode
-        self.model_id = model_id or config.CENTRAL_MODEL_ID
+        self.model_id = model_id or configs.CENTRAL_MODEL_ID
 
     async def embed(
         self,
