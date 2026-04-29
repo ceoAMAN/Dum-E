@@ -2,11 +2,9 @@
 
 ### A Self-Supervising Horizontal Mixture-of-Experts Architecture for Consumer Hardware
 
-> *"v1 was an arrow in the dark. v3 knew its target. v5 is the arrow, the target, and the proof it hit. The target is K → 0."*
 
 **Hardware:** MacBook Air M4 · 16 GB Unified Memory  
 **Stack:** MLX (Apple Silicon Native) · No PyTorch · No CUDA · No cloud  
-**Status:** Final · April 2026 · arXiv Preprint
 
 ---
 
