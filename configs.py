@@ -1,191 +1,110 @@
-# pyre-unsafe
-"""Sturnus configuration."""
 from __future__ import annotations
-
 import os
-from dataclasses import dataclass
 from pathlib import Path
-
-from dotenv import load_dotenv
-
-load_dotenv()
-
-
-def _env_bool(name: str, default: bool) -> bool:
-    value = os.getenv(name)
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "y"}
-
-
-def _is_colab() -> bool:
-    return bool(os.getenv("COLAB_RELEASE_TAG") or os.getenv("COLAB_GPU"))
-
-
+def _load_local_env() -> None:
+    env_path = Path(__file__).resolve().parent / ".env.local"
+    if not env_path.exists():
+        return
+    for raw_line in env_path.read_text().splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        os.environ.setdefault(key, value)
+_load_local_env()
 HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
-
-EXPERT_MODEL_ID = "Qwen/Qwen2.5-0.5B-Instruct"
-GATE_MODEL_ID = "Qwen/Qwen2.5-1.5B-Instruct"
-CENTRAL_MODEL_ID = "Qwen/Qwen2.5-3B-Instruct"
-
-EXPERT_TRAIN_MODEL_ID = "Qwen/Qwen2.5-0.5B-Instruct"
-GATE_TRAIN_MODEL_ID = "Qwen/Qwen2.5-1.5B-Instruct"
-CENTRAL_TRAIN_MODEL_ID = "Qwen/Qwen2.5-3B-Instruct"
-
-NUM_EXPERTS = 240
-EXPERT_GROUPS = {
-    "A": list(range(0, 15)),
-    "B": list(range(15, 30)),
-    "C": list(range(30, 45)),
-    "D": list(range(45, 60)),
-    "E": list(range(60, 75)),
-    "F": list(range(75, 90)),
-    "G": list(range(90, 105)),
-    "H": list(range(105, 120)),
-    "I": list(range(120, 135)),
-    "J": list(range(135, 150)),
-    "K": list(range(150, 165)),
-    "L": list(range(165, 180)),
-    "M": list(range(180, 195)),
-    "N": list(range(195, 210)),
-    "O": list(range(210, 225)),
-    "P": list(range(225, 240)),
-}
-
-# The MLX 4-bit config sizes
-QUANT_BITS = 4
-EXPERT_RAM_MB = 125
-
-EXPERT_D_MODEL = 896
-GATE_D_MODEL = 1536
-CENTRAL_D_MODEL = 2048
-
-NATIVE_MODE = os.environ.get('STURNUS_NATIVE', '0') == '1'
-
+GATE_MODEL_ID = "mlx-community/Qwen2.5-0.5B-Instruct-4bit"
+EXPERT_MODEL_ID = "mlx-community/Qwen2.5-1.5B-Instruct-4bit"
+CENTRAL_MODEL_ID = "mlx-community/Mistral-7B-Instruct-v0.3-4bit"
+EXPERT_POOL_SIZE = 100
+NUM_EXPERTS = EXPERT_POOL_SIZE
+EXPERT_RAM_MB = 850
+CENTRAL_RAM_MB = 4096
+MIN_BOOT_RAM_MB = 6000
+GATE_D_MODEL = 896
+EXPERT_D_MODEL = 1536
+CENTRAL_D_MODEL = 4096
+FRAGMENT_MIN = 32
+OVERLAP_FRACTION = 0.175
 K_MIN = 0
 K_MAX = 20
 K_DEFAULT = 4
-FAST_PATH_THRESHOLD = 0.85
-
-X_MIN = 19
-X_DEFAULT = 19
-X_MAX = 104
-Y_MAX = 25
-
-TIMELINE_B_BUDGET_SECS = 10.0
-DEAD_TIME_MIN_SECS = 3.0
-
-LORA_R = 16
-LORA_ALPHA = 32
-LORA_DROPOUT = 0.05
-LEARNING_RATE = 2e-4
 MAX_SEQ_LEN = 512
-
-DATASET_WEIGHTS = {
-    "fineweb": 0.125,
-    "arxiv": 0.125,
-    "code_search_net": 0.125,
-    "dolma": 0.125,
-    "math": 0.0625,
-    "gsm8k": 0.0625,
-    "openhermes": 0.125,
-    "c4": 0.125,
-    "medqa": 0.125,
-}
-
-DATASET_IDS = {
-    "fineweb": ("HuggingFaceFW/fineweb", "default"),
-    "arxiv": ("Intelligent-Internet/arxiv", None),
-    "code_search_net": ("code_search_net", "all"),
-    "dolma": ("allenai/dolma", None),
-    "math": ("lighteval/MATH", "all"),
-    "gsm8k": ("gsm8k", "main"),
-    "openhermes": ("teknium/OpenHermes-2.5", None),
-    "c4": ("allenai/c4", "en"),
-    "medqa": ("GBaker/MedQA-USMLE-4-options", None),
-}
-
-UTILIZATION_WINDOW = 1000
-UNDERUSE_THRESHOLD = 0.02
-MASKING_RATE = 0.10
+TKL_FLOOR = 32
+TKL_HISTORY_LEN = 10
+MONOPOLY_THRESHOLD = 0.85
+CALIBRATION_PATH = "state/calibration.npz"
+LATENCY_STORE_PATH = "state/latency_store.npz"
+VORONOI_ALPHA = 0.3
+CLUSTER_CAP_RATE = 50
+CLUSTER_PRUNE_AGE = 10_000
+CLUSTER_CONFIDENCE_FLOOR = 0.4
+FAST_PATH_THRESHOLD = 0.85
+LAMBDA_INIT = [0.25, 0.25, 0.25, 0.25]
+ALPHA_LR = 1e-4
+BETA_LR = 1e-5
+T_CHECKPOINT = 5
+L_EFF_EPS = 1e-8
+L_REL_GAMMA = 0.95
+L_REL_N_WINDOWS = 10
+MASKING_STUCK_THRESHOLD = 0.9
+ALPHA_PROTECTION_THRESHOLD = 0.5
 EMA_DECAY = 0.99
-
-DEVICE = "cuda" if _is_colab() else "cpu"
-USE_FP16 = True if _is_colab() else False
-
-BASE_PATH = "/content/drive/MyDrive/Sturnus" if _is_colab() else "./Sturnus"
-BASE_DIR = Path(BASE_PATH).expanduser().resolve()
-CHECKPOINT_DIR = Path(os.getenv("STURNUS_CHECKPOINT_DIR", "./checkpoints")).expanduser().resolve()
-
-USE_MOCK_INFERENCE = _env_bool("STURNUS_MOCK_INFERENCE", not bool(HF_TOKEN))
-GATE_MODE = os.getenv("STURNUS_GATE_MODE", "llm" if HF_TOKEN else "heuristic").strip().lower()
-REQUEST_TIMEOUT_SECS = float(os.getenv("STURNUS_REQUEST_TIMEOUT", "60"))
-DEBUG = _env_bool("STURNUS_DEBUG", False)
-VECTOR_BACKEND = os.getenv("STURNUS_VECTOR_BACKEND", "hash").strip().lower()
-VECTOR_MODEL_ID = os.getenv("STURNUS_VECTOR_MODEL_ID", CENTRAL_MODEL_ID).strip()
-
-HF_CHAT_API_URL = "https://router.huggingface.co/v1/chat/completions"
-
-
-@dataclass(frozen=True)
-class ConfigSnapshot:
-    hf_token_present: bool
-    device: str
-    use_fp16: bool
-    base_path: str
-    mock_inference: bool
-    gate_mode: str
-    vector_backend: str
-    vector_model_id: str
-    checkpoint_dir: str
-
-
-CONFIG_SNAPSHOT = ConfigSnapshot(
-    hf_token_present=bool(HF_TOKEN),
-    device=DEVICE,
-    use_fp16=USE_FP16,
-    base_path=str(BASE_DIR),
-    mock_inference=USE_MOCK_INFERENCE,
-    gate_mode=GATE_MODE,
-    vector_backend=VECTOR_BACKEND,
-    vector_model_id=VECTOR_MODEL_ID,
-    checkpoint_dir=str(CHECKPOINT_DIR),
-)
-
-
+OUTER_LOOP_TOKEN_INTERVAL = 500
+DATASET_WEIGHTS = {
+    "slim_orca": 0.25,
+    "red_pajama": 0.25,
+    "starcoder": 0.25,
+    "fineweb": 0.25,
+}
+DATASET_IDS = {
+    "slim_orca": ("Open-Orca/SlimOrca", "default"),
+    "red_pajama": ("wikitext", "wikitext-103-v1"),
+    "starcoder": ("bigcode/starcoderdata", "default"),
+    "fineweb": ("HuggingFaceFW/fineweb", "CC-MAIN-2024-10"),
+}
+ROUTING_MEMORY_PATH = "state/routing_memory.pkl"
+LAMBDA_SAVE_PATH = "state/lambdas.npz"
+CHECKPOINT_DIR = Path("state/checkpoints/")
+LOG_DIR = Path("logs/")
+DEVICE = None
+CENTRAL_TRAIN_MODEL_ID = CENTRAL_MODEL_ID
+GATE_TRAIN_MODEL_ID = GATE_MODEL_ID
+EXPERT_TRAIN_MODEL_ID = EXPERT_MODEL_ID
+LORA_R = 8
+LORA_ALPHA = 16
+LORA_DROPOUT = 0.05
+LEARNING_RATE = 2e-5
+EXPERT_GROUPS = {
+    "code": list(range(0, 25)),
+    "reasoning": list(range(25, 50)),
+    "knowledge": list(range(50, 75)),
+    "general": list(range(75, 100)),
+}
 def validate_config() -> None:
-    if NUM_EXPERTS != 240:
-        raise ValueError("NUM_EXPERTS must be 240.")
-    total_groups = sum(len(v) for v in EXPERT_GROUPS.values())
-    if total_groups != NUM_EXPERTS:
-        raise ValueError("EXPERT_GROUPS must cover all experts exactly.")
+    if EXPERT_POOL_SIZE != 100:
+        raise ValueError("EXPERT_POOL_SIZE must be 100.")
     if not (0 <= K_MIN <= K_DEFAULT <= K_MAX <= 20):
         raise ValueError("K bounds must be within [0, 20] and ordered.")
     if not (0.0 < FAST_PATH_THRESHOLD < 1.0):
         raise ValueError("FAST_PATH_THRESHOLD must be between 0 and 1.")
     if abs(sum(DATASET_WEIGHTS.values()) - 1.0) > 1e-6:
         raise ValueError("DATASET_WEIGHTS must sum to 1.0.")
-    if VECTOR_BACKEND not in {"hash", "hf", "hf_feature"}:
-        raise ValueError("VECTOR_BACKEND must be one of: hash, hf, hf_feature.")
-
-
-def _print_config() -> None:
-    print("[Sturnus config]")
-    print(f"  HF_TOKEN present: {bool(HF_TOKEN)}")
-    print(f"  EXPERT_MODEL_ID: {EXPERT_MODEL_ID}")
-    print(f"  GATE_MODEL_ID: {GATE_MODEL_ID}")
-    print(f"  CENTRAL_MODEL_ID: {CENTRAL_MODEL_ID}")
-    print(f"  NUM_EXPERTS: {NUM_EXPERTS}")
-    print(f"  K_MIN/K_DEFAULT/K_MAX: {K_MIN}/{K_DEFAULT}/{K_MAX}")
-    print(f"  X_DEFAULT/X_MAX/Y_MAX: {X_DEFAULT}/{X_MAX}/{Y_MAX}")
-    print(f"  USE_MOCK_INFERENCE: {USE_MOCK_INFERENCE}")
-    print(f"  GATE_MODE: {GATE_MODE}")
-    print(f"  VECTOR_BACKEND: {VECTOR_BACKEND}")
-
-
-if os.getenv("STURNUS_CONFIG_QUIET", "0") != "1":
-    _print_config()
-
+    if abs(BETA_LR - ALPHA_LR / 10) > 1e-12:
+        raise ValueError(
+            f"BETA_LR ({BETA_LR}) must equal ALPHA_LR / 10 ({ALPHA_LR / 10}). "
+            "Structural constraint."
+        )
+    if TKL_FLOOR != FRAGMENT_MIN:
+        raise ValueError("TKL_FLOOR must equal FRAGMENT_MIN (both = 32).")
+    if FRAGMENT_MIN < 32:
+        raise ValueError("FRAGMENT_MIN must be >= 32.")
+    if not HF_TOKEN:
+        raise ValueError(
+            "HF_TOKEN is required. Set the HF_TOKEN environment variable before running."
+        )
 if __name__ == "__main__":
     validate_config()
     print("Config OK")

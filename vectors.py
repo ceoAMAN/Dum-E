@@ -1,79 +1,42 @@
-# pyre-unsafe
-"""Vector backend for expert/central representations."""
 from __future__ import annotations
-
-import hashlib
-from dataclasses import dataclass
-from typing import Optional
-
-import aiohttp
 import numpy as np
-
-import configs
-import inference
-
-
-@dataclass
-class VectorResult:
-    vector: np.ndarray
-    backend: str
-    ok: bool
-
-
-def _hash_vector(text: str, dim: int, salt: str) -> np.ndarray:
-    seed = int(hashlib.sha256((text + salt).encode("utf-8")).hexdigest(), 16) % (2**32)
-    rng = np.random.default_rng(seed)
-    return rng.standard_normal(dim).astype(np.float32)
-
-
-def _align(vec: np.ndarray, target_dim: int) -> np.ndarray:
-    if vec.shape[0] == target_dim:
-        return vec
-    if vec.shape[0] > target_dim:
-        return vec[:target_dim]
-    pad = np.zeros(target_dim - vec.shape[0], dtype=vec.dtype)
-    return np.concatenate([vec, pad], axis=0)
-
-
-def _pool_feature_array(arr: np.ndarray) -> np.ndarray:
-    if arr.ndim == 1:
-        return arr
-    if arr.ndim == 2:
-        return arr.mean(axis=0)
-    if arr.ndim == 3:
-        return arr.mean(axis=0).mean(axis=0)
-    return arr.reshape(-1)
-
-
-class VectorBackend:
-    def __init__(self, mode: str = "hash", model_id: Optional[str] = None) -> None:
-        self.mode = mode
-        self.model_id = model_id or configs.CENTRAL_MODEL_ID
-
-    async def embed(
-        self,
-        session: aiohttp.ClientSession,
-        text: str,
-        target_dim: int,
-        salt: str,
-    ) -> VectorResult:
-        if self.mode == "hash":
-            vec = _hash_vector(text, target_dim, salt)
-            return VectorResult(vector=vec, backend="hash", ok=True)
-
-        if self.mode in {"hf", "hf_feature"}:
-            raw = await inference.hf_feature_extract_async(session, self.model_id, text)
-            if raw is None:
-                vec = _hash_vector(text, target_dim, salt)
-                return VectorResult(vector=vec, backend="hash", ok=False)
-            try:
-                arr = np.array(raw, dtype=np.float32)
-            except Exception:
-                vec = _hash_vector(text, target_dim, salt)
-                return VectorResult(vector=vec, backend="hash", ok=False)
-            pooled = _pool_feature_array(arr)
-            vec = _align(pooled.astype(np.float32), target_dim)
-            return VectorResult(vector=vec, backend="hf_feature", ok=True)
-
-        vec = _hash_vector(text, target_dim, salt)
-        return VectorResult(vector=vec, backend="hash", ok=False)
+import mlx.core as mx
+def mx_to_numpy(arr: mx.array) -> np.ndarray:
+    return np.array(arr.tolist(), dtype=np.float32)
+def cosine_similarity(a: mx.array, b: mx.array) -> mx.array:
+    a_norm = a / (mx.linalg.norm(a) + 1e-8)
+    b_norm = b / (mx.linalg.norm(b) + 1e-8)
+    return mx.sum(a_norm * b_norm)
+def cosine_distance(a: mx.array, b: mx.array) -> mx.array:
+    return 1.0 - cosine_similarity(a, b)
+def numpy_cosine_distance(a: np.ndarray, b: np.ndarray) -> float:
+    a_norm = np.linalg.norm(a) + 1e-8
+    b_norm = np.linalg.norm(b) + 1e-8
+    return float(1.0 - np.dot(a, b) / (a_norm * b_norm))
+def batch_cosine_distances(query: mx.array, matrix: mx.array) -> mx.array:
+    q_norm = query / (mx.linalg.norm(query) + 1e-8)
+    m_norm = matrix / (mx.linalg.norm(matrix, axis=1, keepdims=True) + 1e-8)
+    similarities = mx.matmul(m_norm, q_norm)
+    return 1.0 - similarities
+def dot_product_similarity_matrix(weight_matrices: list[mx.array]) -> mx.array:
+    flat = mx.stack([w.reshape(-1) for w in weight_matrices], axis=0)
+    norms = mx.linalg.norm(flat, axis=1, keepdims=True) + 1e-8
+    normed = flat / norms
+    return mx.matmul(normed, normed.T)
+def normalise_scores(scores: mx.array, eps: float = 1e-8) -> mx.array:
+    total = mx.sum(mx.abs(scores)) + eps
+    return scores / total
+def exponential_decay_weights(n: int, gamma: float = 0.95) -> mx.array:
+    exponents = mx.array(list(range(n - 1, -1, -1)), dtype=mx.float32)
+    return mx.power(mx.array(gamma, dtype=mx.float32), exponents)
+def compute_mean_inter_centroid_distance(centroids: list[np.ndarray]) -> float:
+    n = len(centroids)
+    if n < 2:
+        return 1.0
+    matrix = np.stack(centroids, axis=0).astype(np.float32)
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True) + 1e-8
+    normed = matrix / norms
+    sim_matrix = normed @ normed.T
+    dist_matrix = 1.0 - sim_matrix
+    upper = dist_matrix[np.triu_indices(n, k=1)]
+    return float(upper.mean()) if len(upper) > 0 else 1.0

@@ -1,178 +1,144 @@
-# pyre-unsafe
-"""Central model layer (Mistral-7B)."""
 from __future__ import annotations
-
-import aiohttp
-import numpy as np
+import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Union
-
+from typing import Any, Dict, List
+import mlx.core as mx
 import configs
-import inference
-from vectors import VectorBackend
-
-
 @dataclass
 class CentralOutput:
-    output_text: str
-    vector: np.ndarray
-
-
-_vector_backend = VectorBackend(mode=configs.VECTOR_BACKEND, model_id=configs.VECTOR_MODEL_ID)
-
-
-async def central_forward(text: str) -> CentralOutput:
-    async with aiohttp.ClientSession() as session:
-        if configs.USE_MOCK_INFERENCE:
-            output_text = text
+    synthesis_text: str
+    synthesis_hidden: mx.array
+    contribution_hidden: mx.array
+    expert_scores: Dict[int, float]
+    expert_tkl: Dict[int, float]
+    reconstruction_entropy: float
+    send_to_user: bool
+class CentralModel:
+    def __init__(self):
+        self.model = None
+        self.tokenizer = None
+        self._loaded = False
+    def load(self):
+        if self._loaded:
+            return
+        from mlx_lm import load as mlx_load
+        self.model, self.tokenizer = mlx_load(configs.CENTRAL_MODEL_ID)
+        self._loaded = True
+    def _compute_hidden_mean(self, token_ids: List[int]) -> mx.array:
+        tokens = mx.array([token_ids[:configs.MAX_SEQ_LEN]])
+        if hasattr(self.model, "model"):
+            hidden_out = self.model.model(tokens)
+            mx.eval(hidden_out)
         else:
-            try:
-                output_text = await inference.hf_generate_async(
-                    session=session,
-                    model_id=configs.CENTRAL_MODEL_ID,
-                    prompt=text,
-                    max_new_tokens=128,
-                    temperature=0.2,
-                    do_sample=False,
-                )
-            except Exception as exc:
-                if configs.DEBUG:
-                    print(f"[central] HF call failed: {exc}")
-                output_text = text
-        vec_result = await _vector_backend.embed(
-            session=session,
-            text=output_text,
-            target_dim=configs.CENTRAL_D_MODEL,
-            salt="central",
+            hidden_out = self.model(tokens)
+            mx.eval(hidden_out)
+        if hidden_out.ndim == 3:
+            hidden_mean = mx.mean(hidden_out[0], axis=0)
+        else:
+            hidden_mean = mx.mean(hidden_out, axis=0)
+        mx.eval(hidden_mean)
+        return hidden_mean
+    def _build_input_ids(self, original_input: str, expert_outputs: List[Dict[str, Any]]) -> List[int]:
+        limit = configs.MAX_SEQ_LEN
+        input_ids = self.tokenizer.encode(original_input)[:limit]
+        if len(input_ids) >= limit:
+            return input_ids
+        newline_ids = self.tokenizer.encode("\n")
+        for eo in expert_outputs:
+            text = str(eo.get("output_text", ""))
+            if not text:
+                continue
+            part_ids = self.tokenizer.encode(text)
+            remaining = limit - len(input_ids)
+            if remaining <= 0:
+                break
+            if newline_ids:
+                input_ids.extend(newline_ids[:remaining])
+                remaining = limit - len(input_ids)
+                if remaining <= 0:
+                    break
+            input_ids.extend(part_ids[:remaining])
+        return input_ids[:limit]
+    def forward(self, original_input: str, expert_outputs: List[Dict[str, Any]], send_to_user: bool = True) -> CentralOutput:
+        self.load()
+        base_input_ids = self.tokenizer.encode(original_input)[:configs.MAX_SEQ_LEN]
+        input_ids = self._build_input_ids(original_input, expert_outputs)
+        tokens = mx.array([input_ids])
+        t_start = time.perf_counter()
+        logits = self.model(tokens)
+        mx.eval(logits)
+        t_end = time.perf_counter()
+        synthesis_hidden = self._compute_hidden_mean(input_ids)
+        base_hidden = self._compute_hidden_mean(base_input_ids)
+        min_dim = min(base_hidden.shape[0], synthesis_hidden.shape[0])
+        contribution_hidden = synthesis_hidden[:min_dim] - base_hidden[:min_dim]
+        mx.eval(contribution_hidden)
+        last_logits = logits[0, -1, :] if logits.ndim == 3 else logits[-1, :]
+        token_id = int(mx.argmax(last_logits).item())
+        synthesis_text = self.tokenizer.decode([token_id])
+        expert_scores = {}
+        expert_tkl_scores = {}
+        for eo in expert_outputs:
+            eid = eo.get("expert_id", 0)
+            r_i = self._compute_r_i_from_hidden(eo.get("hidden_states"), contribution_hidden, eo.get("wall_time", 1.0))
+            expert_scores[eid] = r_i
+        entropy = self.compute_reconstruction_entropy(synthesis_hidden)
+        return CentralOutput(
+            synthesis_text=synthesis_text,
+            synthesis_hidden=synthesis_hidden,
+            contribution_hidden=contribution_hidden,
+            expert_scores=expert_scores,
+            expert_tkl=expert_tkl_scores,
+            reconstruction_entropy=entropy,
+            send_to_user=send_to_user,
         )
-        return CentralOutput(output_text=output_text, vector=vec_result.vector)
-
-
-def _align_vector(vec: np.ndarray, target_dim: int) -> np.ndarray:
-    if vec.shape[0] == target_dim:
-        return vec
-    if vec.shape[0] > target_dim:
-        return vec[:target_dim]
-    pad = np.zeros(target_dim - vec.shape[0], dtype=vec.dtype)
-    return np.concatenate([vec, pad], axis=0)
-
-
-def attention_synthesis(
-    expert_vectors: List[np.ndarray],
-    token_embedding: np.ndarray,
-    temperature: float = 1.0,
-) -> np.ndarray:
-    if not expert_vectors:
-        return token_embedding
-    d = token_embedding.shape[0]
-    aligned = [_align_vector(v, d) for v in expert_vectors]
-    keys = np.stack(aligned, axis=0)
-    values = keys.copy()
-    query = token_embedding
-
-    scale = np.sqrt(float(d)) * temperature
-    scores = keys @ query / (scale + 1e-9)
-
-    scores = scores - scores.max()
-    weights = np.exp(scores)
-    weights = weights / (weights.sum() + 1e-9)
-
-    synthesized = (weights[:, None] * values).sum(axis=0)
-
-    alpha = 0.7
-    output = alpha * synthesized + (1.0 - alpha) * token_embedding
-    output = output / (np.linalg.norm(output) + 1e-9) * np.linalg.norm(token_embedding)
-    return output
-
-
-def gate_optimization_step(
-    expert_vectors: List[np.ndarray],
-    central_vector: Union[np.ndarray, None] = None,
-) -> Dict[str, Any]:
-    if not expert_vectors:
-        return {"updated": False, "quality": 0.0, "diversity": 0.0, "signals": []}
-
-    norms = [np.linalg.norm(v) for v in expert_vectors]
-    mean_norm = float(np.mean(norms))
-
-    quality_scores = []
-    if central_vector is not None:
-        c_norm = np.linalg.norm(central_vector)
-        for v in expert_vectors:
-            v_norm = np.linalg.norm(v)
-            if c_norm > 1e-9 and v_norm > 1e-9:
-                d_min = min(v.shape[0], central_vector.shape[0])
-                cos_sim = float(np.dot(v[:d_min], central_vector[:d_min]) / (v_norm * c_norm))
-                quality_scores.append(cos_sim)
-            else:
-                quality_scores.append(0.0)
-    else:
-        quality_scores = [1.0] * len(expert_vectors)
-
-    pairwise_dists = []
-    for i in range(len(expert_vectors)):
-        for j in range(i + 1, len(expert_vectors)):
-            vi, vj = expert_vectors[i], expert_vectors[j]
-            ni, nj = norms[i], norms[j]
-            if ni > 1e-9 and nj > 1e-9:
-                d_min = min(vi.shape[0], vj.shape[0])
-                cos = float(np.dot(vi[:d_min], vj[:d_min]) / (ni * nj))
-                pairwise_dists.append(1.0 - cos)
-    diversity = float(np.mean(pairwise_dists)) if pairwise_dists else 0.0
-
-    return {
-        "updated": True,
-        "quality": float(np.mean(quality_scores)),
-        "diversity": diversity,
-        "mean_norm": mean_norm,
-        "signals": quality_scores,
-    }
-
-
-def teacher_distillation_signal(
-    central_output: np.ndarray,
-    temperature: float = 2.0,
-) -> Dict[str, Any]:
-    logits = central_output / (temperature + 1e-9)
-    logits = logits - logits.max()
-    exp_logits = np.exp(logits)
-    soft_labels = exp_logits / (exp_logits.sum() + 1e-9)
-
-    entropy = float(-np.sum(soft_labels * np.log(soft_labels + 1e-12)))
-    top_k_indices = np.argsort(soft_labels)[-5:][::-1].tolist()
-
-    return {
-        "soft_labels": soft_labels,
-        "signal_norm": float(np.linalg.norm(central_output)),
-        "entropy": entropy,
-        "top_k_indices": top_k_indices,
-        "temperature": temperature,
-    }
-
-
-def self_test() -> None:
-    print("[central] self-test")
-    import asyncio
-
-    async def _run():
-        out = await central_forward("hello central")
-        print(f"[central] output_text_len={len(out.output_text)}")
-
-        expert_vecs = [
-            np.random.randn(configs.CENTRAL_D_MODEL).astype(np.float32)
-            for _ in range(4)
-        ]
-        synth = attention_synthesis(expert_vecs, out.vector)
-        print(f"[central] synthesis_dim={synth.shape[0]}")
-
-        gate_update = gate_optimization_step(expert_vecs, central_vector=synth)
-        print(f"[central] gate_quality={gate_update['quality']:.3f} diversity={gate_update['diversity']:.3f}")
-
-        distill = teacher_distillation_signal(synth)
-        print(f"[central] distill_entropy={distill['entropy']:.3f} signal_norm={distill['signal_norm']:.3f}")
-
-    asyncio.run(_run())
-
-
-if __name__ == "__main__":
-    self_test()
+    def compute_r_i(self, expert_output_hidden: mx.array, contribution_hidden: mx.array, wall_time: float) -> float:
+        if expert_output_hidden is None or contribution_hidden is None:
+            return 0.0
+        expert_vec = expert_output_hidden.reshape(-1)
+        contribution_vec = contribution_hidden.reshape(-1)
+        min_dim = min(int(expert_vec.shape[0]), int(contribution_vec.shape[0]))
+        if min_dim <= 0:
+            return 0.0
+        expert_vec = expert_vec[:min_dim]
+        contribution_vec = contribution_vec[:min_dim]
+        expert_vec = expert_vec - mx.mean(expert_vec)
+        contribution_vec = contribution_vec - mx.mean(contribution_vec)
+        eo_norm = mx.linalg.norm(expert_vec)
+        contrib_norm = mx.linalg.norm(contribution_vec)
+        mx.eval(eo_norm, contrib_norm)
+        if float(eo_norm.item()) < 1e-8 or float(contrib_norm.item()) < 1e-8:
+            return 0.0
+        sim = mx.sum((expert_vec / (eo_norm + 1e-8)) * (contribution_vec / (contrib_norm + 1e-8)))
+        mx.eval(sim)
+        raw_sim = float(sim.item())
+        if not (raw_sim == raw_sim):
+            return 0.0
+        score = (raw_sim + 1.0) * 0.5
+        return max(0.0, min(1.0, score))
+    def _compute_r_i_from_hidden(self, expert_hidden, contribution_hidden, wall_time):
+        if expert_hidden is None:
+            return 0.0
+        if isinstance(expert_hidden, mx.array):
+            return self.compute_r_i(expert_hidden, contribution_hidden, wall_time)
+        return 0.0
+    def compute_tkl(self, r_i: float, r_out: float, historical_anchor: float, c_e: float) -> float:
+        if c_e < 1e-9:
+            c_e = 1e-9
+        tkl = r_out * (r_i / c_e) * historical_anchor
+        return max(float(configs.TKL_FLOOR), tkl)
+    def update_r_t(self, expert_id: int, token_count: int, wall_time: float, convolution: ApexNadirConvolution):
+        convolution.update_latency(expert_id, token_count, wall_time)
+    def compute_reconstruction_entropy(self, synthesis_hidden: mx.array) -> float:
+        if synthesis_hidden is None:
+            return 0.0
+        probs = mx.softmax(synthesis_hidden)
+        mx.eval(probs)
+        log_probs = mx.log(probs + 1e-10)
+        mx.eval(log_probs)
+        entropy = -float(mx.sum(probs * log_probs).item())
+        return entropy
+    def generate(self, input_text: str, max_tokens: int = 256) -> str:
+        self.load()
+        from mlx_lm import generate as mlx_generate
+        return mlx_generate(self.model, self.tokenizer, prompt=input_text, max_tokens=max_tokens)

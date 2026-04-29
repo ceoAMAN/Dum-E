@@ -1,22 +1,22 @@
-# pyre-unsafe
-"""Validation harness for Sturnus."""
 from __future__ import annotations
-
-import asyncio
 import sys
+import time
 from pathlib import Path
 import argparse
 from typing import Dict, List, Any
-
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-
 import numpy as np
-
+import mlx.core as mx
+import configs
+from central import CentralModel
 from experts import ExpertPool
-from gating import GateRouter
-
+from gating import GateModel, TripleKSelector, MaskingSchedule
+from memory import RoutingMemory, SessionTracker
+from apex_nadir_convolution import ApexNadirConvolution
+from inference import InferenceEngine
+from data import authenticate_huggingface
 
 SAMPLE_PROMPTS: List[str] = [
     "hello world",
@@ -31,72 +31,61 @@ SAMPLE_PROMPTS: List[str] = [
     "describe transformer attention",
 ]
 
-
-async def _run_end_to_end(router: GateRouter, prompt: str, context: str) -> Dict[str, Any]:
-    decision = router.route(prompt, context)
-    if decision.timeline == "A":
-        result = await router.run_timeline_a(prompt)
-    else:
-        result = await router.run_timeline_b(
-            prompt, context, decision.expert_indices, mode=2, x_concurrency=decision.x
-        )
-    return {"decision": decision, "result": result}
-
-
 def run(samples: int = 50) -> None:
-    print("[validate] running validation")
-    pool = ExpertPool(max_cache=64)
-    router = GateRouter(pool)
-
+    print("[validate] Running validation")
+    authenticate_huggingface()
+    convolution = ApexNadirConvolution(configs.CALIBRATION_PATH, configs.LATENCY_STORE_PATH)
+    convolution.load()
+    routing_memory = RoutingMemory()
+    routing_memory.load(configs.ROUTING_MEMORY_PATH)
+    session_tracker = SessionTracker()
+    gate = GateModel()
+    gate.load()
+    central = CentralModel()
+    expert_pool = ExpertPool(convolution=convolution, session_tracker=session_tracker)
+    triple_k = TripleKSelector(convolution=convolution)
+    masking = MaskingSchedule()
+    engine = InferenceEngine(
+        gate=gate, expert_pool=expert_pool, central=central,
+        convolution=convolution, routing_memory=routing_memory,
+        session_tracker=session_tracker, triple_k=triple_k,
+        masking_schedule=masking,
+    )
     ks: List[int] = []
     fast_path = 0
     timeline_b = 0
-
     print("[validate] Phase 1: routing distribution")
     for i in range(samples):
         prompt = SAMPLE_PROMPTS[i % len(SAMPLE_PROMPTS)]
-        decision = router.route(prompt, context="")
-        ks.append(decision.k)
-        if decision.timeline == "A":
+        token_ids = gate.tokenizer.encode(prompt)
+        tokens = mx.array(token_ids)
+        gate_out = gate.forward(tokens)
+        if gate_out.confidence > configs.FAST_PATH_THRESHOLD:
             fast_path += 1
+            ks.append(0)
         else:
             timeline_b += 1
-        pool.update_utilization(decision.expert_indices)
-
+            ks.append(gate_out.k_per_token)
     k_arr = np.array(ks)
-    print(f"[validate] fast-path rate: {fast_path / samples:.2f}")
-    print(f"[validate] timeline-B rate: {timeline_b / samples:.2f}")
+    print(f"[validate] Fast-path rate: {fast_path / samples:.2f}")
+    print(f"[validate] Timeline-B rate: {timeline_b / samples:.2f}")
     print(f"[validate] K mean/min/max: {k_arr.mean():.2f}/{k_arr.min()}/{k_arr.max()}")
-    utilization = pool.utilization_rates()
-    print(f"[validate] utilization min/max: {min(utilization):.4f}/{max(utilization):.4f}")
-    active_experts = sum(1 for u in utilization if u > 0)
-    print(f"[validate] active experts: {active_experts}/{len(utilization)}")
-
     print("[validate] Phase 2: end-to-end execution")
     test_prompts = SAMPLE_PROMPTS[:3]
-
-    async def _run_e2e():
-        for prompt in test_prompts:
-            output = await _run_end_to_end(router, prompt, context="")
-            d = output["decision"]
-            mode = output["result"].get("mode", "?")
-            has_synth = "synth_vector" in output["result"]
-            print(
-                f"[validate] '{prompt[:30]}...' -> K={d.k} X={d.x} Y={d.y} "
-                f"timeline={d.timeline} mode={mode} synth={has_synth}"
-            )
-
-    asyncio.run(_run_e2e())
-
-    print("[validate] Phase 3: anti-collapse check")
-    underused = pool.least_used()
-    print(f"[validate] underused experts: {len(underused)}")
-    print(f"[validate] EMA fast-path rate: {router.ema.fast_path_rate:.3f}")
-    print(f"[validate] EMA entropy: {router.ema.entropy:.3f}")
-    print(f"[validate] fast_path_threshold: {router.fast_path_threshold:.3f}")
-
+    for prompt in test_prompts:
+        start = time.time()
+        result = engine.run(prompt, send_to_user=True)
+        latency_ms = (time.time() - start) * 1000
+        print(
+            f"[validate] '{prompt[:30]}...' -> "
+            f"K={result.k_used} timeline={result.timeline} "
+            f"experts={result.experts_activated} latency={latency_ms:.0f}ms"
+        )
+    print("[validate] Phase 3: cluster & session stats")
+    print(f"[validate] Routing clusters: {len(routing_memory.clusters)}")
+    print(f"[validate] Session tokens: {session_tracker.get_total_tokens_seen()}")
+    print(f"[validate] Timeline-A rate: {session_tracker.get_timeline_a_rate():.3f}")
     print("[validate] DONE")
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
