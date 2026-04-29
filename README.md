@@ -50,8 +50,7 @@ K is the number of experts activated per token. K is an **observable**, not a hy
 9. [Codebase Structure](#9-codebase-structure)
 10. [Architectural Invariants](#10-architectural-invariants)
 11. [Acceptance Criteria](#11-acceptance-criteria)
-12. [Special Thanks](#12-special-thanks)
-13. [Related Work](#13-related-work)
+12. [Related Work](#12-related-work)
 
 ---
 
@@ -822,15 +821,10 @@ All six must pass simultaneously before capacity scaling:
 | 5 | Routing memory hit rate rising | Cluster hits / total tokens | Rising over session |
 | 6 | Timeline A rate rising | Timeline A tokens / total tokens | Rising with domain familiarity |
 
----
-
-## 12. Special Thanks
-
-This work was completed entirely independently, without institutional affiliation, research funding, or a team. Special thanks to the people who helped me stay standing long enough to build it — they know who they are.
 
 ---
 
-## 13. Related Work
+## 12. Related Work
 
 **Mixture-of-Experts:** Shazeer et al. (2017) introduced sparsely-gated MoE layers. Switch Transformer (Fedus et al., 2021) scaled to trillion parameters with one-expert-per-token routing. GLaM (Du et al., 2021) demonstrated MoE quality matching at a fraction of dense activated parameters. Critical distinction from all prior work: every existing MoE system treats K as fixed at design time. Sturnus treats K as the primary observable of system health and drives it toward zero across sessions.
 
