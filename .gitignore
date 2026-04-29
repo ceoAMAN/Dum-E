@@ -1,8 +1,17 @@
 .env
+.env.local
 .venv/
+sturnus_env/
 __pycache__/
 checkpoints/
 *.pyc
 .pytest_cache/
 .vscode/
 .pyre/
+.tmux/
+.DS_Store
+logs/
+state/
+models/
+checkpoints_backup_tonight/
+scripts/*.log

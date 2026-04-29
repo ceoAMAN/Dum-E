@@ -1,147 +1,192 @@
-# pyre-unsafe
-"""Entry point for Sturnus."""
 from __future__ import annotations
-
 import argparse
 import asyncio
-import threading
-import time
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
-
+from dataclasses import dataclass, field
+from typing import Dict, List
 import configs
+from apex_nadir_convolution import ApexNadirConvolution
+from central import CentralModel
+from data import authenticate_huggingface, DomainLabelledStream
 from experts import ExpertPool
-from gating import GateRouter
-
-
+from gating import GateModel, TripleKSelector, MaskingSchedule
+from inference import InferenceEngine
+from memory import RoutingMemory, SessionTracker
+from meta import MAMLOptimiser
 @dataclass
-class BackgroundTask:
-    thread: threading.Thread
-    cancel_event: threading.Event
-
-
-class SturnusEngine:
-    def __init__(self) -> None:
-        self.expert_pool = ExpertPool()
-        self.router = GateRouter(self.expert_pool)
-        self.history: List[str] = []
-        self.background: Optional[BackgroundTask] = None
-
-    def _context(self) -> str:
-        return "\n".join(self.history[-20:])
-
-    def _cancel_background(self) -> None:
-        if self.background is None:
-            return
-        self.background.cancel_event.set()
-        self.background.thread.join(timeout=0.1)
-        self.background = None
-
-    def _start_background(self, text: str, context: str, expert_indices: List[int], x_concurrency: int) -> None:
-        cancel_event = threading.Event()
-
-        def _worker() -> None:
-            start = time.time()
-            while time.time() - start < configs.DEAD_TIME_MIN_SECS:
-                if cancel_event.is_set():
-                    return
-                time.sleep(0.05)
-            if cancel_event.is_set():
-                return
-
-            async def _run():
-                await asyncio.wait_for(
-                    self.router.run_timeline_b(
-                        text,
-                        context,
-                        expert_indices,
-                        mode=1,
-                        x_concurrency=x_concurrency,
-                    ),
-                    timeout=configs.TIMELINE_B_BUDGET_SECS,
-                )
-
-            try:
-                asyncio.run(_run())
-            except Exception:
-                return
-
-        thread = threading.Thread(target=_worker, daemon=True)
-        thread.start()
-        self.background = BackgroundTask(thread=thread, cancel_event=cancel_event)
-
-    async def process_input(self, text: str) -> Dict[str, Any]:
-        context = self._context()
-        decision = self.router.route(text, context)
-        if decision.timeline == "A":
-            result = await self.router.run_timeline_a(text)
-            self._cancel_background()
-            self._start_background(text, context, decision.expert_indices, decision.x)
-        else:
-            result = await self.router.run_timeline_b(
-                text,
-                context,
-                decision.expert_indices,
-                mode=2,
-                x_concurrency=decision.x,
+class SystemComponents:
+    gate: GateModel
+    expert_pool: ExpertPool
+    central: CentralModel
+    convolution: ApexNadirConvolution
+    routing_memory: RoutingMemory
+    session_tracker: SessionTracker
+    maml: MAMLOptimiser
+    inference_engine: InferenceEngine
+    triple_k: TripleKSelector
+    masking_schedule: MaskingSchedule
+    r_out_mean_seed: float
+@dataclass
+class DeadTimeState:
+    active: bool = False
+    pending_timeline_a_inputs: List[str] = field(default_factory=list)
+    last_outer_loop_token: int = 0
+    total_tokens_processed: int = 0
+    inference_active: bool = False
+    last_domain: str = "general"
+    last_k_used: int = 0
+    last_reconstruction_entropy: float = 0.0
+def boot_system() -> SystemComponents:
+    configs.validate_config()
+    authenticate_huggingface()
+    convolution = ApexNadirConvolution(
+        calibration_path=configs.CALIBRATION_PATH,
+        latency_store_path=configs.LATENCY_STORE_PATH,
+    )
+    convolution.load()
+    routing_memory = RoutingMemory()
+    routing_memory.load(configs.ROUTING_MEMORY_PATH)
+    session_tracker = SessionTracker()
+    gate = GateModel()
+    gate.load()
+    central = CentralModel()
+    expert_pool = ExpertPool(convolution=convolution, session_tracker=session_tracker)
+    triple_k = TripleKSelector(convolution=convolution)
+    masking_schedule = MaskingSchedule()
+    maml = MAMLOptimiser(gate_model=gate.model)
+    maml.load()
+    inference_engine = InferenceEngine(
+        gate=gate,
+        expert_pool=expert_pool,
+        central=central,
+        convolution=convolution,
+        routing_memory=routing_memory,
+        session_tracker=session_tracker,
+        triple_k=triple_k,
+        masking_schedule=masking_schedule,
+    )
+    r_out_mean_seed = configs.MAX_SEQ_LEN / configs.K_DEFAULT
+    return SystemComponents(
+        gate=gate,
+        expert_pool=expert_pool,
+        central=central,
+        convolution=convolution,
+        routing_memory=routing_memory,
+        session_tracker=session_tracker,
+        maml=maml,
+        inference_engine=inference_engine,
+        triple_k=triple_k,
+        masking_schedule=masking_schedule,
+        r_out_mean_seed=r_out_mean_seed,
+    )
+def run_universal_buffet(components: SystemComponents):
+    stream = DomainLabelledStream(dataset_ids=configs.DATASET_IDS)
+    for expert_id in range(configs.EXPERT_POOL_SIZE):
+        calibration_data: Dict[str, Any] = {}
+        for domain_batch in stream.iter_calibration_batches(expert_id):
+            calibration_data.update(domain_batch)
+        components.convolution.fit_curves_from_calibration(expert_id, calibration_data)
+    components.convolution.save()
+def session_reset(components: SystemComponents, dead_state: DeadTimeState):
+    components.session_tracker.reset()
+    components.routing_memory.save(configs.ROUTING_MEMORY_PATH)
+    components.maml.save()
+    components.convolution.save_latency_store()
+    components.maml.log_k_velocity_all_domains()
+    dead_state.pending_timeline_a_inputs.clear()
+    dead_state.last_outer_loop_token = 0
+async def dead_time_orchestrator(components: SystemComponents, dead_state: DeadTimeState):
+    while True:
+        await asyncio.sleep(0.1)
+        if dead_state.inference_active:
+            continue
+        if components.maml.should_run_outer_loop(dead_state.total_tokens_processed, dead_state.last_outer_loop_token):
+            components.maml.run_outer_step_from_metrics(
+                domain=dead_state.last_domain,
+                k_value=dead_state.last_k_used,
+                reconstruction_entropy=dead_state.last_reconstruction_entropy,
+                timeline_a_rate=components.session_tracker.get_timeline_a_rate(),
+                cluster_count=len(components.routing_memory.clusters),
             )
-        self.history.append(text)
-        return {
-            "decision": decision,
-            "result": result,
-        }
-
-
-async def _run_once(prompt: str) -> None:
-    engine = SturnusEngine()
-    output = await engine.process_input(prompt)
-    print("[main] decision:", output["decision"])
-    print("[main] output:", output["result"]["output_text"])
-
-
-def self_test() -> None:
-    print("[main] self-test")
-    asyncio.run(_run_once("Test input for Sturnus"))
-
-
-def run_cli() -> None:
-    parser = argparse.ArgumentParser(description="Run the Sturnus engine")
-    parser.add_argument("--prompt", type=str, help="Single prompt to run")
-    parser.add_argument("--interactive", action="store_true", help="Interactive chat loop")
-    parser.add_argument("--max-turns", type=int, default=0, help="Stop after N turns in interactive mode")
-    parser.add_argument("--json", action="store_true", help="Print raw result dict")
+            dead_state.last_outer_loop_token = dead_state.total_tokens_processed
+        components.routing_memory.sync(configs.ROUTING_MEMORY_PATH)
+        components.convolution.save_latency_store()
+        components.session_tracker.log_warmup(dead_state.total_tokens_processed)
+        for expert_id in range(configs.EXPERT_POOL_SIZE):
+            domain = components.session_tracker.get_dominant_domain(expert_id)
+            if components.expert_pool.check_stuck_expert(expert_id, domain, dead_state.total_tokens_processed, components.convolution):
+                new_domain = components.session_tracker.find_migration_target(expert_id, components.convolution)
+                components.expert_pool.reassign_expert(expert_id, new_domain)
+        if dead_state.pending_timeline_a_inputs:
+            pending = dead_state.pending_timeline_a_inputs.copy()
+            dead_state.pending_timeline_a_inputs.clear()
+            for text in pending:
+                components.inference_engine.run(text, send_to_user=False)
+def process_input(text: str, components: SystemComponents, dead_state: DeadTimeState) -> Dict[str, Any]:
+    dead_state.inference_active = True
+    try:
+        result = components.inference_engine.run(text, send_to_user=True)
+        if result.timeline == "A":
+            dead_state.pending_timeline_a_inputs.append(text)
+        token_count = result.token_count
+        dead_state.total_tokens_processed += token_count
+        dead_state.last_domain = result.domain
+        dead_state.last_k_used = result.k_used
+        dead_state.last_reconstruction_entropy = result.reconstruction_entropy
+        components.maml.record_k(result.domain, result.k_used, dead_state.total_tokens_processed)
+        components.session_tracker.log_warmup(dead_state.total_tokens_processed)
+    finally:
+        dead_state.inference_active = False
+    return {
+        "timeline": result.timeline,
+        "output_text": result.output_text,
+        "k_used": result.k_used,
+        "experts_activated": result.experts_activated,
+    }
+async def run_interactive(components: SystemComponents, dead_state: DeadTimeState, max_turns: int = 0):
+    orchestrator_task = asyncio.create_task(dead_time_orchestrator(components, dead_state))
+    turns = 0
+    try:
+        while True:
+            if max_turns and turns >= max_turns:
+                break
+            try:
+                user_in = input("Sturnus> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                break
+            if not user_in:
+                continue
+            result = process_input(user_in, components, dead_state)
+            print(result["output_text"])
+            turns += 1
+    finally:
+        orchestrator_task.cancel()
+        session_reset(components, dead_state)
+def run_cli():
+    parser = argparse.ArgumentParser(description="Sturnus inference engine.")
+    parser.add_argument("--prompt", type=str, help="Run a single prompt and exit.")
+    parser.add_argument("--interactive", action="store_true", help="Start interactive chat loop.")
+    parser.add_argument("--max-turns", type=int, default=0, help="Stop after N turns.")
+    parser.add_argument("--json", action="store_true", help="Print full result dict.")
+    parser.add_argument("--buffet", action="store_true", help="Run Universal Buffet calibration.")
     args = parser.parse_args()
-
-    engine = SturnusEngine()
-
-    async def _run_prompt(text: str) -> None:
-        result = await engine.process_input(text)
+    components = boot_system()
+    dead_state = DeadTimeState()
+    if args.buffet:
+        run_universal_buffet(components)
+        return
+    if args.prompt:
+        result = process_input(args.prompt, components, dead_state)
         if args.json:
             print(result)
         else:
-            print(result["result"]["output_text"])
-
-    if args.prompt:
-        asyncio.run(_run_prompt(args.prompt))
+            print(result["output_text"])
+        session_reset(components, dead_state)
         return
-
     if args.interactive:
-        turns = 0
-        try:
-            while True:
-                if args.max_turns and turns >= args.max_turns:
-                    break
-                user_in = input("Sturnus> ").strip()
-                if not user_in:
-                    break
-                asyncio.run(_run_prompt(user_in))
-                turns += 1
-        finally:
-            engine._cancel_background()
+        asyncio.run(run_interactive(components, dead_state, max_turns=args.max_turns))
         return
-
-    self_test()
-
-
+    result = process_input("Test input for Sturnus.", components, dead_state)
+    print(result["output_text"])
+    session_reset(components, dead_state)
 if __name__ == "__main__":
     run_cli()
