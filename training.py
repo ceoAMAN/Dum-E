@@ -2,8 +2,21 @@ from __future__ import annotations
 from typing import List
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.utils import tree_flatten
 import configs
 from vectors import dot_product_similarity_matrix, exponential_decay_weights
+def _is_finite_scalar(value: mx.array) -> bool:
+    finite = mx.all(mx.isfinite(value))
+    mx.eval(finite)
+    return bool(finite.item())
+def _tree_is_finite(tree) -> bool:
+    flat = dict(tree_flatten(tree))
+    for value in flat.values():
+        finite = mx.all(mx.isfinite(value))
+        mx.eval(finite)
+        if not bool(finite.item()):
+            return False
+    return True
 def compute_l_eff_loss(l_eff_scores: mx.array, selected_mask: mx.array) -> mx.array:
     selected_scores = l_eff_scores * selected_mask
     n_selected = mx.sum(selected_mask) + 1e-8
@@ -80,8 +93,12 @@ def apply_gate_gradients(
         return compute_l_gate(lambdas, l_eff, l_dom, l_rel, l_div)
     loss_and_grad_fn = nn.value_and_grad(gate_model, gate_loss_fn)
     loss, grads = loss_and_grad_fn(gate_model)
+    if not _is_finite_scalar(loss) or not _tree_is_finite(grads):
+        return 0.0
     gate_optimizer.update(gate_model, grads)
     mx.eval(gate_model.parameters(), gate_optimizer.state)
+    if not _tree_is_finite(gate_model.parameters()):
+        return 0.0
     return float(loss.item())
 def apply_expert_gradients(
     expert_model,
@@ -102,6 +119,10 @@ def apply_expert_gradients(
         return mx.mean((hidden_mean[:min_dim] - central_synthesis[:min_dim]) ** 2)
     loss_and_grad_fn = nn.value_and_grad(expert_model, expert_loss_fn)
     loss, grads = loss_and_grad_fn(expert_model)
+    if not _is_finite_scalar(loss) or not _tree_is_finite(grads):
+        return 0.0
     expert_optimizer.update(expert_model, grads)
     mx.eval(expert_model.parameters(), expert_optimizer.state)
+    if not _tree_is_finite(expert_model.trainable_parameters()):
+        return 0.0
     return float(loss.item())

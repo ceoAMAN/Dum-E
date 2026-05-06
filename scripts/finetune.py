@@ -2,6 +2,7 @@ from __future__ import annotations
 import argparse
 import json
 import signal
+import threading
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -19,11 +20,12 @@ import configs
 from apex_nadir_convolution import ApexNadirConvolution
 from central import CentralModel
 from data import authenticate_huggingface, iter_mixture_samples, get_tokenizer
+from diagnostics import Diagnostics
 from experts import ExpertPool
 from gating import GateModel, TripleKSelector, MaskingSchedule, SelectedExpert
 from memory import RoutingMemory, SessionTracker
 from meta import MAMLOptimiser
-from splitter import get_available_ram_mb
+from splitter import get_available_ram_mb, prefetch_next_batch
 from training import (
     compute_dot_product_peer_gradients,
     apply_gate_gradients,
@@ -40,13 +42,14 @@ class FinetuneState:
         self.timeline_a_count = 0
         self.timeline_b_count = 0
         self.start_time = time.time()
-        self.last_checkpoint_time = time.time()
         self.last_log_time = time.time()
         self.weight_snapshots: Dict[int, List[mx.array]] = defaultdict(list)
         self.expert_r_i_history: Dict[int, List[mx.array]] = defaultdict(list)
         self.domain_r_i: Dict[str, List[float]] = defaultdict(list)
         self.last_domain_snapshot_tokens: Dict[str, int] = defaultdict(int)
         self.interrupted = False
+        self.diagnostics = Diagnostics()
+        self.current_x = configs.X_MAX
         if Path("logs/finetune_metrics.json").exists():
             try:
                 import json
@@ -56,6 +59,7 @@ class FinetuneState:
                     self.total_batches = d.get("total_batches", 0)
                     self.timeline_a_count = d.get("timeline_a_count", 0)
                     self.timeline_b_count = d.get("timeline_b_count", 0)
+                    self.current_x = d.get("x_next", self.current_x)
             except Exception:
                 pass
     def elapsed(self) -> str:
@@ -79,51 +83,39 @@ def log_progress(
     batch_loss: float,
     batch_r_i: float,
     k_used: int,
-    k_raw: int,
     domain: str,
-    max_c: int,
-    fragment_size: int,
-    requested_expert_ids: List[int],
     active_expert_ids: List[int],
-    missing_expert_ids: List[int],
+    timeline_pref: str,
+    a_l: int,
     confidence: float,
-    cluster_hit,
-    source: str,
-    expert_r_i_scores: Dict[int, float],
+    thermal_state: float,
+    ram_headroom_mb: float,
+    x_next: int,
+    tokens_per_sec: float,
 ):
     state.last_log_time = time.time()
-    avg_loss = float(np.mean(state.loss_history[-100:])) if state.loss_history else 0.0
-    avg_r_i = float(np.mean(state.r_i_history[-100:])) if state.r_i_history else 0.0
-    tps = state.tokens_per_sec()
-    tl_a_rate = state.timeline_a_count / max(state.timeline_a_count + state.timeline_b_count, 1) * 100
-    expert_r_i_text = ", ".join(
-        f"{eid}:{score:+.3f}" for eid, score in sorted(expert_r_i_scores.items())
-    ) or "-"
     print(
-        f"time={state.elapsed()} | "
-        f"batch={state.total_batches:>6d} | "
-        f"tokens={state.total_tokens:>9d} | "
+        f"batch={state.total_batches} | "
         f"loss={float(batch_loss):.4f} | "
-        f"avg_loss={avg_loss:.4f} | "
-        f"k={k_used:>2d} | "
-        f"k_raw={k_raw:>2d} | "
-        f"r_i={batch_r_i:+.4f} | "
-        f"avg_r_i={avg_r_i:+.4f} | "
-        f"max_c={max_c:>2d} | "
-        f"frag={fragment_size:>3d} | "
-        f"req={len(requested_expert_ids):>2d} | "
-        f"active={len(active_expert_ids):>2d} | "
-        f"experts_idx={active_expert_ids} | "
-        f"expert_r_i=[{expert_r_i_text}] | "
-        f"requested={requested_expert_ids} | "
-        f"missing={missing_expert_ids} | "
+        f"k={k_used} | "
+        f"pref={timeline_pref} | "
+        f"a_l={a_l} | "
         f"conf={confidence:.3f} | "
-        f"domain={domain:<12s} | "
-        f"source={source:<12.12s} | "
-        f"cluster={'Y' if cluster_hit is not None else 'N'} | "
-        f"tok/s={tps:.1f} | "
-        f"tl_a={tl_a_rate:.0f}%"
+        f"x_next={x_next} | "
+        f"thermal={thermal_state:.1f} | "
+        f"ram_mb={ram_headroom_mb:.0f} | "
+        f"tok/s={tokens_per_sec:.1f} | "
+        f"r_i={batch_r_i:.4f} | "
+        f"domain={domain} | "
+        f"experts_used={active_expert_ids} | "
+        f"total_tokens={state.total_tokens}"
     )
+def log_stage(batch_number: int, stage: str, **fields: Any):
+    extras = " | ".join(f"{key}={value}" for key, value in fields.items())
+    if extras:
+        print(f"[batch {batch_number}] {stage} | {extras}")
+    else:
+        print(f"[batch {batch_number}] {stage}")
 def save_checkpoint(
     state: FinetuneState,
     convolution: ApexNadirConvolution,
@@ -131,12 +123,13 @@ def save_checkpoint(
     maml: MAMLOptimiser,
     gate: Optional[GateModel] = None,
     force: bool = False,
-    checkpoint_interval: int = 60,
+    checkpoint_every_batches: int = 100,
 ):
-    now = time.time()
-    if not force and now - state.last_checkpoint_time < checkpoint_interval:
-        return
-    state.last_checkpoint_time = now
+    if not force:
+        if checkpoint_every_batches <= 0:
+            checkpoint_every_batches = 100
+        if state.total_batches <= 0 or state.total_batches % checkpoint_every_batches != 0:
+            return
     Path("state").mkdir(parents=True, exist_ok=True)
     Path("logs").mkdir(parents=True, exist_ok=True)
     convolution.save()
@@ -159,6 +152,7 @@ def save_checkpoint(
         "timeline_a_count": state.timeline_a_count,
         "timeline_b_count": state.timeline_b_count,
         "tokens_per_sec": state.tokens_per_sec(),
+        "x_next": state.current_x,
         "domain_k_means": {d: float(np.mean(ks[-100:])) for d, ks in state.domain_k_history.items() if ks},
         "lambdas": maml.get_lambdas().tolist(),
     }
@@ -184,7 +178,8 @@ def run_finetune(
     max_tokens: int = 500_000,
     max_batches: int = 0,
     batch_token_target: int = 256,
-    checkpoint_interval: int = 300,
+    print_every_batches: int = 10,
+    checkpoint_every_batches: int = 100,
     seed: int = 42,
     clean: bool = False,
 ):
@@ -225,8 +220,10 @@ def run_finetune(
     linear_to_lora_layers(gate.model, num_layers, lora_config)
     gate.model.train()
     central = CentralModel()
-    central.load()
-    print(f"[boot] Central loaded ({configs.CENTRAL_MODEL_ID})")
+    # Do NOT call central.load() at boot — the 7B Central model consumes ~4 GB.
+    # Loading it here would leave <200 MB for experts. Instead, CentralModel.load()
+    # is called lazily on first use (it has an internal _loaded guard).
+    print(f"[boot] Central deferred (will load on first use: {configs.CENTRAL_MODEL_ID})")
     expert_pool = ExpertPool(convolution=convolution, session_tracker=session_tracker)
     triple_k = TripleKSelector(convolution=convolution)
     masking = MaskingSchedule()
@@ -242,13 +239,49 @@ def run_finetune(
     state = FinetuneState()
     setup_signal_handler(state)
     available_ram = get_available_ram_mb()
-    max_concurrent = max(1, int(available_ram // configs.EXPERT_RAM_MB))
-    max_concurrent = min(max_concurrent, configs.K_MAX)
-    print(f"[boot] Available RAM: {available_ram:.0f} MB → max {max_concurrent} concurrent experts")
+    boot_max_concurrent = max(1, int(available_ram // configs.EXPERT_RAM_MB))
+    boot_max_concurrent = min(boot_max_concurrent, configs.K_MAX)
+    print(f"[boot] Available RAM (before Central load): {available_ram:.0f} MB → max {boot_max_concurrent} concurrent experts")
     print(f"[boot] Starting training loop...")
     print()
-    data_stream = iter_mixture_samples(seed=seed)
-    for sample in data_stream:
+    print_every_batches = max(1, print_every_batches)
+    record_every_batches = max(1, checkpoint_every_batches)
+
+    # ── prefetch pipeline ────────────────────────────────────────────────────
+    # We peek one sample ahead so we can load the next batch's experts in a
+    # background thread while the current batch runs forward+backward+save.
+    _pf_thread: Optional[threading.Thread] = None
+    _pf_event:  Optional[threading.Event]  = None
+    _pf_ids:    List[int]                  = []
+
+    def _kick_prefetch(eids: List[int]) -> None:
+        nonlocal _pf_thread, _pf_event, _pf_ids
+        if not eids or _pf_event is not None:
+            return  # already one in-flight
+        _pf_event = threading.Event()
+        _pf_ids   = list(eids)
+        _pf_thread = threading.Thread(
+            target=prefetch_next_batch,
+            args=(expert_pool, _pf_ids, _pf_event),
+            daemon=True,
+        )
+        _pf_thread.start()
+
+    def _await_prefetch() -> List[int]:
+        """Block until the in-flight prefetch finishes; return prefetched IDs."""
+        nonlocal _pf_thread, _pf_event, _pf_ids
+        if _pf_event is None:
+            return []
+        _pf_event.wait()
+        _pf_thread = _pf_event = None
+        ids, _pf_ids = list(_pf_ids), []
+        return ids
+    # ── end prefetch helpers ─────────────────────────────────────────────────
+
+    data_iter = iter(iter_mixture_samples(seed=seed))
+    print("[boot] Waiting for first sample...")
+    sample = next(data_iter, None)
+    while sample is not None:
         if state.interrupted:
             break
         if max_tokens > 0 and state.total_tokens >= max_tokens:
@@ -257,20 +290,32 @@ def run_finetune(
             break
         text = sample.text
         if not text or len(text.strip()) < 20:
+            sample = next(data_iter, None)
             continue
         domain = classify_domain(text)
         source = sample.source
         token_ids = gate_tokenizer.encode(text)[:configs.MAX_SEQ_LEN]
         if len(token_ids) < configs.FRAGMENT_MIN:
+            sample = next(data_iter, None)
             continue
+        batch_start_time = time.time()
         tokens = mx.array(token_ids)
         n_tokens = len(token_ids)
+        batch_number = state.total_batches + 1
+        stage_due = batch_number <= 3
+        if stage_due:
+            log_stage(batch_number, "sample", source=source, domain=domain, tokens=n_tokens)
         gate_out = gate.forward(tokens)
         k = gate_out.k_per_token
-        k_raw = k
         confidence = gate_out.confidence
+        timeline_pref = gate_out.timeline_flag
+        a_l = 1 if timeline_pref == "A" else 0
         cluster_hit = routing_memory.lookup(gate_out.hidden_states)
+        if stage_due:
+            log_stage(batch_number, "gate", pref=timeline_pref, a_l=a_l, conf=f"{confidence:.3f}", k=k, cluster_hit=cluster_hit is not None)
         state.timeline_b_count += 1
+        if timeline_pref == "A":
+            state.timeline_a_count += 1
         if cluster_hit is not None:
             selected_ids = cluster_hit.top_experts[:k]
             selected = [SelectedExpert(expert_id=eid, distance_to_peak=0.0, domain=domain, is_alpha=False) for eid in selected_ids]
@@ -281,15 +326,24 @@ def run_finetune(
             state.total_batches += 1
             continue
         current_ram = get_available_ram_mb()
-        max_c = max(1, int(current_ram // configs.EXPERT_RAM_MB))
-        max_c = min(max_c, max_concurrent, configs.K_MAX)
+        x_used = state.current_x
+        current_max_concurrent = max(1, int(current_ram // configs.EXPERT_RAM_MB))
+        current_max_concurrent = min(current_max_concurrent, configs.K_MAX)
+        max_c = min(current_max_concurrent, configs.K_MAX, x_used)
         selected = selected[:max_c]
         requested_ids = [s.expert_id for s in selected]
+        if stage_due:
+            log_stage(batch_number, "load_start", requested=requested_ids, x_used=x_used, ram_mb=f"{current_ram:.0f}")
+        # Wait for any in-flight prefetch, then only load what isn't already in memory
+        _await_prefetch()
+        ids_to_load = [eid for eid in requested_ids if eid not in expert_pool.loaded_experts]
         try:
-            expert_pool.load_experts(requested_ids)
+            if ids_to_load:
+                expert_pool.load_experts(ids_to_load)
         except RuntimeError as e:
-            print(f"[warn] Could not load experts {requested_ids}: {e}")
+            print(f"[warn] Could not load experts {ids_to_load}: {e}")
             expert_pool.unload_experts(requested_ids)
+            sample = next(data_iter, None)
             state.total_tokens += n_tokens
             state.total_batches += 1
             continue
@@ -302,6 +356,8 @@ def run_finetune(
             continue
         if missing:
             print(f"[warn] Skipping unloaded experts: {missing}")
+        if stage_due:
+            log_stage(batch_number, "load_done", active=expert_ids, missing=missing)
         fragment_size = max(configs.FRAGMENT_MIN, n_tokens // max(len(expert_ids), 1))
         expert_outputs = []
         expert_hidden_states = []
@@ -322,11 +378,15 @@ def run_finetune(
             state.total_tokens += n_tokens
             state.total_batches += 1
             continue
+        if stage_due:
+            log_stage(batch_number, "experts_done", outputs=len(expert_outputs), fragment_size=fragment_size)
         expert_data = [
             {"expert_id": eo.expert_id, "output_text": eo.output_text, "hidden_states": eo.hidden_states, "wall_time": eo.wall_time}
             for eo in expert_outputs
         ]
         central_out = central.forward(text, expert_data, send_to_user=False)
+        if stage_due:
+            log_stage(batch_number, "central_done", entropy=f"{central_out.reconstruction_entropy:.4f}")
         batch_r_i_scores = []
         expert_r_i_scores: Dict[int, float] = {}
         batch_l_eff_raw = []
@@ -388,33 +448,68 @@ def run_finetune(
                     tokens=f_tokens,
                     central_synthesis=central_out.synthesis_hidden
                 )
+        if stage_due:
+            log_stage(batch_number, "gradients_done", experts=expert_ids)
         expert_pool.save_experts(expert_ids)
-        expert_pool.unload_experts(expert_ids)
+
+        # ── prefetch next batch while save finishes ───────────────────────────
+        # Peek at the next raw sample, skip blanks, run the gate on it, and
+        # kick off a background thread to load that batch's experts so they
+        # are already in memory by the time the next iteration reaches load_experts.
+        next_sample = next(data_iter, None)
+        while next_sample is not None and (not next_sample.text or len(next_sample.text.strip()) < 20):
+            next_sample = next(data_iter, None)
+        if next_sample is not None:
+            _nxt_ids = gate_tokenizer.encode(next_sample.text)[:configs.MAX_SEQ_LEN]
+            if len(_nxt_ids) >= configs.FRAGMENT_MIN:
+                _nxt_tokens  = mx.array(_nxt_ids)
+                _nxt_gate    = gate.forward(_nxt_tokens)
+                _nxt_ram     = get_available_ram_mb()
+                _nxt_max_c   = max(1, min(int(_nxt_ram // configs.EXPERT_RAM_MB), configs.K_MAX, state.current_x))
+                _nxt_sel     = triple_k.select_experts(_nxt_gate, session_tracker, masking, state.total_batches + 1)
+                _nxt_eids    = [s.expert_id for s in _nxt_sel[:_nxt_max_c]]
+                _kick_prefetch(_nxt_eids)  # non-blocking — loads in background
+        # ── end prefetch kick ─────────────────────────────────────────────────
+
+        # Unload current experts but keep any that were just prefetched
+        expert_pool.unload_experts(expert_ids, keep_buffer=set(_pf_ids))
+        if stage_due:
+            log_stage(batch_number, "save_unload_done", experts=expert_ids)
+
+        sample = next_sample  # advance the manual iterator
         if len(expert_hidden_states) >= 2:
             peer_loss = compute_dot_product_peer_gradients(expert_hidden_states)
             mx.eval(peer_loss)
         mean_r_i = float(np.mean(batch_r_i_scores)) if batch_r_i_scores else 0.0
+        actual_k = len(expert_ids)
         state.loss_history.append(batch_loss)
         state.r_i_history.append(mean_r_i)
-        state.domain_k_history[domain].append(k)
+        state.domain_k_history[domain].append(actual_k)
         state.total_tokens += n_tokens
         state.total_batches += 1
         state.total_experts_activated += len(expert_ids)
-        maml.record_k(domain, k, state.total_tokens)
+        batch_elapsed = time.time() - batch_start_time
+        state.current_x = state.diagnostics.update(state.total_tokens, batch_elapsed, max_c, actual_k)
+        latest_diag = state.diagnostics.history[-1]
+        batch_tok_s = n_tokens / max(batch_elapsed, 1e-6)
+        print_due = state.total_batches <= 10 or state.total_batches % print_every_batches == 0
+        record_due = state.total_batches % record_every_batches == 0
+        maml.record_k(domain, actual_k, state.total_tokens)
         if maml.should_run_outer_loop(state.total_tokens, maml.state.last_outer_token):
             maml.run_outer_step_from_metrics(
                 domain=domain,
-                k_value=k,
+                k_value=actual_k,
                 reconstruction_entropy=central_out.reconstruction_entropy,
                 timeline_a_rate=session_tracker.get_timeline_a_rate(),
                 cluster_count=len(routing_memory.clusters),
             )
             maml.state.last_outer_token = state.total_tokens
+        migrated_experts = []
         for eo in expert_outputs:
             if expert_pool.check_starvation_eviction(eo.expert_id, domain):
                 new_domain = session_tracker.find_migration_target(eo.expert_id, convolution)
                 expert_pool.reassign_expert(eo.expert_id, new_domain)
-                print(f"[migration] Expert {eo.expert_id}: {domain} -> {new_domain}")
+                migrated_experts.append((eo.expert_id, new_domain))
         domain_r_i_history = state.domain_r_i[domain]
         domain_mean_r_i = float(np.mean(domain_r_i_history[-100:])) if domain_r_i_history else 0.0
         state.domain_r_i[domain].append(mean_r_i)
@@ -428,56 +523,64 @@ def run_finetune(
             routing_memory.spawn_cluster(
                 gate_hidden=gate_out.hidden_states, expert_ids=expert_ids,
                 tkl_scores=batch_tkl_scores, r_out_snapshot=r_out_snap,
-                l_eff_scores=l_eff_snap, optimal_k=k, token_count=state.total_tokens,
+                l_eff_scores=l_eff_snap, optimal_k=actual_k, token_count=state.total_tokens,
                 r_i=mean_r_i, domain_mean_r_i=domain_mean_r_i,
             )
         if state.total_batches % 500 == 0 and state.total_batches > 0:
             routing_memory.prune_stale(state.total_tokens)
             routing_memory.merge_close_clusters()
-        log_progress(
-            state=state,
-            batch_loss=batch_loss,
-            batch_r_i=mean_r_i,
-            k_used=k,
-            k_raw=k_raw,
-            domain=domain,
-            max_c=max_c,
-            fragment_size=fragment_size,
-            requested_expert_ids=requested_ids,
-            active_expert_ids=expert_ids,
-            missing_expert_ids=missing,
-            confidence=confidence,
-            cluster_hit=cluster_hit,
-            source=source,
-            expert_r_i_scores=expert_r_i_scores,
-        )
+        if print_due:
+            if migrated_experts:
+                migrated_ids = [eid for eid, _ in migrated_experts]
+                print(f"[migration] count={len(migrated_experts)} | experts={migrated_ids} | from={domain}")
+            log_progress(
+                state=state,
+                batch_loss=batch_loss,
+                batch_r_i=mean_r_i,
+                k_used=actual_k,
+                domain=domain,
+                active_expert_ids=expert_ids,
+                timeline_pref=timeline_pref,
+                a_l=a_l,
+                confidence=confidence,
+                thermal_state=latest_diag.thermal_state,
+                ram_headroom_mb=latest_diag.ram_headroom_mb,
+                x_next=state.current_x,
+                tokens_per_sec=batch_tok_s,
+            )
         cluster_count = len(routing_memory.clusters)
         timeline_a_rate = state.timeline_a_count / max(state.timeline_a_count + state.timeline_b_count, 1)
-        append_proof_metric(
-            {
-                "record_type": "batch",
-                "time": state.elapsed(),
-                "elapsed_seconds": int(time.time() - state.start_time),
-                "batch": state.total_batches,
-                "tokens": state.total_tokens,
-                "source": source,
-                "domain": domain,
-                "k": int(k),
-                "loss": float(batch_loss),
-                "avg_loss": float(np.mean(state.loss_history[-100:])),
-                "r_i": float(mean_r_i),
-                "avg_r_i": float(np.mean(state.r_i_history[-100:])),
-                "confidence": float(confidence),
-                "requested_experts": requested_ids,
-                "active_experts": expert_ids,
-                "expert_r_i": expert_r_i_scores,
-                "cluster_hit": cluster_hit is not None,
-                "cluster_count": cluster_count,
-                "timeline_a_rate": float(timeline_a_rate),
-                "tokens_per_sec": float(state.tokens_per_sec()),
-            }
-        )
-        if state.total_tokens - state.last_domain_snapshot_tokens[domain] >= 1000:
+        if record_due:
+            append_proof_metric(
+                {
+                    "record_type": "batch",
+                    "time": state.elapsed(),
+                    "elapsed_seconds": int(time.time() - state.start_time),
+                    "batch": state.total_batches,
+                    "tokens": state.total_tokens,
+                    "source": source,
+                    "domain": domain,
+                    "k": int(actual_k),
+                    "timeline_pref": timeline_pref,
+                    "a_l": int(a_l),
+                    "loss": float(batch_loss),
+                    "avg_loss": float(np.mean(state.loss_history[-100:])),
+                    "r_i": float(mean_r_i),
+                    "avg_r_i": float(np.mean(state.r_i_history[-100:])),
+                    "confidence": float(confidence),
+                    "x_next": int(state.current_x),
+                    "thermal": float(latest_diag.thermal_state),
+                    "ram_mb": float(latest_diag.ram_headroom_mb),
+                    "ssd_read_rate_mb": float(latest_diag.ssd_read_rate_mb),
+                    "requested_experts": requested_ids,
+                    "active_experts": expert_ids,
+                    "expert_r_i": expert_r_i_scores,
+                    "cluster_hit": cluster_hit is not None,
+                    "cluster_count": cluster_count,
+                    "timeline_a_rate": float(timeline_a_rate),
+                    "tokens_per_sec": float(batch_tok_s),
+                }
+            )
             state.last_domain_snapshot_tokens[domain] = state.total_tokens
             append_proof_metric(
                 {
@@ -487,8 +590,13 @@ def run_finetune(
                     "batch": state.total_batches,
                     "tokens": state.total_tokens,
                     "domain": domain,
-                    "k": int(k),
+                    "k": int(actual_k),
+                    "timeline_pref": timeline_pref,
+                    "a_l": int(a_l),
                     "r_i": float(mean_r_i),
+                    "x_next": int(state.current_x),
+                    "thermal": float(latest_diag.thermal_state),
+                    "ram_mb": float(latest_diag.ram_headroom_mb),
                     "cluster_count": cluster_count,
                     "timeline_a_rate": float(timeline_a_rate),
                 }
@@ -499,7 +607,7 @@ def run_finetune(
             routing_memory,
             maml,
             gate=gate,
-            checkpoint_interval=checkpoint_interval,
+            checkpoint_every_batches=record_every_batches,
         )
     print()
     print("=" * 70)
@@ -519,14 +627,15 @@ def run_finetune(
             late_k = float(np.mean(ks[-50:]))
             print(f"  K({domain}):  {early_k:.1f} → {late_k:.1f}  (Δ={late_k - early_k:+.1f})")
     print("=" * 70)
-    save_checkpoint(state, convolution, routing_memory, maml, session_tracker, gate=gate, force=True)
+    save_checkpoint(state, convolution, routing_memory, maml, gate=gate, force=True)
     print("[done] Final checkpoint saved")
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Sturnus full fine-tuning")
     parser.add_argument("--max-tokens", type=int, default=500_000, help="Stop after this many tokens")
     parser.add_argument("--max-batches", type=int, default=0, help="Stop after this many batches (0=unlimited)")
     parser.add_argument("--batch-size", type=int, default=256, help="Target tokens per batch")
-    parser.add_argument("--checkpoint-interval", type=int, default=300, help="Seconds between checkpoints")
+    parser.add_argument("--print-every-batches", type=int, default=10, help="Print progress every N batches")
+    parser.add_argument("--checkpoint-every-batches", "--checkpoint-interval", dest="checkpoint_every_batches", type=int, default=100, help="Record progress and save checkpoints every N batches")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for data sampling")
     parser.add_argument("--clean", action="store_true", help="Start from empty state")
     args = parser.parse_args()
@@ -534,7 +643,8 @@ if __name__ == "__main__":
         max_tokens=args.max_tokens,
         max_batches=args.max_batches,
         batch_token_target=args.batch_size,
-        checkpoint_interval=args.checkpoint_interval,
+        print_every_batches=args.print_every_batches,
+        checkpoint_every_batches=args.checkpoint_every_batches,
         seed=args.seed,
         clean=args.clean,
     )

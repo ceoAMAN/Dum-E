@@ -3,7 +3,9 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict, List
 import mlx.core as mx
+import numpy as np
 import configs
+from apex_nadir_convolution import ApexNadirConvolution
 @dataclass
 class CentralOutput:
     synthesis_text: str
@@ -132,11 +134,24 @@ class CentralModel:
     def compute_reconstruction_entropy(self, synthesis_hidden: mx.array) -> float:
         if synthesis_hidden is None:
             return 0.0
-        probs = mx.softmax(synthesis_hidden)
-        mx.eval(probs)
-        log_probs = mx.log(probs + 1e-10)
-        mx.eval(log_probs)
-        entropy = -float(mx.sum(probs * log_probs).item())
+        values = np.asarray(synthesis_hidden.tolist(), dtype=np.float64).reshape(-1)
+        if values.size == 0:
+            return 0.0
+        finite_mask = np.isfinite(values)
+        if not finite_mask.any():
+            return 0.0
+        values = values[finite_mask]
+        values = np.clip(values, -1e4, 1e4)
+        values = values - np.max(values)
+        exp_values = np.exp(values)
+        denom = float(exp_values.sum())
+        if denom <= 0.0 or not np.isfinite(denom):
+            return 0.0
+        probs = exp_values / denom
+        probs = np.clip(probs, 1e-12, 1.0)
+        entropy = float(-(probs * np.log(probs)).sum())
+        if not np.isfinite(entropy):
+            return 0.0
         return entropy
     def generate(self, input_text: str, max_tokens: int = 256) -> str:
         self.load()

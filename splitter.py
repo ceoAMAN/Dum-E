@@ -1,8 +1,9 @@
 from __future__ import annotations
 import math
 import subprocess
+import threading
 from dataclasses import dataclass, field
-from typing import List, Dict
+from typing import Dict, List, Optional
 from collections import defaultdict
 import mlx.core as mx
 import configs
@@ -37,17 +38,40 @@ class OverlapPaddedFragment:
     fragment_len: int
     expert_id: int
     original_tokens: mx.array
-def compute_xy(total_tokens: int, r_out_mean: float, available_ram_mb: float) -> XYGeometry:
+def compute_xy(
+    total_tokens: int,
+    r_out_mean: float,
+    available_ram_mb: float,
+    x_override: Optional[int] = None,
+) -> XYGeometry:
     if total_tokens <= 0:
         raise ValueError(f"total_tokens must be > 0, got {total_tokens}")
     if r_out_mean <= 0:
         raise ValueError(f"r_out_mean must be > 0, got {r_out_mean}")
     if available_ram_mb < configs.EXPERT_RAM_MB:
         raise ValueError(f"Insufficient RAM: {available_ram_mb:.1f} MB available, {configs.EXPERT_RAM_MB} MB required per expert.")
-    X = max(1, math.floor(available_ram_mb / configs.EXPERT_RAM_MB))
+    if x_override is not None:
+        X = max(configs.X_MIN, min(configs.X_MAX, x_override))
+    else:
+        X = max(1, math.floor(available_ram_mb / configs.EXPERT_RAM_MB))
     total_experts_needed = max(1, math.ceil(total_tokens / r_out_mean))
     Y = max(1, math.ceil(total_experts_needed / X))
     return XYGeometry(X=X, Y=Y, total_experts_needed=total_experts_needed, r_out_mean=r_out_mean, available_ram_mb=available_ram_mb, total_tokens=total_tokens)
+
+
+def prefetch_next_batch(
+    expert_pool,
+    next_batch_expert_ids: List[int],
+    done_event: threading.Event,
+) -> None:
+    try:
+        expert_pool.load_experts(next_batch_expert_ids)
+    except Exception as e:
+        print(f"[prefetch] Failed to prefetch experts {next_batch_expert_ids}: {e}")
+    finally:
+        done_event.set()
+
+
 def build_geography_batches(tokens: mx.array, domain_map: Dict[int, str], n_y: int) -> List[DomainBatch]:
     total_tokens_count = tokens.shape[0]
     domain_groups: Dict[str, List[int]] = defaultdict(list)
@@ -151,8 +175,6 @@ def get_available_ram_mb() -> float:
             elif line.startswith("Pages inactive:"):
                 inactive_pages = int(line.split(":")[1].strip().rstrip("."))
         available_mb = (free_pages + inactive_pages) * page_size / (1024 * 1024)
-        usable_mb = max(0.0, available_mb)
-        print(f"[splitter] RAM: {available_mb:.0f} MB currently available")
-        return usable_mb
+        return max(0.0, available_mb)
     except Exception:
         return float(configs.EXPERT_RAM_MB * 3)

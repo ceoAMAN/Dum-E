@@ -2,7 +2,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 from dataclasses import dataclass, field
-from typing import Dict, List
+from typing import Any, Dict, List
 import configs
 from apex_nadir_convolution import ApexNadirConvolution
 from central import CentralModel
@@ -120,7 +120,7 @@ async def dead_time_orchestrator(components: SystemComponents, dead_state: DeadT
             pending = dead_state.pending_timeline_a_inputs.copy()
             dead_state.pending_timeline_a_inputs.clear()
             for text in pending:
-                components.inference_engine.run(text, send_to_user=False)
+                components.inference_engine.run(text, send_to_user=False, force_timeline_b=True)
 def process_input(text: str, components: SystemComponents, dead_state: DeadTimeState) -> Dict[str, Any]:
     dead_state.inference_active = True
     try:
@@ -142,6 +142,13 @@ def process_input(text: str, components: SystemComponents, dead_state: DeadTimeS
         "k_used": result.k_used,
         "experts_activated": result.experts_activated,
     }
+def run_pending_timeline_a_shadows(components: SystemComponents, dead_state: DeadTimeState):
+    if not dead_state.pending_timeline_a_inputs:
+        return
+    pending = dead_state.pending_timeline_a_inputs.copy()
+    dead_state.pending_timeline_a_inputs.clear()
+    for text in pending:
+        components.inference_engine.run(text, send_to_user=False, force_timeline_b=True)
 async def run_interactive(components: SystemComponents, dead_state: DeadTimeState, max_turns: int = 0):
     orchestrator_task = asyncio.create_task(dead_time_orchestrator(components, dead_state))
     turns = 0
@@ -176,6 +183,7 @@ def run_cli():
         return
     if args.prompt:
         result = process_input(args.prompt, components, dead_state)
+        run_pending_timeline_a_shadows(components, dead_state)
         if args.json:
             print(result)
         else:
@@ -186,6 +194,7 @@ def run_cli():
         asyncio.run(run_interactive(components, dead_state, max_turns=args.max_turns))
         return
     result = process_input("Test input for Sturnus.", components, dead_state)
+    run_pending_timeline_a_shadows(components, dead_state)
     print(result["output_text"])
     session_reset(components, dead_state)
 if __name__ == "__main__":

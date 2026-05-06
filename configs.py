@@ -5,9 +5,10 @@ def _load_local_env() -> None:
     env_path = Path(__file__).resolve().parent / ".env.local"
     if not env_path.exists():
         return
+    comment_prefix = chr(35)
     for raw_line in env_path.read_text().splitlines():
         line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
+        if not line or line[:1] == comment_prefix or "=" not in line:
             continue
         key, value = line.split("=", 1)
         key = key.strip()
@@ -42,6 +43,11 @@ CLUSTER_CAP_RATE = 50
 CLUSTER_PRUNE_AGE = 10_000
 CLUSTER_CONFIDENCE_FLOOR = 0.4
 FAST_PATH_THRESHOLD = 0.85
+THERMAL_SAMPLE_INTERVAL = 1
+THERMAL_THROTTLE_TEMP = 85.0
+DIAGNOSTICS_SAVE_PATH = "state/diagnostics.pkl"
+X_MIN = 1
+X_MAX = 7
 LAMBDA_INIT = [0.25, 0.25, 0.25, 0.25]
 ALPHA_LR = 1e-4
 BETA_LR = 1e-5
@@ -52,19 +58,30 @@ L_REL_N_WINDOWS = 10
 MASKING_STUCK_THRESHOLD = 0.9
 ALPHA_PROTECTION_THRESHOLD = 0.5
 EMA_DECAY = 0.99
+STARVATION_MIN_ACTIVATIONS = 5   # expert must have this many activations in domain before eviction
 OUTER_LOOP_TOKEN_INTERVAL = 500
 DATASET_WEIGHTS = {
-    "slim_orca": 0.25,
-    "red_pajama": 0.25,
-    "starcoder": 0.25,
-    "fineweb": 0.25,
+    "ultrachat": 0.125,
+    "dolly_15k": 0.125,
+    "alpaca_cleaned": 0.125,
+    "openorca": 0.125,
+    "gsm8k": 0.125,
+    "wikitext": 0.125,
+    "codeparrot_clean": 0.125,
+    "openhermes": 0.125,
 }
 DATASET_IDS = {
-    "slim_orca": ("Open-Orca/SlimOrca", "default"),
-    "red_pajama": ("wikitext", "wikitext-103-v1"),
-    "starcoder": ("bigcode/starcoderdata", "default"),
-    "fineweb": ("HuggingFaceFW/fineweb", "CC-MAIN-2024-10"),
+    "ultrachat": ("HuggingFaceH4/ultrachat_200k", None, "train_sft"),
+    "dolly_15k": ("databricks/databricks-dolly-15k", None, "train"),
+    "alpaca_cleaned": ("yahma/alpaca-cleaned", None, "train"),
+    "openorca": ("Open-Orca/OpenOrca", "default", "train"),
+    "gsm8k": ("openai/gsm8k", "main", "train"),
+    "wikitext": ("Salesforce/wikitext", "wikitext-103-raw-v1", "train"),
+    "codeparrot_clean": ("codeparrot/codeparrot-clean", None, "train"),
+    "openhermes": ("teknium/openhermes", None, "train"),
 }
+DATASET_BOOT_TIMEOUT = 60.0
+DATASET_SAMPLE_TIMEOUT = 5.0
 ROUTING_MEMORY_PATH = "state/routing_memory.pkl"
 LAMBDA_SAVE_PATH = "state/lambdas.npz"
 CHECKPOINT_DIR = Path("state/checkpoints/")

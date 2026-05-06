@@ -7,6 +7,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 import mlx.core as mx
 import mlx.nn as nn
+import mlx.optimizers as optim
 import configs
 import data
 from scripts.train_common import load_mlx_model, resolve_model_id
@@ -48,13 +49,20 @@ def run() -> None:
     print(f"[train_phase2] Loaded {model_id}")
     out_dir = configs.CHECKPOINT_DIR / "gate"
     out_dir.mkdir(parents=True, exist_ok=True)
-    step = 0
-    while step < max_steps:
-        batch = next(batch_iter)
-        input_ids = batch["input_ids"]
-        attention_mask = batch["attention_mask"]
-        output = model(input_ids)
-        mx.eval(output)
+    from mlx_lm.tuner.utils import linear_to_lora_layers
+    model.freeze()
+    lora_config = {"rank": configs.LORA_R, "scale": configs.LORA_ALPHA, "dropout": configs.LORA_DROPOUT}
+    num_layers = len(model.layers) if hasattr(model, "layers") else len(model.model.layers)
+    linear_to_lora_layers(model, num_layers, lora_config)
+    weights_path = out_dir / "weights.safetensors"
+    if weights_path.exists():
+        model.load_weights(str(weights_path), strict=False)
+    model.train()
+
+    optimizer = optim.Adam(learning_rate=configs.LEARNING_RATE)
+
+    def _gate_loss(m: nn.Module, input_ids: mx.array, attention_mask: mx.array) -> mx.array:
+        output = m(input_ids)
         if output.ndim == 3:
             hidden = mx.mean(output, axis=1)
         else:
@@ -68,8 +76,39 @@ def run() -> None:
         load_balance_loss = -entropy
         rq_loss = _routing_quality_loss(expert_logits)
         ac_loss = _adaptive_context_loss(hidden)
-        loss = k_loss + lb_weight * load_balance_loss + rq_weight * rq_loss + ac_weight * ac_loss
+        return k_loss + lb_weight * load_balance_loss + rq_weight * rq_loss + ac_weight * ac_loss
+
+    loss_and_grad_fn = nn.value_and_grad(model, _gate_loss)
+
+    step = 0
+    while step < max_steps:
+        batch = next(batch_iter)
+        input_ids = batch["input_ids"]
+        attention_mask = batch["attention_mask"]
+
+        loss, grads = loss_and_grad_fn(model, input_ids, attention_mask)
         mx.eval(loss)
+        optimizer.update(model, grads)
+        mx.eval(model.parameters(), optimizer.state)
+
+        # log component losses for visibility (no-grad, cheap)
+        with mx.no_grad() if hasattr(mx, "no_grad") else __import__("contextlib").nullcontext():
+            output = model(input_ids)
+            if output.ndim == 3:
+                hidden = mx.mean(output, axis=1)
+            else:
+                hidden = output
+            expert_logits = hidden[:, :configs.NUM_EXPERTS] if hidden.shape[-1] >= configs.NUM_EXPERTS else hidden
+            k_logits = hidden[:, :configs.K_MAX + 1] if hidden.shape[-1] >= configs.K_MAX + 1 else hidden
+            target_k = _target_k(attention_mask)
+            k_loss = mx.mean(nn.losses.cross_entropy(k_logits, target_k))
+            probs = mx.softmax(expert_logits, axis=-1)
+            entropy = -mx.mean(mx.sum(probs * mx.log(probs + 1e-8), axis=-1))
+            load_balance_loss = -entropy
+            rq_loss = _routing_quality_loss(expert_logits)
+            ac_loss = _adaptive_context_loss(hidden)
+            mx.eval(k_loss, load_balance_loss, rq_loss, ac_loss)
+
         if step % 10 == 0:
             print(
                 f"[train_phase2] step={step} total={float(loss.item()):.4f} "
@@ -77,6 +116,9 @@ def run() -> None:
                 f"rq={float(rq_loss.item()):.4f} ac={float(ac_loss.item()):.4f}"
             )
         step += 1
+
+    from mlx.utils import tree_flatten
+    mx.save_safetensors(str(out_dir / "weights.safetensors"), dict(tree_flatten(model.trainable_parameters())))
     print(f"[train_phase2] Completed {step} steps, saved to {out_dir}")
 
 if __name__ == "__main__":
