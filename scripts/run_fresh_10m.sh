@@ -7,10 +7,11 @@ if [ ! -x "$PYTHON_BIN" ]; then
   PYTHON_BIN="$ROOT/sturnus-env/bin/python"
 fi
 LOG_DIR="$ROOT/logs"
-LOG_FILE="$LOG_DIR/sturnus-10m.log"
-PID_FILE="$LOG_DIR/sturnus-10m.pid"
+LOG_FILE="$LOG_DIR/sturnus-fresh-10m.log"
+PID_FILE="$LOG_DIR/sturnus-fresh-10m.pid"
 MAX_TOKENS="${STURNUS_MAX_TOKENS:-10000000}"
 BATCH_SIZE="${STURNUS_BATCH_SIZE:-256}"
+PRINT_EVERY_BATCHES="${STURNUS_PRINT_EVERY_BATCHES:-10}"
 CHECKPOINT_EVERY_BATCHES="${STURNUS_CHECKPOINT_EVERY_BATCHES:-100}"
 SEED="${STURNUS_SEED:-42}"
 
@@ -24,7 +25,7 @@ if [ -f "$ROOT/.env.local" ]; then
 fi
 
 if [ ! -x "$PYTHON_BIN" ]; then
-  echo "[error] missing virtualenv python: $PYTHON_BIN"
+  echo "[error] missing python: $PYTHON_BIN"
   exit 1
 fi
 
@@ -43,43 +44,33 @@ if [ -z "${HF_TOKEN:-}" ]; then
   exit 1
 fi
 
-if pgrep -f 'scripts/finetune.py' >/dev/null 2>&1; then
-  echo "[boot] stopping existing finetune process"
-  pkill -INT -f 'scripts/finetune.py' || true
-  for _ in $(seq 1 30); do
-    if ! pgrep -f 'scripts/finetune.py' >/dev/null 2>&1; then
-      break
-    fi
-    sleep 1
-  done
-  if pgrep -f 'scripts/finetune.py' >/dev/null 2>&1; then
-    echo "[boot] forcing remaining finetune process to stop"
-    pkill -TERM -f 'scripts/finetune.py' || true
-    sleep 2
-  fi
-fi
+pkill -INT -f 'scripts/finetune.py' >/dev/null 2>&1 || true
+sleep 3
+pkill -TERM -f 'scripts/finetune.py' >/dev/null 2>&1 || true
+sleep 1
 
-echo "[boot] wiping previous state and logs for a fresh start"
 rm -rf "$ROOT/state"
 rm -f \
   "$ROOT/logs/finetune_metrics.json" \
   "$ROOT/logs/proof_metrics.jsonl" \
   "$ROOT/logs/benchmark_runs.jsonl" \
   "$ROOT/logs/benchmark_summary.json" \
-  "$ROOT/logs/sturnus-10m.log" \
-  "$ROOT/logs/sturnus-10m.pid"
+  "$LOG_FILE" \
+  "$PID_FILE"
 
-nohup env PYTHONFAULTHANDLER=1 caffeinate -dimsu "$PYTHON_BIN" scripts/finetune.py \
+nohup env PYTHONUNBUFFERED=1 PYTHONFAULTHANDLER=1 HF_TOKEN="${HF_TOKEN}" HF_HUB_DISABLE_PROGRESS_BARS=1 TRANSFORMERS_VERBOSITY=error caffeinate -dimsu \
+  "$PYTHON_BIN" "$ROOT/scripts/finetune.py" \
   --clean \
   --max-tokens "$MAX_TOKENS" \
   --batch-size "$BATCH_SIZE" \
+  --print-every-batches "$PRINT_EVERY_BATCHES" \
   --checkpoint-every-batches "$CHECKPOINT_EVERY_BATCHES" \
   --seed "$SEED" \
   > "$LOG_FILE" 2>&1 &
 
 PID=$!
 echo "$PID" > "$PID_FILE"
-echo "[ok] started fresh 10M run"
+echo "[ok] fresh run started"
 echo "[ok] pid=$PID"
 echo "[ok] python=$PYTHON_BIN ($PYTHON_VERSION)"
 echo "[ok] log=$LOG_FILE"

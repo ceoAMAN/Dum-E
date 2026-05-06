@@ -8,6 +8,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 import mlx.core as mx
 import mlx.nn as nn
+import mlx.optimizers as optim
 import configs
 import data
 from scripts.train_common import load_mlx_model, resolve_model_id
@@ -46,12 +47,20 @@ def run() -> None:
         model, _ = load_mlx_model(model_id)
         out_dir = configs.CHECKPOINT_DIR / "experts" / group_name
         out_dir.mkdir(parents=True, exist_ok=True)
-        step = 0
-        while step < max_steps:
-            batch = next(batch_iter)
-            input_ids = batch["input_ids"]
-            output = model(input_ids)
-            mx.eval(output)
+        from mlx_lm.tuner.utils import linear_to_lora_layers
+        model.freeze()
+        lora_config = {"rank": configs.LORA_R, "scale": configs.LORA_ALPHA, "dropout": configs.LORA_DROPOUT}
+        num_layers = len(model.layers) if hasattr(model, "layers") else len(model.model.layers)
+        linear_to_lora_layers(model, num_layers, lora_config)
+        weights_path = out_dir / "weights.safetensors"
+        if weights_path.exists():
+            model.load_weights(str(weights_path), strict=False)
+        model.train()
+
+        optimizer = optim.Adam(learning_rate=configs.LEARNING_RATE)
+
+        def _expert_loss(m: nn.Module, input_ids: mx.array) -> mx.array:
+            output = m(input_ids)
             if output.ndim == 3:
                 logits = output[:, :-1, :]
                 targets = input_ids[:, 1:]
@@ -66,15 +75,24 @@ def run() -> None:
                 task_loss = mx.mean(output)
                 distill_loss = mx.array(0.0)
                 alignment_loss = mx.array(0.0)
-            loss = task_loss + distill_weight * distill_loss + alignment_weight * alignment_loss
+            return task_loss + distill_weight * distill_loss + alignment_weight * alignment_loss
+
+        loss_and_grad_fn = nn.value_and_grad(model, _expert_loss)
+
+        step = 0
+        while step < max_steps:
+            batch = next(batch_iter)
+            input_ids = batch["input_ids"]
+            loss, grads = loss_and_grad_fn(model, input_ids)
             mx.eval(loss)
+            optimizer.update(model, grads)
+            mx.eval(model.parameters(), optimizer.state)
             if step % 10 == 0:
-                print(
-                    f"[train_phase3] {group_name} step={step} total={float(loss.item()):.4f} "
-                    f"task={float(task_loss.item()):.4f} distill={float(distill_loss.item()):.4f} "
-                    f"align={float(alignment_loss.item()):.4f}"
-                )
+                print(f"[train_phase3] {group_name} step={step} loss={float(loss.item()):.4f}")
             step += 1
+
+        from mlx.utils import tree_flatten
+        mx.save_safetensors(str(out_dir / "weights.safetensors"), dict(tree_flatten(model.trainable_parameters())))
         print(f"[train_phase3] {group_name} completed {step} steps, saved to {out_dir}")
     print("[train_phase3] Done")
 

@@ -139,6 +139,7 @@ class SessionTracker:
         self.domain_exposure: Dict[int, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
         self.expert_tkl: Dict[int, float] = defaultdict(float)
         self.expert_domains: Dict[int, str] = {}
+        self._expert_activations: Dict[int, int] = defaultdict(int)  # resets on migration
         self.token_count: int = 0
         self._timeline_a_tokens: int = 0
         self._warmup_logged: bool = False
@@ -148,6 +149,7 @@ class SessionTracker:
         self.expert_tkl[expert_id] = tkl_score
         self.domain_exposure[expert_id][domain] += tokens
         self.expert_domains[expert_id] = domain
+        self._expert_activations[expert_id] += 1
         self.token_count += tokens
     def record_timeline_a(self, tokens):
         self._timeline_a_tokens += tokens
@@ -159,6 +161,8 @@ class SessionTracker:
         return self.get_domain_mean_tkl(domain)
     def get_expert_tkl(self, expert_id):
         return self.expert_tkl.get(expert_id, 0.0)
+    def get_expert_activations(self, expert_id) -> int:
+        return self._expert_activations.get(expert_id, 0)
     def get_domain_exposure(self, expert_id, domain):
         return self.domain_exposure[expert_id].get(domain, 0)
     def get_domain_mean_exposure(self, domain):
@@ -186,6 +190,7 @@ class SessionTracker:
     def record_migration(self, expert_id, new_domain):
         self.expert_domains[expert_id] = new_domain
         self.domain_exposure[expert_id] = defaultdict(int)
+        self._expert_activations[expert_id] = 0  # reset cooldown counter
     def get_timeline_a_rate(self):
         return self._timeline_a_tokens / max(self.token_count, 1)
     def log_warmup(self, token_count):

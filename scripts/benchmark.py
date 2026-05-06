@@ -1,21 +1,26 @@
 from __future__ import annotations
+import json
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
+
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
 import numpy as np
+
 import configs
-from central import CentralModel
-from experts import ExpertPool
-from gating import GateModel, TripleKSelector, MaskingSchedule
-from memory import RoutingMemory, SessionTracker
 from apex_nadir_convolution import ApexNadirConvolution
-from inference import InferenceEngine
+from central import CentralModel
 from data import authenticate_huggingface
+from experts import ExpertPool
+from gating import GateModel, MaskingSchedule, TripleKSelector
+from inference import InferenceEngine, InferenceResult
+from memory import RoutingMemory, SessionTracker
+
 BENCHMARK_PROMPTS = [
     {
         "prompt": "What is quantum entanglement and how does it relate to Bell's theorem?",
@@ -58,23 +63,42 @@ BENCHMARK_PROMPTS = [
         "expected_keywords": ["2", "hours", "meet", "distance", "speed"],
     },
 ]
+
+
 @dataclass
-class BenchmarkResult:
-    prompt: str
+class BenchmarkRecord:
+    batch: int
+    loop: str
     category: str
-    mode: str
+    prompt: str
+    prompt_tokens: int
     output: str
+    timeline: str
+    loss: float
+    k: int
+    conf: float
+    x_next: int
+    thermal: float
+    ram_mb: float
+    ssd_read_rate_mb: float
+    tok_s: float
+    r_i: float
+    domain: str
+    experts_used: List[int]
+    total_tokens: int
     latency_ms: float
     accuracy: float
     reasoning_depth: float
-    consistency: float
-    overall: float
+
+
 def _score_accuracy(output: str, expected_keywords: List[str]) -> float:
     if not output:
         return 0.0
     output_lower = output.lower()
     hits = sum(1 for kw in expected_keywords if kw.lower() in output_lower)
     return hits / max(len(expected_keywords), 1)
+
+
 def _score_reasoning_depth(output: str) -> float:
     if not output:
         return 0.0
@@ -86,20 +110,11 @@ def _score_reasoning_depth(output: str) -> float:
         "first", "second", "finally", "in conclusion", "for example",
         "this means", "as a result", "due to", "leads to", "implies",
     ]
-    marker_count = sum(1 for m in reasoning_markers if m in output.lower())
+    marker_count = sum(1 for marker in reasoning_markers if marker in output.lower())
     marker_score = min(1.0, marker_count / 3.0)
     return 0.3 * length_score + 0.3 * structure_score + 0.4 * marker_score
-def _score_consistency(outputs: List[str]) -> float:
-    if len(outputs) < 2:
-        return 1.0
-    keyword_sets = [set(out.lower().split()) for out in outputs]
-    overlaps = []
-    for i in range(len(keyword_sets)):
-        for j in range(i + 1, len(keyword_sets)):
-            if keyword_sets[i] or keyword_sets[j]:
-                overlap = len(keyword_sets[i] & keyword_sets[j]) / max(len(keyword_sets[i] | keyword_sets[j]), 1)
-                overlaps.append(overlap)
-    return float(np.mean(overlaps)) if overlaps else 1.0
+
+
 def _build_components():
     configs.validate_config()
     authenticate_huggingface()
@@ -115,120 +130,179 @@ def _build_components():
     triple_k = TripleKSelector(convolution=convolution)
     masking = MaskingSchedule()
     engine = InferenceEngine(
-        gate=gate, expert_pool=expert_pool, central=central,
-        convolution=convolution, routing_memory=routing_memory,
-        session_tracker=session_tracker, triple_k=triple_k,
+        gate=gate,
+        expert_pool=expert_pool,
+        central=central,
+        convolution=convolution,
+        routing_memory=routing_memory,
+        session_tracker=session_tracker,
+        triple_k=triple_k,
         masking_schedule=masking,
     )
-    return central, engine, routing_memory
-def run_benchmark(runs_per_prompt: int = 2) -> Dict[str, Any]:
-    central, engine, routing_memory = _build_components()
-    central_results: List[BenchmarkResult] = []
-    pipeline_results: List[BenchmarkResult] = []
-    print("=" * 70)
-    print("  STURNUS BENCHMARK: Central-Only vs Full Pipeline")
-    print("=" * 70)
-    print()
+    return engine, routing_memory
+
+
+def _truncate_prompt(tokenizer, prompt: str, numerator: int, denominator: int) -> str:
+    token_ids = tokenizer.encode(prompt)
+    if not token_ids:
+        return prompt
+    target = max(1, int(len(token_ids) * numerator / max(denominator, 1)))
+    return tokenizer.decode(token_ids[:target])
+
+
+def _run_once(
+    engine: InferenceEngine,
+    prompt: str,
+    send_to_user: bool = True,
+    force_timeline_b: bool = False,
+    force_timeline_a: bool = False,
+):
+    start = time.time()
+    result = engine.run(
+        prompt,
+        send_to_user=send_to_user,
+        force_timeline_b=force_timeline_b,
+        force_timeline_a=force_timeline_a,
+    )
+    latency_ms = (time.time() - start) * 1000.0
+    tok_s = result.token_count / max(latency_ms / 1000.0, 1e-6)
+    return result, latency_ms, tok_s
+
+
+def _to_record(
+    batch: int,
+    loop: str,
+    category: str,
+    prompt: str,
+    expected_keywords: List[str],
+    result: InferenceResult,
+    latency_ms: float,
+    tok_s: float,
+) -> BenchmarkRecord:
+    return BenchmarkRecord(
+        batch=batch,
+        loop=loop,
+        category=category,
+        prompt=prompt,
+        prompt_tokens=result.token_count,
+        output=result.output_text,
+        timeline=result.timeline,
+        loss=0.0,
+        k=result.k_used,
+        conf=result.confidence,
+        x_next=result.x_next,
+        thermal=result.thermal_state,
+        ram_mb=result.ram_headroom_mb,
+        ssd_read_rate_mb=result.ssd_read_rate_mb,
+        tok_s=tok_s,
+        r_i=result.mean_r_i,
+        domain=result.domain,
+        experts_used=result.experts_activated,
+        total_tokens=result.token_count,
+        latency_ms=latency_ms,
+        accuracy=_score_accuracy(result.output_text, expected_keywords),
+        reasoning_depth=_score_reasoning_depth(result.output_text),
+    )
+
+
+def _append_record(path: Path, record: BenchmarkRecord) -> None:
+    with path.open("a") as handle:
+        handle.write(json.dumps(asdict(record)) + "\n")
+
+
+def _print_record(record: BenchmarkRecord) -> None:
+    print(
+        f"batch={record.batch} | "
+        f"loss={record.loss:.4f} | "
+        f"k={record.k} | "
+        f"conf={record.conf:.3f} | "
+        f"x_next={record.x_next} | "
+        f"thermal={record.thermal:.1f} | "
+        f"ram_mb={record.ram_mb:.0f} | "
+        f"tok/s={record.tok_s:.1f} | "
+        f"r_i={record.r_i:.4f} | "
+        f"domain={record.domain} | "
+        f"experts_used={record.experts_used} | "
+        f"total_tokens={record.total_tokens} | "
+        f"loop={record.loop} | "
+        f"timeline={record.timeline}"
+    )
+
+
+def _summarize(records: List[BenchmarkRecord]) -> Dict[str, Any]:
+    by_loop: Dict[str, Dict[str, float]] = {}
+    for loop_name in sorted({record.loop for record in records}):
+        loop_records = [record for record in records if record.loop == loop_name]
+        by_loop[loop_name] = {
+            "count": len(loop_records),
+            "avg_accuracy": float(np.mean([record.accuracy for record in loop_records])) if loop_records else 0.0,
+            "avg_reasoning_depth": float(np.mean([record.reasoning_depth for record in loop_records])) if loop_records else 0.0,
+            "avg_latency_ms": float(np.mean([record.latency_ms for record in loop_records])) if loop_records else 0.0,
+            "avg_tok_s": float(np.mean([record.tok_s for record in loop_records])) if loop_records else 0.0,
+            "avg_k": float(np.mean([record.k for record in loop_records])) if loop_records else 0.0,
+            "avg_conf": float(np.mean([record.conf for record in loop_records])) if loop_records else 0.0,
+            "avg_r_i": float(np.mean([record.r_i for record in loop_records])) if loop_records else 0.0,
+            "avg_x_next": float(np.mean([record.x_next for record in loop_records])) if loop_records else 0.0,
+        }
+    return {"loops": by_loop, "records": len(records)}
+
+
+def run_benchmark(output_dir: str = "logs", clear_existing: bool = True) -> Dict[str, Any]:
+    engine, routing_memory = _build_components()
+    output_root = Path(output_dir)
+    output_root.mkdir(parents=True, exist_ok=True)
+    records_path = output_root / "benchmark_runs.jsonl"
+    summary_path = output_root / "benchmark_summary.json"
+    if clear_existing:
+        records_path.unlink(missing_ok=True)
+        summary_path.unlink(missing_ok=True)
+    tokenizer = engine.gate.tokenizer
+    batch = 0
+    records: List[BenchmarkRecord] = []
     for item in BENCHMARK_PROMPTS:
         prompt = item["prompt"]
         category = item["category"]
-        expected = item["expected_keywords"]
-        print(f"  [{category.upper()}] {prompt[:60]}...")
-        central_outputs: List[str] = []
-        central_latencies: List[float] = []
-        for _ in range(runs_per_prompt):
-            start = time.time()
-            central.load()
-            out = central.generate(prompt)
-            latency = (time.time() - start) * 1000
-            central_outputs.append(out)
-            central_latencies.append(latency)
-        c_accuracy = float(np.mean([_score_accuracy(o, expected) for o in central_outputs]))
-        c_depth = float(np.mean([_score_reasoning_depth(o) for o in central_outputs]))
-        c_consistency = _score_consistency(central_outputs)
-        c_overall = 0.40 * c_accuracy + 0.35 * c_depth + 0.25 * c_consistency
-        c_latency = float(np.mean(central_latencies))
-        central_results.append(BenchmarkResult(
-            prompt=prompt, category=category, mode="central",
-            output=central_outputs[0], latency_ms=c_latency,
-            accuracy=c_accuracy, reasoning_depth=c_depth,
-            consistency=c_consistency, overall=c_overall,
-        ))
-        pipeline_outputs: List[str] = []
-        pipeline_latencies: List[float] = []
-        for _ in range(runs_per_prompt):
-            start = time.time()
-            result = engine.run(prompt, send_to_user=True)
-            latency = (time.time() - start) * 1000
-            pipeline_outputs.append(result.output_text)
-            pipeline_latencies.append(latency)
-        p_accuracy = float(np.mean([_score_accuracy(o, expected) for o in pipeline_outputs]))
-        p_depth = float(np.mean([_score_reasoning_depth(o) for o in pipeline_outputs]))
-        p_consistency = _score_consistency(pipeline_outputs)
-        p_overall = 0.40 * p_accuracy + 0.35 * p_depth + 0.25 * p_consistency
-        p_latency = float(np.mean(pipeline_latencies))
-        pipeline_results.append(BenchmarkResult(
-            prompt=prompt, category=category, mode="pipeline",
-            output=pipeline_outputs[0], latency_ms=p_latency,
-            accuracy=p_accuracy, reasoning_depth=p_depth,
-            consistency=p_consistency, overall=p_overall,
-        ))
-        delta = p_overall - c_overall
-        winner = "PIPELINE" if delta > 0.01 else ("CENTRAL" if delta < -0.01 else "TIE")
-        print(f"    Central:  acc={c_accuracy:.2f} depth={c_depth:.2f} cons={c_consistency:.2f} overall={c_overall:.2f} ({c_latency:.0f}ms)")
-        print(f"    Pipeline: acc={p_accuracy:.2f} depth={p_depth:.2f} cons={p_consistency:.2f} overall={p_overall:.2f} ({p_latency:.0f}ms)")
-        print(f"    Winner:   {winner} (delta={delta:+.3f})")
-        print()
-    print("=" * 70)
-    print("  AGGREGATE SCORES")
-    print("=" * 70)
-    print()
-    c_scores = {
-        "accuracy": float(np.mean([r.accuracy for r in central_results])),
-        "reasoning_depth": float(np.mean([r.reasoning_depth for r in central_results])),
-        "consistency": float(np.mean([r.consistency for r in central_results])),
-        "overall": float(np.mean([r.overall for r in central_results])),
-        "latency_ms": float(np.mean([r.latency_ms for r in central_results])),
-    }
-    p_scores = {
-        "accuracy": float(np.mean([r.accuracy for r in pipeline_results])),
-        "reasoning_depth": float(np.mean([r.reasoning_depth for r in pipeline_results])),
-        "consistency": float(np.mean([r.consistency for r in pipeline_results])),
-        "overall": float(np.mean([r.overall for r in pipeline_results])),
-        "latency_ms": float(np.mean([r.latency_ms for r in pipeline_results])),
-    }
-    print(f"  {'Metric':<20} {'Central':>10} {'Pipeline':>10} {'Delta':>10}")
-    print(f"  {'-'*50}")
-    for metric in ["accuracy", "reasoning_depth", "consistency", "overall"]:
-        c_val = c_scores[metric]
-        p_val = p_scores[metric]
-        delta = p_val - c_val
-        print(f"  {metric:<20} {c_val:>10.3f} {p_val:>10.3f} {delta:>+10.3f}")
-    print(f"  {'latency_ms':<20} {c_scores['latency_ms']:>10.0f} {p_scores['latency_ms']:>10.0f} {p_scores['latency_ms'] - c_scores['latency_ms']:>+10.0f}")
-    print()
-    by_category: Dict[str, Dict[str, List[float]]] = {}
-    for r in central_results:
-        by_category.setdefault(r.category, {"central": [], "pipeline": []})["central"].append(r.overall)
-    for r in pipeline_results:
-        by_category.setdefault(r.category, {"central": [], "pipeline": []})["pipeline"].append(r.overall)
-    print(f"  {'Category':<15} {'Central':>10} {'Pipeline':>10} {'Delta':>10}")
-    print(f"  {'-'*45}")
-    for cat in sorted(by_category.keys()):
-        c_mean = float(np.mean(by_category[cat]["central"])) if by_category[cat]["central"] else 0.0
-        p_mean = float(np.mean(by_category[cat]["pipeline"])) if by_category[cat]["pipeline"] else 0.0
-        print(f"  {cat:<15} {c_mean:>10.3f} {p_mean:>10.3f} {p_mean - c_mean:>+10.3f}")
-    print()
-    print(f"  Routing clusters: {len(routing_memory.clusters)}")
-    print()
-    overall_winner = "PIPELINE" if p_scores["overall"] > c_scores["overall"] + 0.01 else (
-        "CENTRAL" if c_scores["overall"] > p_scores["overall"] + 0.01 else "TIE"
-    )
-    print(f"  OVERALL WINNER: {overall_winner}")
-    print("=" * 70)
-    return {
-        "central": c_scores,
-        "pipeline": p_scores,
-        "by_category": {cat: {"central": float(np.mean(v["central"])), "pipeline": float(np.mean(v["pipeline"]))} for cat, v in by_category.items()},
-    }
+        expected_keywords = item["expected_keywords"]
+        half_prompt = _truncate_prompt(tokenizer, prompt, 1, 2)
+        centile_prompt = _truncate_prompt(tokenizer, prompt, 1, 100)
+
+        batch += 1
+        result_b_full, latency_b_full, tok_s_b_full = _run_once(engine, prompt, send_to_user=True, force_timeline_b=True)
+        record_b_full = _to_record(batch, "training_b_full", category, prompt, expected_keywords, result_b_full, latency_b_full, tok_s_b_full)
+        records.append(record_b_full)
+        _append_record(records_path, record_b_full)
+        _print_record(record_b_full)
+
+        batch += 1
+        result_deploy, latency_deploy, tok_s_deploy = _run_once(engine, half_prompt, send_to_user=True)
+        record_deploy = _to_record(batch, "deployment_half", category, half_prompt, expected_keywords, result_deploy, latency_deploy, tok_s_deploy)
+        records.append(record_deploy)
+        _append_record(records_path, record_deploy)
+        _print_record(record_deploy)
+
+        if result_deploy.timeline == "A":
+            batch += 1
+            shadow_result, shadow_latency, shadow_tok_s = _run_once(engine, half_prompt, send_to_user=False, force_timeline_b=True)
+            shadow_record = _to_record(batch, "deployment_half_shadow_b", category, half_prompt, expected_keywords, shadow_result, shadow_latency, shadow_tok_s)
+            records.append(shadow_record)
+            _append_record(records_path, shadow_record)
+            _print_record(shadow_record)
+
+        batch += 1
+        result_a_only, latency_a_only, tok_s_a_only = _run_once(engine, centile_prompt, send_to_user=True, force_timeline_a=True)
+        record_a_only = _to_record(batch, "timeline_a_centile", category, centile_prompt, expected_keywords, result_a_only, latency_a_only, tok_s_a_only)
+        records.append(record_a_only)
+        _append_record(records_path, record_a_only)
+        _print_record(record_a_only)
+
+    summary = _summarize(records)
+    summary["routing_clusters"] = len(routing_memory.clusters)
+    with summary_path.open("w") as handle:
+        json.dump(summary, handle, indent=2)
+    print(f"saved_records={records_path}")
+    print(f"saved_summary={summary_path}")
+    return summary
+
+
 if __name__ == "__main__":
-    run_benchmark(runs_per_prompt=2)
+    run_benchmark()

@@ -3,8 +3,10 @@ import math
 import time
 from collections import deque
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 import mlx.core as mx
+from mlx.utils import tree_flatten
 import configs
 from apex_nadir_convolution import ApexNadirConvolution
 from memory import SessionTracker
@@ -34,6 +36,30 @@ class ExpertPool:
         }
     def get_available_ram_mb(self) -> float:
         return get_available_ram_mb()
+    def _model_is_finite(self, model: Any) -> bool:
+        flat = dict(tree_flatten(model.trainable_parameters()))
+        for value in flat.values():
+            finite = mx.all(mx.isfinite(value))
+            mx.eval(finite)
+            if not bool(finite.item()):
+                return False
+        return True
+    def _checkpoint_is_finite(self, path: Path) -> bool:
+        try:
+            from safetensors.numpy import load_file
+            import numpy as np
+            data = load_file(str(path))
+            for value in data.values():
+                if not np.isfinite(value).all():
+                    return False
+            return True
+        except Exception:
+            return False
+    def _drop_checkpoint(self, expert_id: int):
+        checkpoint_dir = Path(configs.CHECKPOINT_DIR) / f"expert_{expert_id:03d}"
+        weights_path = checkpoint_dir / "weights.safetensors"
+        if weights_path.exists():
+            weights_path.unlink()
     def load_experts(self, expert_ids: List[int]):
         from mlx_lm import load as mlx_load
         for eid in expert_ids:
@@ -52,9 +78,19 @@ class ExpertPool:
                 num_layers = len(model.layers) if hasattr(model, "layers") else len(model.model.layers)
                 linear_to_lora_layers(model, num_layers, lora_config)
                 weights_path = Path(configs.CHECKPOINT_DIR) / f"expert_{eid:03d}" / "weights.safetensors"
+                if weights_path.exists() and not self._checkpoint_is_finite(weights_path):
+                    print(f"[warn] Dropping corrupt expert checkpoint {eid}")
+                    self._drop_checkpoint(eid)
                 if weights_path.exists():
                     model.load_weights(str(weights_path), strict=False)
                 model.train()
+                if not self._model_is_finite(model):
+                    print(f"[warn] Expert {eid} loaded non-finite weights, resetting to base")
+                    self._drop_checkpoint(eid)
+                    model, tokenizer = mlx_load(configs.EXPERT_MODEL_ID)
+                    model.freeze()
+                    linear_to_lora_layers(model, num_layers, lora_config)
+                    model.train()
             except Exception as e:
                 print(f"[error] Failed to load expert {eid}: {e}")
                 continue
@@ -73,11 +109,14 @@ class ExpertPool:
         mx.clear_cache()
     def save_experts(self, expert_ids: Optional[List[int]] = None):
         from mlx.utils import tree_flatten
-        from pathlib import Path
         targets = expert_ids if expert_ids is not None else list(self.loaded_experts.keys())
         for eid in targets:
             model = self.loaded_experts.get(eid)
             if model is None:
+                continue
+            if not self._model_is_finite(model):
+                print(f"[warn] Skipping non-finite expert save {eid}")
+                self._drop_checkpoint(eid)
                 continue
             flat_params = dict(tree_flatten(model.trainable_parameters()))
             checkpoint_dir = Path(configs.CHECKPOINT_DIR) / f"expert_{eid:03d}"
@@ -161,6 +200,10 @@ class ExpertPool:
         current = self.domain_scores[expert_id].get(domain, 0.0)
         self.domain_scores[expert_id][domain] = configs.EMA_DECAY * current + (1.0 - configs.EMA_DECAY) * r_i
     def check_starvation_eviction(self, expert_id: int, domain: str) -> bool:
+        # Require minimum activations in new domain before eviction is eligible.
+        # Prevents the death spiral: migrate → bad first batch → migrate again → r_i stays 0.
+        if self.session_tracker.get_expert_activations(expert_id) < configs.STARVATION_MIN_ACTIVATIONS:
+            return False
         tkl = self.session_tracker.get_expert_tkl(expert_id)
         domain_mean_tkl = self.session_tracker.get_domain_mean_tkl(domain)
         if domain_mean_tkl < 1e-9:
