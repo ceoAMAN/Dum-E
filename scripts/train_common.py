@@ -42,25 +42,31 @@ def train_loop(
     step = 0
     accum_loss = 0.0
     start_time = __import__("time").time()
+
+    def _loss_fn(m: nn.Module, tokens: mx.array) -> mx.array:
+        if loss_fn is not None:
+            return loss_fn(m, tokens)
+        output = m(tokens)
+        if output.ndim == 3:
+            logits = output[:, :-1, :]
+            targets = tokens[:, 1:]
+            return mx.mean(nn.losses.cross_entropy(logits, targets))
+        return mx.mean(output)
+
+    loss_and_grad_fn = nn.value_and_grad(model, _loss_fn)
+
     while step < cfg.max_steps:
         batch = next(batch_iter)
         input_ids = batch["input_ids"]
         tokens = input_ids if isinstance(input_ids, mx.array) else mx.array(input_ids)
-        if loss_fn is not None:
-            loss = loss_fn(model, tokens)
-        else:
-            output = model(tokens)
-            mx.eval(output)
-            if output.ndim == 3:
-                logits = output[:, :-1, :]
-                targets = tokens[:, 1:]
-                loss = mx.mean(nn.losses.cross_entropy(logits, targets))
-            else:
-                loss = mx.mean(output)
+
+        loss, grads = loss_and_grad_fn(model, tokens)
         mx.eval(loss)
         loss_value = float(loss.item())
         accum_loss += loss_value
         if (step + 1) % cfg.grad_accum_steps == 0:
+            optimizer.update(model, grads)
+            mx.eval(model.parameters(), optimizer.state)
             accum_loss = 0.0
         elapsed = __import__("time").time() - start_time
         tokens_in_batch = int(tokens.size)
@@ -79,7 +85,7 @@ def train_loop(
             cfg.last_save_time = now
             print(f"[train] Saving checkpoint at step {step}...")
             from mlx.utils import tree_flatten
-            flat_params = dict(tree_flatten(model.parameters()))
+            flat_params = dict(tree_flatten(model.trainable_parameters()))
             mx.save_safetensors(str(cfg.output_dir / "weights.safetensors"), flat_params)
         step += 1
     print(f"[train] Completed {step} steps")

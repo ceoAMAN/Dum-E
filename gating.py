@@ -6,6 +6,7 @@ from typing import Dict, List, Set
 import mlx.core as mx
 import numpy as np
 import configs
+from apex_nadir_convolution import ApexNadirConvolution
 @dataclass
 class DomainTopography:
     domain_map: Dict[int, str]
