@@ -42,7 +42,7 @@ VORONOI_ALPHA = 0.3
 CLUSTER_CAP_RATE = 50
 CLUSTER_PRUNE_AGE = 10_000
 CLUSTER_CONFIDENCE_FLOOR = 0.4
-FAST_PATH_THRESHOLD = 0.85
+FAST_PATH_THRESHOLD = 0.99
 THERMAL_SAMPLE_INTERVAL = 1
 THERMAL_THROTTLE_TEMP = 85.0
 DIAGNOSTICS_SAVE_PATH = "state/diagnostics.pkl"
@@ -61,24 +61,16 @@ EMA_DECAY = 0.99
 STARVATION_MIN_ACTIVATIONS = 5   # expert must have this many activations in domain before eviction
 OUTER_LOOP_TOKEN_INTERVAL = 500
 DATASET_WEIGHTS = {
-    "ultrachat": 0.125,
-    "dolly_15k": 0.125,
-    "alpaca_cleaned": 0.125,
-    "openorca": 0.125,
-    "gsm8k": 0.125,
-    "wikitext": 0.125,
-    "codeparrot_clean": 0.125,
-    "openhermes": 0.125,
+    "redpajama": 0.25,
+    "the_stack": 0.25,
+    "metamath": 0.25,
+    "openhermes": 0.25,
 }
 DATASET_IDS = {
-    "ultrachat": ("HuggingFaceH4/ultrachat_200k", None, "train_sft"),
-    "dolly_15k": ("databricks/databricks-dolly-15k", None, "train"),
-    "alpaca_cleaned": ("yahma/alpaca-cleaned", None, "train"),
-    "openorca": ("Open-Orca/OpenOrca", "default", "train"),
-    "gsm8k": ("openai/gsm8k", "main", "train"),
-    "wikitext": ("Salesforce/wikitext", "wikitext-103-raw-v1", "train"),
-    "codeparrot_clean": ("codeparrot/codeparrot-clean", None, "train"),
-    "openhermes": ("teknium/openhermes", None, "train"),
+    "redpajama": ("togethercomputer/RedPajama-Data-V2", "default", "train"),
+    "the_stack": ("bigcode/the-stack-dedup", None, "train"),
+    "metamath": ("meta-math/MetaMathQA", None, "train"),
+    "openhermes": ("teknium/OpenHermes-2.5", None, "train"),
 }
 DATASET_BOOT_TIMEOUT = 60.0
 DATASET_SAMPLE_TIMEOUT = 5.0

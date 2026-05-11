@@ -1,7 +1,7 @@
 from __future__ import annotations
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import List, Optional
 import mlx.core as mx
 import configs
@@ -66,6 +66,7 @@ class InferenceEngine:
         send_to_user: bool = True,
         force_timeline_b: bool = False,
         force_timeline_a: bool = False,
+        min_experts: int = 0,
     ) -> InferenceResult:
         self.gate.load()
         tokenizer = self.gate.tokenizer
@@ -74,7 +75,13 @@ class InferenceEngine:
         gate_out = self.gate.forward(tokens)
         cluster_hit = self.routing_memory.lookup(gate_out.hidden_states)
         domain = self._domain_from_gate_output(gate_out)
-        selected_experts = self._select_experts_for_request(gate_out, cluster_hit)
+        if force_timeline_a:
+            k_floor = 0
+        elif force_timeline_b:
+            k_floor = max(1, min_experts)
+        else:
+            k_floor = min_experts
+        selected_experts = self._select_experts_for_request(gate_out, cluster_hit, k_floor=k_floor)
         if force_timeline_a:
             return self._timeline_a(input_text, send_to_user, domain, len(token_ids), gate_out.confidence)
         if not force_timeline_b and self._is_timeline_a(gate_out):
@@ -87,6 +94,7 @@ class InferenceEngine:
             send_to_user,
             selected_experts=selected_experts,
             default_domain=domain,
+            min_experts=k_floor,
         )
     def _domain_from_gate_output(self, gate_out: GateOutput) -> str:
         domains = ["code", "reasoning", "knowledge", "general"]
@@ -97,13 +105,33 @@ class InferenceEngine:
         if len(vals) < len(domains):
             return "general"
         return domains[int(mx.argmax(logits[:len(domains)]).item())]
-    def _select_experts_for_request(self, gate_out: GateOutput, cluster_hit) -> List[SelectedExpert]:
+    def _select_experts_for_request(self, gate_out: GateOutput, cluster_hit, k_floor: int = 0) -> List[SelectedExpert]:
+        k_floor = max(0, min(configs.K_MAX, int(k_floor)))
         if cluster_hit is not None:
-            cached_k = max(1, int(cluster_hit.optimal_k))
-            return [
+            cached_k = max(1, k_floor, int(cluster_hit.optimal_k))
+            cached_k = min(configs.K_MAX, cached_k)
+            selected = [
                 SelectedExpert(expert_id=eid, distance_to_peak=0.0, domain="cached", is_alpha=False)
                 for eid in cluster_hit.top_experts[:cached_k]
             ]
+            if len(selected) >= cached_k:
+                return selected
+            fallback_gate = replace(gate_out, k_per_token=cached_k)
+            for candidate in self.triple_k.select_experts(
+                fallback_gate,
+                self.session_tracker,
+                self.masking,
+                self._batch_counter,
+            ):
+                if len(selected) >= cached_k:
+                    break
+                if any(existing.expert_id == candidate.expert_id for existing in selected):
+                    continue
+                selected.append(candidate)
+            return selected
+        requested_k = min(configs.K_MAX, max(k_floor, int(gate_out.k_per_token)))
+        if requested_k != gate_out.k_per_token:
+            gate_out = replace(gate_out, k_per_token=requested_k)
         return self.triple_k.select_experts(gate_out, self.session_tracker, self.masking, self._batch_counter)
     def _is_timeline_a(self, gate_out: GateOutput) -> bool:
         return gate_out.confidence > configs.FAST_PATH_THRESHOLD
@@ -163,11 +191,19 @@ class InferenceEngine:
         send_to_user: bool,
         selected_experts: Optional[List[SelectedExpert]] = None,
         default_domain: str = "general",
+        min_experts: int = 0,
     ) -> InferenceResult:
         topo = self.gate.look_ahead(tokens)
         if selected_experts is None:
             selected_experts = self._select_experts_for_request(gate_out, cluster_hit)
         domain = max(topo.domain_proportions, key=topo.domain_proportions.get) if topo.domain_proportions else default_domain
+        # If we have no experts but min_experts demands them, force-select
+        # from the full pool instead of silently falling back to Central-only.
+        if not selected_experts and min_experts > 0:
+            forced_gate = replace(gate_out, k_per_token=min_experts)
+            selected_experts = self.triple_k.select_experts(
+                forced_gate, self.session_tracker, self.masking, self._batch_counter
+            )
         if not selected_experts:
             self.central.load()
             output_text = self.central.generate(input_text)

@@ -9,7 +9,17 @@ echo "================================================"
 
 echo ""
 echo "[1/5] Creating Python environment..."
-python3 -m venv sturnus_env
+PYTHON_BIN="${PYTHON_BIN:-}"
+if [ -z "$PYTHON_BIN" ]; then
+    if command -v python3.12 >/dev/null 2>&1; then
+        PYTHON_BIN="$(command -v python3.12)"
+    elif command -v python3.11 >/dev/null 2>&1; then
+        PYTHON_BIN="$(command -v python3.11)"
+    else
+        PYTHON_BIN="$(command -v python3)"
+    fi
+fi
+"$PYTHON_BIN" -m venv sturnus_env
 source sturnus_env/bin/activate
 pip install --upgrade pip --quiet
 

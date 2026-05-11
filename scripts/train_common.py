@@ -30,6 +30,19 @@ def load_mlx_model(model_id: str):
     model, tokenizer = mlx_load(model_id)
     return model, tokenizer
 
+def save_trainable_checkpoint(model: nn.Module, output_dir: Path) -> Path:
+    from mlx.utils import tree_flatten
+    output_dir = output_dir.resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    target = output_dir / "weights.safetensors"
+    tmp_target = output_dir / "weights.tmp.safetensors"
+    if tmp_target.exists():
+        tmp_target.unlink()
+    flat_params = dict(tree_flatten(model.trainable_parameters()))
+    mx.save_safetensors(str(tmp_target), flat_params)
+    tmp_target.replace(target)
+    return target
+
 def train_loop(
     model: nn.Module,
     tokenizer,
@@ -84,8 +97,9 @@ def train_loop(
         if cfg.save_every > 0 and (now - cfg.last_save_time) >= cfg.save_every:
             cfg.last_save_time = now
             print(f"[train] Saving checkpoint at step {step}...")
-            from mlx.utils import tree_flatten
-            flat_params = dict(tree_flatten(model.trainable_parameters()))
-            mx.save_safetensors(str(cfg.output_dir / "weights.safetensors"), flat_params)
+            checkpoint_path = save_trainable_checkpoint(model, cfg.output_dir)
+            print(f"[train] Saved checkpoint: {checkpoint_path}")
         step += 1
+    checkpoint_path = save_trainable_checkpoint(model, cfg.output_dir)
+    print(f"[train] Saved final checkpoint: {checkpoint_path}")
     print(f"[train] Completed {step} steps")
