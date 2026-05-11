@@ -1,5 +1,7 @@
 from __future__ import annotations
+import argparse
 import json
+import shutil
 import sys
 import time
 from dataclasses import asdict, dataclass
@@ -63,6 +65,22 @@ BENCHMARK_PROMPTS = [
         "expected_keywords": ["2", "hours", "meet", "distance", "speed"],
     },
 ]
+
+TRAINING_VALIDATION_ARTIFACTS = {
+    "k_trajectory": ("k_trajectory.jsonl", "benchmark_k_trajectory.jsonl", "jsonl"),
+    "expert_drift": ("expert_drift.jsonl", "benchmark_expert_drift.jsonl", "jsonl"),
+    "thermal_regression": (
+        "thermal_regression_validation.jsonl",
+        "benchmark_thermal_regression_validation.jsonl",
+        "jsonl",
+    ),
+    "proof_metrics": ("proof_metrics.jsonl", "benchmark_proof_metrics.jsonl", "jsonl"),
+    "finetune_metrics": ("finetune_metrics.json", "benchmark_finetune_metrics.json", "json"),
+    "validation_summary": ("validation_summary.json", "benchmark_validation_summary.json", "json"),
+    "validation_runs": ("validation_runs.jsonl", "benchmark_validation_runs.jsonl", "jsonl"),
+    "fresh_training_log": ("sturnus-fresh-10m.log", "benchmark_training.log", "text"),
+    "full_protocol_log": ("sturnus-full-protocol.log", "benchmark_full_protocol.log", "text"),
+}
 
 
 @dataclass
@@ -156,6 +174,7 @@ def _run_once(
     send_to_user: bool = True,
     force_timeline_b: bool = False,
     force_timeline_a: bool = False,
+    min_experts: int = 0,
 ):
     start = time.time()
     result = engine.run(
@@ -163,6 +182,7 @@ def _run_once(
         send_to_user=send_to_user,
         force_timeline_b=force_timeline_b,
         force_timeline_a=force_timeline_a,
+        min_experts=min_experts,
     )
     latency_ms = (time.time() - start) * 1000.0
     tok_s = result.token_count / max(latency_ms / 1000.0, 1e-6)
@@ -210,6 +230,105 @@ def _append_record(path: Path, record: BenchmarkRecord) -> None:
         handle.write(json.dumps(asdict(record)) + "\n")
 
 
+def _jsonl_stats(path: Path, tail_count: int = 5) -> Dict[str, Any]:
+    records = 0
+    tail: List[Any] = []
+    with path.open("r") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            records += 1
+            try:
+                parsed: Any = json.loads(line)
+            except json.JSONDecodeError:
+                parsed = {"raw": line}
+            tail.append(parsed)
+            if len(tail) > tail_count:
+                tail.pop(0)
+    return {
+        "records": records,
+        "latest": tail[-1] if tail else None,
+        "tail": tail,
+    }
+
+
+def _json_stats(path: Path) -> Dict[str, Any]:
+    with path.open("r") as handle:
+        data = json.load(handle)
+    return {"records": 1, "latest": data}
+
+
+def _text_stats(path: Path, tail_count: int = 20) -> Dict[str, Any]:
+    tail: List[str] = []
+    lines = 0
+    with path.open("r", errors="replace") as handle:
+        for line in handle:
+            lines += 1
+            tail.append(line.rstrip("\n"))
+            if len(tail) > tail_count:
+                tail.pop(0)
+    return {"lines": lines, "tail": tail}
+
+
+def _snapshot_training_validation(output_root: Path) -> Dict[str, Any]:
+    artifacts: Dict[str, Any] = {}
+    for name, (source_name, dest_name, artifact_type) in TRAINING_VALIDATION_ARTIFACTS.items():
+        source = output_root / source_name
+        dest = output_root / dest_name
+        if not source.exists():
+            dest.unlink(missing_ok=True)
+            artifacts[name] = {
+                "exists": False,
+                "source_path": str(source),
+                "benchmark_path": str(dest),
+            }
+            continue
+        if source.resolve() != dest.resolve():
+            shutil.copyfile(source, dest)
+        if artifact_type == "jsonl":
+            stats = _jsonl_stats(dest)
+        elif artifact_type == "json":
+            stats = _json_stats(dest)
+        else:
+            stats = _text_stats(dest)
+        artifacts[name] = {
+            "exists": True,
+            "source_path": str(source),
+            "benchmark_path": str(dest),
+            "bytes": dest.stat().st_size,
+            **stats,
+        }
+    return artifacts
+
+
+def _write_total_validation(
+    total_validation_path: Path,
+    records: List[BenchmarkRecord],
+    summary: Dict[str, Any],
+    training_validation: Dict[str, Any],
+    records_path: Path,
+    summary_path: Path,
+    checkpoint_path: Path,
+) -> Dict[str, Any]:
+    total_validation = {
+        "record_type": "benchmark_total_validation",
+        "saved_at_unix": time.time(),
+        "benchmark": {
+            "records": len(records),
+            "last_batch": records[-1].batch if records else 0,
+            "records_path": str(records_path),
+            "summary_path": str(summary_path),
+            "checkpoint_path": str(checkpoint_path),
+            "summary": summary,
+        },
+        "training_validation": training_validation,
+    }
+    with total_validation_path.open("w") as handle:
+        json.dump(total_validation, handle, indent=2)
+    return total_validation
+
+
 def _print_record(record: BenchmarkRecord) -> None:
     print(
         f"batch={record.batch} | "
@@ -247,15 +366,84 @@ def _summarize(records: List[BenchmarkRecord]) -> Dict[str, Any]:
     return {"loops": by_loop, "records": len(records)}
 
 
-def run_benchmark(output_dir: str = "logs", clear_existing: bool = True) -> Dict[str, Any]:
+def _write_summary(
+    summary_path: Path,
+    records: List[BenchmarkRecord],
+    routing_memory: RoutingMemory,
+) -> Dict[str, Any]:
+    summary = _summarize(records)
+    summary["routing_clusters"] = len(routing_memory.clusters)
+    with summary_path.open("w") as handle:
+        json.dump(summary, handle, indent=2)
+    return summary
+
+
+def _save_checkpoint(
+    checkpoint_path: Path,
+    records: List[BenchmarkRecord],
+    routing_memory: RoutingMemory,
+    summary_path: Path,
+    records_path: Path,
+    output_root: Path,
+) -> Dict[str, Any]:
+    summary = _write_summary(summary_path, records, routing_memory)
+    total_validation_path = output_root / "benchmark_total_validation.json"
+    training_validation = _snapshot_training_validation(output_root)
+    total_validation = _write_total_validation(
+        total_validation_path,
+        records,
+        summary,
+        training_validation,
+        records_path,
+        summary_path,
+        checkpoint_path,
+    )
+    summary["total_validation_path"] = str(total_validation_path)
+    summary["training_validation"] = training_validation
+    with summary_path.open("w") as handle:
+        json.dump(summary, handle, indent=2)
+    checkpoint = {
+        "saved_at_unix": time.time(),
+        "records": len(records),
+        "last_batch": records[-1].batch if records else 0,
+        "records_path": str(records_path),
+        "summary_path": str(summary_path),
+        "total_validation_path": str(total_validation_path),
+        "training_validation": total_validation["training_validation"],
+        "summary": summary,
+    }
+    with checkpoint_path.open("w") as handle:
+        json.dump(checkpoint, handle, indent=2)
+    print(f"saved_checkpoint={checkpoint_path} | records={len(records)}")
+    return summary
+
+
+def _maybe_save_checkpoint(
+    checkpoint_path: Path,
+    records: List[BenchmarkRecord],
+    routing_memory: RoutingMemory,
+    summary_path: Path,
+    records_path: Path,
+    output_root: Path,
+    save_every_runs: int,
+) -> None:
+    if save_every_runs <= 0:
+        return
+    if records and len(records) % save_every_runs == 0:
+        _save_checkpoint(checkpoint_path, records, routing_memory, summary_path, records_path, output_root)
+
+
+def run_benchmark(output_dir: str = "logs", clear_existing: bool = True, save_every_runs: int = 100) -> Dict[str, Any]:
     engine, routing_memory = _build_components()
     output_root = Path(output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
     records_path = output_root / "benchmark_runs.jsonl"
     summary_path = output_root / "benchmark_summary.json"
+    checkpoint_path = output_root / "benchmark_checkpoint.json"
     if clear_existing:
         records_path.unlink(missing_ok=True)
         summary_path.unlink(missing_ok=True)
+        checkpoint_path.unlink(missing_ok=True)
     tokenizer = engine.gate.tokenizer
     batch = 0
     records: List[BenchmarkRecord] = []
@@ -267,11 +455,26 @@ def run_benchmark(output_dir: str = "logs", clear_existing: bool = True) -> Dict
         centile_prompt = _truncate_prompt(tokenizer, prompt, 1, 100)
 
         batch += 1
-        result_b_full, latency_b_full, tok_s_b_full = _run_once(engine, prompt, send_to_user=True, force_timeline_b=True)
+        result_b_full, latency_b_full, tok_s_b_full = _run_once(
+            engine,
+            prompt,
+            send_to_user=True,
+            force_timeline_b=True,
+            min_experts=max(1, routing_memory.get_domain_mean_k()),
+        )
         record_b_full = _to_record(batch, "training_b_full", category, prompt, expected_keywords, result_b_full, latency_b_full, tok_s_b_full)
         records.append(record_b_full)
         _append_record(records_path, record_b_full)
         _print_record(record_b_full)
+        _maybe_save_checkpoint(
+            checkpoint_path,
+            records,
+            routing_memory,
+            summary_path,
+            records_path,
+            output_root,
+            save_every_runs,
+        )
 
         batch += 1
         result_deploy, latency_deploy, tok_s_deploy = _run_once(engine, half_prompt, send_to_user=True)
@@ -279,14 +482,38 @@ def run_benchmark(output_dir: str = "logs", clear_existing: bool = True) -> Dict
         records.append(record_deploy)
         _append_record(records_path, record_deploy)
         _print_record(record_deploy)
+        _maybe_save_checkpoint(
+            checkpoint_path,
+            records,
+            routing_memory,
+            summary_path,
+            records_path,
+            output_root,
+            save_every_runs,
+        )
 
         if result_deploy.timeline == "A":
             batch += 1
-            shadow_result, shadow_latency, shadow_tok_s = _run_once(engine, half_prompt, send_to_user=False, force_timeline_b=True)
+            shadow_result, shadow_latency, shadow_tok_s = _run_once(
+                engine,
+                half_prompt,
+                send_to_user=False,
+                force_timeline_b=True,
+                min_experts=max(1, routing_memory.get_domain_mean_k()),
+            )
             shadow_record = _to_record(batch, "deployment_half_shadow_b", category, half_prompt, expected_keywords, shadow_result, shadow_latency, shadow_tok_s)
             records.append(shadow_record)
             _append_record(records_path, shadow_record)
             _print_record(shadow_record)
+            _maybe_save_checkpoint(
+                checkpoint_path,
+                records,
+                routing_memory,
+                summary_path,
+                records_path,
+                output_root,
+                save_every_runs,
+            )
 
         batch += 1
         result_a_only, latency_a_only, tok_s_a_only = _run_once(engine, centile_prompt, send_to_user=True, force_timeline_a=True)
@@ -294,15 +521,30 @@ def run_benchmark(output_dir: str = "logs", clear_existing: bool = True) -> Dict
         records.append(record_a_only)
         _append_record(records_path, record_a_only)
         _print_record(record_a_only)
+        _maybe_save_checkpoint(
+            checkpoint_path,
+            records,
+            routing_memory,
+            summary_path,
+            records_path,
+            output_root,
+            save_every_runs,
+        )
 
-    summary = _summarize(records)
-    summary["routing_clusters"] = len(routing_memory.clusters)
-    with summary_path.open("w") as handle:
-        json.dump(summary, handle, indent=2)
+    summary = _save_checkpoint(checkpoint_path, records, routing_memory, summary_path, records_path, output_root)
     print(f"saved_records={records_path}")
     print(f"saved_summary={summary_path}")
+    print(f"saved_checkpoint={checkpoint_path}")
+    print(f"saved_total_validation={output_root / 'benchmark_total_validation.json'}")
     return summary
 
 
 if __name__ == "__main__":
-    run_benchmark()
+    parser = argparse.ArgumentParser(description="Run Sturnus benchmark loops")
+    parser.add_argument("--output-dir", default="logs")
+    parser.add_argument("--save-every-runs", type=int, default=100)
+    args = parser.parse_args()
+    run_benchmark(
+        output_dir=args.output_dir,
+        save_every_runs=args.save_every_runs,
+    )

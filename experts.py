@@ -20,11 +20,13 @@ class ExpertOutput:
     token_count: int
     from_cache: bool
 class ExpertPool:
-    def __init__(self, convolution: ApexNadirConvolution, session_tracker: SessionTracker):
+    def __init__(self, convolution: ApexNadirConvolution, session_tracker: SessionTracker, max_loaded: int = 6):
         self.convolution = convolution
         self.session_tracker = session_tracker
         self.loaded_experts: Dict[int, Any] = {}
         self.loaded_tokenizers: Dict[int, Any] = {}
+        self._load_order: deque = deque()  # LRU tracking: oldest at left
+        self._max_loaded = max_loaded  # hard cap on concurrent experts in memory
         self.token_allocation_history: Dict[int, deque] = {
             i: deque(maxlen=configs.TKL_HISTORY_LEN) for i in range(configs.EXPERT_POOL_SIZE)
         }
@@ -38,12 +40,13 @@ class ExpertPool:
         return get_available_ram_mb()
     def _model_is_finite(self, model: Any) -> bool:
         flat = dict(tree_flatten(model.trainable_parameters()))
-        for value in flat.values():
-            finite = mx.all(mx.isfinite(value))
-            mx.eval(finite)
-            if not bool(finite.item()):
-                return False
-        return True
+        if not flat:
+            return True
+        # Single batched eval instead of per-parameter loop to avoid MLX deadlock
+        checks = [mx.all(mx.isfinite(v)) for v in flat.values()]
+        all_finite = mx.all(mx.stack(checks))
+        mx.eval(all_finite)
+        return bool(all_finite.item())
     def _checkpoint_is_finite(self, path: Path) -> bool:
         try:
             from safetensors.numpy import load_file
@@ -60,14 +63,43 @@ class ExpertPool:
         weights_path = checkpoint_dir / "weights.safetensors"
         if weights_path.exists():
             weights_path.unlink()
+    def _evict_lru(self, protect: Optional[Set[int]] = None) -> bool:
+        """Evict the least-recently-used expert to free RAM. Returns True if evicted."""
+        protect = protect or set()
+        for eid in list(self._load_order):
+            if eid in protect or eid not in self.loaded_experts:
+                continue
+            del self.loaded_experts[eid]
+            if eid in self.loaded_tokenizers:
+                del self.loaded_tokenizers[eid]
+            self._load_order.remove(eid)
+            mx.clear_cache()
+            return True
+        return False
+
+    def _touch_lru(self, eid: int):
+        """Mark expert as recently used (move to right/end of deque)."""
+        if eid in self._load_order:
+            self._load_order.remove(eid)
+        self._load_order.append(eid)
+
     def load_experts(self, expert_ids: List[int]):
         from mlx_lm import load as mlx_load
+        needed_set = set(expert_ids)
         for eid in expert_ids:
             if eid in self.loaded_experts:
+                self._touch_lru(eid)
                 continue
+            # Evict LRU experts until we're under the hard cap
+            while len(self.loaded_experts) >= self._max_loaded:
+                if not self._evict_lru(protect=needed_set):
+                    break  # can't evict — load what fits, skip the rest
+            if len(self.loaded_experts) >= self._max_loaded:
+                break  # cache full, continue with what we have
             available = self.get_available_ram_mb()
             if available < configs.EXPERT_RAM_MB:
-                raise RuntimeError(f"Cannot load expert {eid}: {available:.1f} MB available, {configs.EXPERT_RAM_MB} MB required.")
+                if not self._evict_lru(protect=needed_set):
+                    break  # no RAM — continue with what we have
             try:
                 model, tokenizer = mlx_load(configs.EXPERT_MODEL_ID)
                 from mlx_lm.tuner.utils import linear_to_lora_layers
@@ -96,6 +128,7 @@ class ExpertPool:
                 continue
             self.loaded_experts[eid] = model
             self.loaded_tokenizers[eid] = tokenizer
+            self._touch_lru(eid)
     def unload_experts(self, expert_ids: List[int], keep_buffer: Optional[Set[int]] = None):
         keep = keep_buffer or set()
         import mlx.core as mx
@@ -114,10 +147,8 @@ class ExpertPool:
             model = self.loaded_experts.get(eid)
             if model is None:
                 continue
-            if not self._model_is_finite(model):
-                print(f"[warn] Skipping non-finite expert save {eid}")
-                self._drop_checkpoint(eid)
-                continue
+            # Skip the expensive _model_is_finite check during save.
+            # Load-time validation (_checkpoint_is_finite) catches corrupt files.
             flat_params = dict(tree_flatten(model.trainable_parameters()))
             checkpoint_dir = Path(configs.CHECKPOINT_DIR) / f"expert_{eid:03d}"
             checkpoint_dir.mkdir(parents=True, exist_ok=True)

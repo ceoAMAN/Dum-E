@@ -137,7 +137,7 @@ class TripleKSelector:
             self.alpha_experts[domain] = experts[:n_alpha]
             self.beta_experts[domain] = experts[n_alpha:]
             self.k_pd[domain] = list(experts)
-    def select_experts(self, gate_output: GateOutput, session_tracker, masking_schedule: MaskingSchedule, batch_id: int = 0) -> List[SelectedExpert]:
+    def select_experts(self, gate_output: GateOutput, session_tracker, masking_schedule: MaskingSchedule, batch_id: int = 0, loaded_experts=None) -> List[SelectedExpert]:
         domain = "general"
         logits = gate_output.domain_logits
         if logits is not None and logits.shape[0] > 0:
@@ -155,6 +155,8 @@ class TripleKSelector:
                 continue
             current_alloc = session_tracker.get_current_allocation(eid)
             dist = self.convolution.get_distance_to_peak(eid, current_alloc)
+            if loaded_experts and eid in loaded_experts:
+                dist *= 0.1  # Huge discount for RAM-resident experts to avoid SSD latency
             jitter = self._rng.random() * 1e-6
             is_alpha = eid in self.alpha_experts.get(domain, [])
             candidates.append(SelectedExpert(expert_id=eid, distance_to_peak=dist + jitter, domain=domain, is_alpha=is_alpha))

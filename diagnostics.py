@@ -49,6 +49,47 @@ class Diagnostics:
         self.x_next = self._regress()
         return self.x_next
 
+    def validate_thermal_regression(self) -> dict:
+        if not self.history:
+            return {
+                "history_len": 0,
+                "x_next": self.x_next,
+                "bounded": configs.X_MIN <= self.x_next <= configs.X_MAX,
+                "thermal_guard_active": False,
+                "recent_avg_thermal": 0.0,
+                "recent_avg_time_in_bound": 0.0,
+                "thermal_source": "none",
+            }
+        latest = self.history[-1]
+        recent = self.history[-3:]
+        recent_avg_thermal = sum(snap.thermal_state for snap in recent) / len(recent)
+        recent_avg_time = sum(snap.time_in_bound for snap in recent) / len(recent)
+        thermal_guard_active = (
+            latest.thermal_state > configs.THERMAL_THROTTLE_TEMP * 0.9
+            or (
+                not self._thermal_is_exact
+                and len(self.history) >= 3
+                and (
+                    recent_avg_time > 2.5
+                    or recent_avg_thermal > configs.THERMAL_THROTTLE_TEMP * 0.82
+                )
+            )
+        )
+        return {
+            "history_len": len(self.history),
+            "latest_batch_index": latest.batch_index,
+            "x_used": latest.x_used,
+            "x_next": self.x_next,
+            "bounded": configs.X_MIN <= self.x_next <= configs.X_MAX,
+            "thermal_guard_active": thermal_guard_active,
+            "thermal": latest.thermal_state,
+            "recent_avg_thermal": recent_avg_thermal,
+            "recent_avg_time_in_bound": recent_avg_time,
+            "ram_mb": latest.ram_headroom_mb,
+            "ssd_read_rate_mb": latest.ssd_read_rate_mb,
+            "thermal_source": "direct" if self._thermal_is_exact else "proxy_or_estimate",
+        }
+
     def _read_thermal(
         self,
         time_in_bound: float,

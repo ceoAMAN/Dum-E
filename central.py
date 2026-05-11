@@ -42,7 +42,9 @@ class CentralModel:
         return hidden_mean
     def _build_input_ids(self, original_input: str, expert_outputs: List[Dict[str, Any]]) -> List[int]:
         limit = configs.MAX_SEQ_LEN
-        input_ids = self.tokenizer.encode(original_input)[:limit]
+        reserve = 128
+        base_limit = max(configs.FRAGMENT_MIN, limit - reserve)
+        input_ids = self.tokenizer.encode(original_input)[:base_limit]
         if len(input_ids) >= limit:
             return input_ids
         newline_ids = self.tokenizer.encode("\n")
@@ -153,7 +155,9 @@ class CentralModel:
         if not np.isfinite(entropy):
             return 0.0
         return entropy
+    def format_prompt(self, input_text: str) -> str:
+        return f"<s> [INST] {input_text} [/INST]"
     def generate(self, input_text: str, max_tokens: int = 256) -> str:
         self.load()
         from mlx_lm import generate as mlx_generate
-        return mlx_generate(self.model, self.tokenizer, prompt=input_text, max_tokens=max_tokens)
+        return mlx_generate(self.model, self.tokenizer, prompt=self.format_prompt(input_text), max_tokens=max_tokens)

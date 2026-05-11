@@ -11,12 +11,12 @@ def _is_finite_scalar(value: mx.array) -> bool:
     return bool(finite.item())
 def _tree_is_finite(tree) -> bool:
     flat = dict(tree_flatten(tree))
-    for value in flat.values():
-        finite = mx.all(mx.isfinite(value))
-        mx.eval(finite)
-        if not bool(finite.item()):
-            return False
-    return True
+    if not flat:
+        return True
+    checks = [mx.all(mx.isfinite(v)) for v in flat.values()]
+    all_finite = mx.all(mx.stack(checks))
+    mx.eval(all_finite)
+    return bool(all_finite.item())
 def compute_l_eff_loss(l_eff_scores: mx.array, selected_mask: mx.array) -> mx.array:
     selected_scores = l_eff_scores * selected_mask
     n_selected = mx.sum(selected_mask) + 1e-8

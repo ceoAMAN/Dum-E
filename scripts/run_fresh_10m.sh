@@ -4,6 +4,9 @@ set -euo pipefail
 ROOT="/Users/aman/Sturnus"
 PYTHON_BIN="$ROOT/sturnus-env312/bin/python"
 if [ ! -x "$PYTHON_BIN" ]; then
+  PYTHON_BIN="$ROOT/sturnus_env/bin/python"
+fi
+if [ ! -x "$PYTHON_BIN" ]; then
   PYTHON_BIN="$ROOT/sturnus-env/bin/python"
 fi
 LOG_DIR="$ROOT/logs"

@@ -20,6 +20,7 @@ class VoronoiCluster:
     r_out_snapshot: Dict[int, float]
     l_eff_scores: Dict[int, float]
     last_updated: int
+    domain: str = "general"
     def update_confidence(self):
         self.confidence = min(1.0, self.sample_count / 50)
 class RoutingMemory:
@@ -37,6 +38,9 @@ class RoutingMemory:
         self.tau = max(1e-6, float(configs.VORONOI_ALPHA) * mean_dist)
     def get_dynamic_tau(self) -> float:
         return self.tau
+    def get_domain_mean_k(self) -> int:
+        ks = [int(cluster.optimal_k) for cluster in self.clusters if int(cluster.optimal_k) > 0]
+        return round(sum(ks) / len(ks)) if ks else 1
     def lookup(self, gate_hidden: mx.array) -> Optional[VoronoiCluster]:
         if not self.clusters:
             return None
@@ -60,7 +64,7 @@ class RoutingMemory:
             best_cluster.update_confidence()
             return best_cluster
         return None
-    def spawn_cluster(self, gate_hidden, expert_ids, tkl_scores, r_out_snapshot, l_eff_scores, optimal_k, token_count, r_i, domain_mean_r_i):
+    def spawn_cluster(self, gate_hidden, expert_ids, tkl_scores, r_out_snapshot, l_eff_scores, optimal_k, token_count, r_i, domain_mean_r_i, domain="general"):
         if r_i <= domain_mean_r_i:
             return None
         centroid = self._to_numpy(gate_hidden)
@@ -73,6 +77,7 @@ class RoutingMemory:
             top_experts=sorted(expert_ids, key=lambda i: tkl_scores.get(i, 0), reverse=True),
             confidence=min(1.0, 1 / 50), sample_count=1,
             r_out_snapshot=r_out_snapshot, l_eff_scores=l_eff_scores, last_updated=token_count,
+            domain=domain,
         )
         self.clusters.append(cluster)
         self._recompute_tau()
@@ -97,6 +102,7 @@ class RoutingMemory:
                         a.update_confidence()
                         if b.confidence > a.confidence:
                             a.top_experts = b.top_experts
+                            a.domain = getattr(b, "domain", getattr(a, "domain", "general"))
                         self.clusters.pop(j)
                         merged = True
                         break
