@@ -160,19 +160,31 @@ class ExpertPool:
         tokenizer = self.loaded_tokenizers[expert_id]
         input_embeds = fragment_tokens.reshape(1, -1)
         t_start = time.perf_counter()
-        logits = model(input_embeds)
-        mx.eval(logits)
-        t_end = time.perf_counter()
-        wall_time = t_end - t_start
-        token_ids = logits[0].tolist() if hasattr(logits[0], "tolist") else list(logits[0])
-        if isinstance(token_ids[0], list):
-            token_ids = [int(max(enumerate(row), key=lambda x: x[1])[0]) for row in token_ids]
-        output_text = tokenizer.decode(token_ids)
+        # Single backbone pass: get hidden states, then derive logits cheaply
         if hasattr(model, 'model'):
             hidden_out = model.model(input_embeds)
             mx.eval(hidden_out)
+            # Derive logits from hidden states (just the lm_head, no second pass)
+            if hasattr(model, 'lm_head'):
+                logits = model.lm_head(hidden_out)
+            else:
+                logits = model(input_embeds)
+            mx.eval(logits)
         else:
+            logits = model(input_embeds)
+            mx.eval(logits)
             hidden_out = logits
+        t_end = time.perf_counter()
+        wall_time = t_end - t_start
+        # Proper argmax to convert logits → token IDs
+        if logits.ndim == 3:
+            token_ids = mx.argmax(logits[0], axis=-1).tolist()
+        elif logits.ndim == 2:
+            token_ids = mx.argmax(logits, axis=-1).tolist()
+        else:
+            token_ids = [int(mx.argmax(logits).item())]
+        output_text = tokenizer.decode(token_ids)
+        # Hidden states already computed above (no extra pass)
         if hidden_out.ndim == 3:
             hidden_mean = mx.mean(hidden_out[0], axis=0)
         elif hidden_out.ndim == 2:
