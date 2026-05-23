@@ -53,7 +53,11 @@ class GateModel:
         total = tokens.shape[0]
         if total == 0:
             return DomainTopography(domain_map={}, domain_proportions={}, total_tokens=0)
-        hidden = self.model(tokens.reshape(1, -1))
+        # Use backbone to get actual hidden states, not logits
+        if hasattr(self.model, 'model'):
+            hidden = self.model.model(tokens.reshape(1, -1))
+        else:
+            hidden = self.model(tokens.reshape(1, -1))
         mx.eval(hidden)
         domain_counts: Dict[str, int] = {}
         chunk_size = max(1, total // 10)
@@ -83,7 +87,11 @@ class GateModel:
         return "general"
     def forward(self, tokens: mx.array) -> GateOutput:
         self.load()
-        hidden = self.model(tokens.reshape(1, -1))
+        # Use backbone (model.model) to get actual hidden states, not logits
+        if hasattr(self.model, 'model'):
+            hidden = self.model.model(tokens.reshape(1, -1))
+        else:
+            hidden = self.model(tokens.reshape(1, -1))
         mx.eval(hidden)
         mean_hidden = mx.mean(hidden[0], axis=0)
         mean_hidden = mx.clip(mean_hidden, -1e4, 1e4)
