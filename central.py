@@ -69,10 +69,28 @@ class CentralModel:
         input_ids = self._build_input_ids(original_input, expert_outputs)
         tokens = mx.array([input_ids])
         t_start = time.perf_counter()
-        logits = self.model(tokens)
-        mx.eval(logits)
+        # Single backbone pass: extract hidden states, then derive logits cheaply
+        if hasattr(self.model, 'model'):
+            hidden_out = self.model.model(tokens)
+            mx.eval(hidden_out)
+            # Derive logits from hidden states (just the lm_head projection, no second pass)
+            if hasattr(self.model, 'lm_head'):
+                logits = self.model.lm_head(hidden_out)
+            else:
+                logits = self.model(tokens)
+            mx.eval(logits)
+        else:
+            logits = self.model(tokens)
+            mx.eval(logits)
+            hidden_out = logits
         t_end = time.perf_counter()
-        synthesis_hidden = self._compute_hidden_mean(input_ids)
+        # Synthesis hidden from the backbone pass we already did (no extra pass)
+        if hidden_out.ndim == 3:
+            synthesis_hidden = mx.mean(hidden_out[0], axis=0)
+        else:
+            synthesis_hidden = mx.mean(hidden_out, axis=0)
+        mx.eval(synthesis_hidden)
+        # Base hidden still needs its own pass (the delta reference)
         base_hidden = self._compute_hidden_mean(base_input_ids)
         min_dim = min(base_hidden.shape[0], synthesis_hidden.shape[0])
         contribution_hidden = synthesis_hidden[:min_dim] - base_hidden[:min_dim]
@@ -136,7 +154,7 @@ class CentralModel:
     def compute_reconstruction_entropy(self, synthesis_hidden: mx.array) -> float:
         if synthesis_hidden is None:
             return 0.0
-        values = np.asarray(synthesis_hidden.tolist(), dtype=np.float64).reshape(-1)
+        values = np.asarray(synthesis_hidden, dtype=np.float64).reshape(-1)
         if values.size == 0:
             return 0.0
         finite_mask = np.isfinite(values)
