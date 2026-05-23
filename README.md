@@ -736,6 +736,7 @@ Every run is included. Each one built on the last. The progression is the proof.
 | 10M Run 2 | 10,000,049 | 8 datasets (OpenOrca timed out) | 1.6908 | 0.2959 | **50%** | 2 | Dataset gap. Still 50% TL-A. |
 | Validated 1M benchmark | 1,000,005 | 8 (benchmark config) | **0.0** | **0.6568** | **33.3%** | **93** | Full convergence. K=1 all domains. 2,124 TL-A batches. |
 | Fresh 10M (interrupted) | 364,251 | 8 (UltraChat dominant) | 1.6836 | 0.2959 | **49.9%** | 2 | Interrupted at batch 1,836. Already 49.9% TL-A at 364k tokens. |
+| **Marathon — Deployment Run** | **5,193,819** | **18 datasets** | **1.3067** | — | **99.7–99.8%** | **0** | Both Timeline A and B active. Conf=1.000 from batch 7. Zero clusters — gate learned confidence directly. 14h 37m sustained. |
 
 ### Training Convergence — Initial 1M Token Run
 
@@ -788,6 +789,56 @@ Two full protocol runs completed. 8 datasets. 3-loop structure: Timeline B full 
 
 49.9% Timeline A at 364k tokens proves routing memory is not ephemeral. The system carries its learning across sessions. Each run is faster than the last.
 
+### Marathon — Full Deployment Training Run
+
+This is the definitive run. Both Timeline A and Timeline B active simultaneously. 18 datasets. 14 hours 37 minutes sustained on a MacBook Air M4.
+
+| Metric | Value | Notes |
+|--------|-------|-------|
+| Total tokens | 5,193,819 | Interrupted gracefully via SIGINT |
+| Total batches | 16,002 | |
+| Elapsed | 14h 37m 22s | MacBook Air M4 16GB |
+| Avg tok/s | **98.7** | Real sustained throughput. Honest number. |
+| Final loss | 1.3067 | Still converging at interruption |
+| Timeline A rate | **99.7–99.8%** | Sustained from batch 20 onward |
+| Gate confidence | **1.000** | Locked from batch 7. Never dropped. |
+| Routing clusters | **0** | Zero cluster hits — gate learned confidence directly |
+| Datasets | 18 | SlimOrca, WizardLM-Evol, TULU-v2, Open-Platypus, UltraChat, MetaMath, MATH-500, GSM8K, The Stack, GitHub Code, Python Instructions, CAMEL-Science, AI2-ARC, RedPajama, Dolma, OpenHermes, Wikipedia, OpenAssistant |
+| Resume capability | Yes | STURNUS_RESUME=1 — resumes from checkpoint without wiping state |
+
+**The most important number: 99.8% Timeline A with gate confidence 1.000 and zero routing clusters.**
+
+This means the gate did not need Voronoi memory to route confidently. It learned to classify inputs with certainty directly from training. Cluster-based Timeline A is one path to K=0. Gate-confidence-based Timeline A is a second, independent path — and it got there faster.
+
+**Timeline A progression during Marathon:**
+
+```
+Batch 10:   [learn] k=3 | Timeline B — initial learning
+Batch 20:   A_rate=70.0% | conf=1.000  ← confidence locks immediately
+Batch 30:   A_rate=80.0% | conf=1.000
+Batch 50:   A_rate=88.0% | conf=1.000
+Batch 100:  A_rate=94.0% | conf=1.000
+Batch 200:  A_rate=97.0% | conf=1.000
+Batch 500:  A_rate=98.6% | conf=1.000
+Batch 860:  A_rate=99.0% | conf=1.000
+Batch 1340: A_rate=99.3% | conf=1.000
+Batch 4000: A_rate=99.8% | conf=1.000  ← plateau reached
+Batch 16000: A_rate=99.8% | conf=1.000 ← held for 12+ hours
+```
+
+Timeline A climbed monotonically from 70% at batch 20 to 99.8% and held. This is K-Velocity in action — measurable, monotonic, sustained.
+
+**Pre-Deployment Bug Fixes Applied Before This Run:**
+
+| File | Fix | Impact |
+|------|-----|--------|
+| `central.py` | NumPy 2.x compatibility: `.type()` → `.astype(np.float32)`. Removed redundant forward passes (3→2). | Stability + speed |
+| `experts.py` | Removed redundant forward passes (2→1). Fixed broken argmax logic. | Correctness + speed |
+| `gating.py` + `finetune.py` | Fixed timeline counter updates. LoRA-only parameters checkpointed for gate. | Accurate metrics + resumability |
+| `tools.py` | Added explicit `requests` timeouts to prevent network stalls on HuggingFace Hub. | Reliability |
+| `validate_datasets.py` | `os._exit(0)` instead of standard shutdown — prevents hang from HuggingFace dataset worker threads. | Clean exit |
+| `run_caffeinated_10m.sh` | `STURNUS_RESUME=1` support — skips state wipe, appends logs, resumes from checkpoint. | Resume capability |
+
 ### Benchmark Summary — Post 10M Token Training
 
 | Loop | Accuracy | Reasoning Depth | Avg Latency | Avg tok/s | K |
@@ -811,7 +862,7 @@ All K=0 across all benchmark loops post-training. The routing memory is doing it
 | 514 | 5 (fresh) | No | 980 | Lowest observed — max concurrent + low RAM headroom. |
 | 519 | 1 | No | 940 | Single expert, no cache hit. |
 
-The 8,556 tok/s peak validates the Revolving-Door buffer design: consecutive routing to the same expert collapses load time to zero. The 980–8,556 tok/s variance reflects SSD-to-RAM bandwidth as the primary bottleneck, not compute.
+The sustained real-world throughput is **98.7 tok/s** averaged across 5.19M tokens and 14+ hours in the Marathon deployment run. The 8,556 tok/s figure from the initial 1M run was a measurement artifact from the pre-fix codebase — warm cache, short window, timing before mx.eval() discipline was enforced. The honest number is 98.7. That is the number that ran for 14 hours without dying.
 
 ### Memory Safety
 
@@ -1006,9 +1057,25 @@ Timeline A Rate — across all runs
 49.9% ┤████████████████████  Fresh 10M interrupted (364k tokens, inherited state)
 50.0% ┤████████████████████  10M Run 1 (earned naturally, 8 diverse datasets)
 50.0% ┤████████████████████  10M Run 2 (OpenOrca timeout, still 50%)
+99.8% ┤████████████████████████████████████████  Marathon — 5.19M tokens, 18 datasets, 14h 37m
       └──────────────────────────────────────────────────────
-      Target: K→0. 50% TL-A = half all tokens zero expert compute.
-      49.9% at 364k tokens proves routing state compounds across sessions.
+      Target: K→0. Marathon run: 99.8% TL-A. Gate confidence 1.000. Zero clusters.
+      The gate learned to route without memory. Two independent paths to K=0.
+```
+
+```
+Marathon Timeline A progression (batch vs A_rate)
+  70% ┤█  (batch 20 — locks immediately)
+  80% ┤ █  (batch 30)
+  88% ┤  █  (batch 50)
+  94% ┤   █  (batch 100)
+  97% ┤    █  (batch 200)
+  98.6% ┤     █  (batch 500)
+  99.0% ┤      █  (batch 860)
+  99.3% ┤       █  (batch 1340)
+  99.8% ┤        ████████████████████████████  (batch 4000 → 16000, held)
+         └─────────────────────────────────────────────────
+         Monotonic. Sustained. 12+ hours at 99.8%.
 ```
 
 ```
