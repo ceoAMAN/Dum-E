@@ -19,7 +19,7 @@ class CentralModel:
         self.model = None
         self.tokenizer = None
         self._loaded = False
-        # Default reply length; the voice daemon lowers this for snappy speech.
+        # Default reply length (callers may override for shorter outputs).
         self.gen_max_tokens = 256
     def load(self):
         if self._loaded:
