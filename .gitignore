@@ -16,3 +16,7 @@ models/
 checkpoints_backup_tonight/
 scripts/*.log
 sturnus-env312/
+
+# Large local training data (kept off the public engine repo)
+data/custom_prompts.jsonl
+data/raw_prompts/

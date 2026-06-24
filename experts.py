@@ -103,8 +103,6 @@ class ExpertPool:
             try:
                 model, tokenizer = mlx_load(configs.EXPERT_MODEL_ID)
                 from mlx_lm.tuner.utils import linear_to_lora_layers
-                import mlx.core as mx
-                from pathlib import Path
                 model.freeze()
                 lora_config = {"rank": configs.LORA_R, "scale": configs.LORA_ALPHA, "dropout": configs.LORA_DROPOUT}
                 num_layers = len(model.layers) if hasattr(model, "layers") else len(model.model.layers)
@@ -131,7 +129,6 @@ class ExpertPool:
             self._touch_lru(eid)
     def unload_experts(self, expert_ids: List[int], keep_buffer: Optional[Set[int]] = None):
         keep = keep_buffer or set()
-        import mlx.core as mx
         for eid in expert_ids:
             if eid in keep:
                 continue
@@ -141,7 +138,6 @@ class ExpertPool:
                 del self.loaded_tokenizers[eid]
         mx.clear_cache()
     def save_experts(self, expert_ids: Optional[List[int]] = None):
-        from mlx.utils import tree_flatten
         targets = expert_ids if expert_ids is not None else list(self.loaded_experts.keys())
         for eid in targets:
             model = self.loaded_experts.get(eid)
@@ -160,19 +156,31 @@ class ExpertPool:
         tokenizer = self.loaded_tokenizers[expert_id]
         input_embeds = fragment_tokens.reshape(1, -1)
         t_start = time.perf_counter()
-        logits = model(input_embeds)
-        mx.eval(logits)
-        t_end = time.perf_counter()
-        wall_time = t_end - t_start
-        token_ids = logits[0].tolist() if hasattr(logits[0], "tolist") else list(logits[0])
-        if isinstance(token_ids[0], list):
-            token_ids = [int(max(enumerate(row), key=lambda x: x[1])[0]) for row in token_ids]
-        output_text = tokenizer.decode(token_ids)
+        # Single backbone pass: get hidden states, then derive logits cheaply
         if hasattr(model, 'model'):
             hidden_out = model.model(input_embeds)
             mx.eval(hidden_out)
+            # Derive logits from hidden states (just the lm_head, no second pass)
+            if hasattr(model, 'lm_head'):
+                logits = model.lm_head(hidden_out)
+            else:
+                logits = model(input_embeds)
+            mx.eval(logits)
         else:
+            logits = model(input_embeds)
+            mx.eval(logits)
             hidden_out = logits
+        t_end = time.perf_counter()
+        wall_time = t_end - t_start
+        # Proper argmax to convert logits → token IDs
+        if logits.ndim == 3:
+            token_ids = mx.argmax(logits[0], axis=-1).tolist()
+        elif logits.ndim == 2:
+            token_ids = mx.argmax(logits, axis=-1).tolist()
+        else:
+            token_ids = [int(mx.argmax(logits).item())]
+        output_text = tokenizer.decode(token_ids)
+        # Hidden states already computed above (no extra pass)
         if hidden_out.ndim == 3:
             hidden_mean = mx.mean(hidden_out[0], axis=0)
         elif hidden_out.ndim == 2:
@@ -207,7 +215,6 @@ class ExpertPool:
             return False
         return True
     def reassign_expert(self, expert_id: int, new_domain: str):
-        old_domain = self.current_domain.get(expert_id, "unknown")
         self.domain_scores[expert_id][new_domain] = 0.0
         self.token_allocation_history[expert_id] = deque(maxlen=configs.TKL_HISTORY_LEN)
         self.current_domain[expert_id] = new_domain

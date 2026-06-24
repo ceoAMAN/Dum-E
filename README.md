@@ -52,7 +52,8 @@ K is the number of experts activated per token. K is an **observable**, not a hy
 9. [Codebase Structure](#9-codebase-structure)
 10. [Architectural Invariants](#10-architectural-invariants)
 11. [Acceptance Criteria](#11-acceptance-criteria)
-12. [Related Work](#12-related-work)
+12. [Limitations and Future Work](#12-limitations-and-future-work)
+13. [Related Work](#13-related-work)
 
 ---
 
@@ -386,11 +387,18 @@ routing_memory = {
 **Dynamic threshold τ:**
 
 ```
-τ = VORONOI_ALPHA × mean_inter_centroid_distance(all centroids)
-VORONOI_ALPHA = 0.3  ← the only relative constant in the system
+Cold cache (<2 clusters):   τ = VORONOI_TAU_COLD = 0.030
+Warm cache (≥2 clusters):   τ = min(VORONOI_TAU_CEIL, VORONOI_ALPHA × mean_inter_centroid_dist)
+                            VORONOI_TAU_CEIL  = 0.040
+                            VORONOI_ALPHA     = 0.30
 
-Young memory:  τ large (tolerant — casts wide net)
-Mature memory: τ small (precise — tight semantic matching)
+Measured fingerprint separation band (50 queries × 10 paraphrases):
+  same-query paraphrases: mean 0.018, p90 0.033
+  different queries:      mean 0.136, p10 0.063
+
+The old cold-start fallback (τ = VORONOI_ALPHA = 0.30) was 7× too loose and
+let the first cluster swallow almost any prompt before the cache could tighten.
+VORONOI_TAU_COLD sits inside the measured separation band.
 ```
 
 **Lookup logic:**
@@ -626,6 +634,84 @@ Same as Bug 2. Documented separately because it appeared in two different code p
 
 ---
 
+#### Bug 9 — Gate Confidence Saturated at 1.000 (Collapse to a Deterministic Switch)
+
+**The Problem:** After the Bug 2 fix the gate swung the other way: confidence locked at **exactly 1.000** from ~batch 7 onward and never moved. This is the cause of the earlier "loss 0.0 / confidence 1.000 / K=1 everywhere" result — the gate was not routing probabilistically, it had collapsed into a hard, saturated switch. Entropy over the domain softmax was ≈ 0.
+
+**Root Cause:** Two compounding faults. (1) The domain logits were taken from **raw backbone activations** whose magnitudes are large and unnormalised, so `softmax` saturated and entropy → 0. (2) A stale gate checkpoint contained **NaN** hidden states; Python `min/max(NaN)` returned 1.0, hard-pinning confidence.
+
+**The Fix:** Z-score normalise `mean_hidden` across all 896 dims, then slice `normed[:4]` as the 4 domain logits; set `max_entropy = log(4)` (not `log(20)`); add a NaN guard that returns `confidence = 0 → timeline B`; delete the corrupt checkpoint. Mirrored the same normalisation in `training.py` so train/infer match. **Result:** an untrained gate now reports `conf ≈ 0.02` and routes Timeline B correctly; confidence rises smoothly with training instead of pinning at 1.0.
+
+---
+
+#### Bug 10 — MAML Loss-Weights Frozen at [0.25, 0.25, 0.25, 0.25]
+
+**The Problem:** The "emergence" loop never moved the loss-weight lambdas off their uniform init. The advertised meta-learning was inert.
+
+**Root Cause:** The lambda meta-update used `BETA_LR = 1e-5` (bound by the structural `BETA_LR = ALPHA_LR/10` constraint), giving ~3e-6 movement per step — invisible over the whole run.
+
+**The Fix:** A **separate** `LAMBDA_META_LR = 0.03` for the loss-weight update, plus `LAMBDA_FLOOR = 0.05` with a simplex-with-floor projection so the linear meta-loss cannot collapse all weight onto one objective. **Result (measured):** in a controlled run the lambdas adapt — `l_dom` rises 0.268 → 0.316 as routing sharpens while `l_rel` falls 0.222 → 0.170.
+
+---
+
+#### Bug 11 — Three of Four Gate-Loss Terms Had Zero Gradient
+
+**The Problem:** The gate loss `λ·[l_eff, l_dom, l_rel, l_div]` advertised four objectives, but the gate only ever learned domain routing.
+
+**Root Cause:** `l_eff`, `l_rel`, and `l_div` were computed from values **detached from the gate's compute graph** (precomputed expert scores, expert hidden states, r_i history). They are constants w.r.t. the gate's parameters → exactly zero gradient. A gradient-norm test confirmed: `l_eff 0.0, l_rel 0.0, l_div 0.0, l_dom 51.0`. They burned compute every batch and on every `value_and_grad` for no learning.
+
+**The Fix:** Removed the three inert terms and their upstream prep; the gate loss is now `λ_dom · l_dom`, **gradient-identical** to the old four-term loss but cheaper per batch. (Making efficiency/diversity actually shape routing would require recomputing them from the gate's *outputs* — flagged as future work.)
+
+---
+
+#### Bug 12 — Voronoi Routing Memory Never Written During Training
+
+**The Problem:** The routing cache that is meant to skip expert re-selection on repeat queries stayed empty forever — every run reported `Clusters: 0`.
+
+**Root Cause:** The training loop called `routing_memory.lookup()` every Timeline-B batch but **never** called `spawn_cluster` / `merge_close_clusters` / `prune_stale`. The cache was read-only; nothing populated it.
+
+**The Fix:** Wired `spawn_cluster` after each Timeline-B batch that routes better than the domain's running-average `r_i` (a per-domain EMA threshold), with `merge_close_clusters` + `prune_stale` at checkpoint cadence. **Result:** clusters now form (3–4 in short runs) and grow with training — the routing-efficiency flywheel is live.
+
+---
+
+#### Bug 13 — Observability Silently Killed by the Adaptive Block
+
+**The Problem:** During long runs the `[learn]` progress lines, `[ckpt]` checkpoints, and the trajectory log never fired — the run looked like it produced no per-batch data despite completing thousands of batches.
+
+**Root Cause:** The logging/checkpoint block sat **after** the MAML + expert-migration code in the loop body. When that adaptive code raised on an iteration, the rest of the body (including all logging and checkpointing) was skipped — every batch.
+
+**The Fix:** Restructured the loop so **observability (logging, trajectory CSV, checkpointing) runs unconditionally right after the batch counter increments**, and the adaptive code now lives in a `try/except` that surfaces failures as a `[warn]` instead of aborting the iteration. **Result:** per-batch trajectory is captured reliably; any adaptive fault is visible, not silent.
+
+---
+
+#### Bug 15 — ~75% of Training Batches Were Silent No-Ops (Highest-Impact Training Bug)
+
+**The Problem:** After the gate-saturation fix (Bug 9), a large fraction of training batches performed **no learning at all** — no gate gradient, no expert gradient — yet still advanced the batch counter. This inflated batch/throughput counts and starved the actual optimisation.
+
+**Root Cause:** `TripleKSelector.select_experts` computed `k = gate_output.k_per_token` and returned `selected[:k]`. A **confident gate emits `k_per_token = 0`** (its way of signalling "Timeline A, no experts"). But during training the loop forces Timeline B and calls `select_experts` anyway — so `selected[:0] == []` came back empty, and the caller's `if not selected:` guard incremented the counter and `continue`d, skipping the entire train step. The loop's own `k = K_DEFAULT` / `k = max(1, k)` overrides were **local variables that `select_experts` ignored**. Measured on a controlled run: **20 of 27 batches (74%) skipped.**
+
+**The Fix:** Clamp inside the selector — `k = max(1, gate_output.k_per_token)`. Timeline A (true K=0) never calls this path, so whenever we *are* selecting we always get ≥1 expert. **After the fix: 0% skip, every batch produces gradients** (verified: loss 0.124 → 0.0003 over 10 batches, clusters growing, per-batch trajectory populated).
+
+**Impact on earlier numbers:** the pre-fix 500k/1M runs trained on only ~¼ of their tokens, and their tokens/sec figures were inflated because skipped batches avoid the expensive expert + Central passes. Those throughput/loss numbers are flagged for re-measurement (see §7).
+
+---
+
+#### Bug 16 — Observability Coupled to the Adaptive Block (see also above)
+
+Documented with the loop restructure: the `[learn]`/`[ckpt]`/trajectory writes are now unconditional immediately after the batch counter increments, and MAML + migration run in a guarded block afterward. Combined with Bug 15, this is why earlier long runs appeared to emit no per-batch data.
+
+---
+
+#### Bug 14 — Disabled Datasets Still Opened at Boot
+
+**The Problem:** Boot stalled for minutes (sometimes hung) opening streams for datasets that had been weight-zeroed precisely because they hang/time out.
+
+**Root Cause:** `iter_mixture_samples` initialised a stream for **every** key in `DATASET_WEIGHTS`, including `weight == 0` entries, so the slow/timeout loads still ran even though those streams are never sampled.
+
+**The Fix:** Initialise only streams with positive weight (`w > 0`). Boot now opens 18 streams instead of 21 and skips the known hang-prone sources.
+
+---
+
 #### Additional Fixes
 
 | Bug | Root Cause | Fix |
@@ -657,9 +743,64 @@ Steps 1–9: synchronous per-batch. Step 10: fully async, never blocks inference
 
 ## 7. Results and Benchmarks
 
-### Final Validated Training Results — 1M Token Benchmark Run
+### Post-Fix Validation (2026-06-23) — Gate Saturation Resolved
 
-This is the most complete validated run. All proof metrics, thermal regression, K-trajectory, and expert drift logs captured.
+> **Read this first.** The "loss 0.0 / confidence 1.000 / K=1-everywhere" numbers in the legacy benchmark below were produced while the gate was **saturated** (Bug 9) and the MAML lambdas were **frozen** (Bug 10). That regime is an artefact, not a result: a hard deterministic switch reporting zero loss is not convergence. After the gate-loss, MAML, routing-memory, logging, and data-loader fixes (Bugs 9–14), we re-ran clean. The corrected runs show **non-zero, healthy loss**, **lambdas that actually move**, and **routing clusters that actually populate**.
+
+#### Authoritative run — full 1M tokens, every batch trained (post-Bug-15)
+
+This is the first complete run after **all** fixes including Bug 15 (the no-op-batch bug). Every batch produced gate + expert gradients. It supersedes the inflated pre-Bug-15 numbers further below.
+
+| Metric | Value | Note |
+|--------|-------|------|
+| Total tokens | 1,000,086 | 3,629 batches, 100% Timeline B |
+| Elapsed | 10h 52m | MacBook Air M4 16GB, gradients ON |
+| **Tokens/sec** | **25.6** | **TRUE rate** — every batch does the full expert + 2× Central 7B passes. (The earlier 528–747 tok/s was the Bug-15 mirage: ~75% empty batches are nearly free and inflated the average.) |
+| **Expert contribution r_i** | **0.50 → 0.86 peak, ~0.66 sustained** | The headline learning signal: experts measurably get better at contributing to Central's synthesis. Flat at ~0.49 under the old skip regime — this rise only appears now that every batch trains. |
+| Routing clusters | 46 peak, bounded ~15–25 | Spawn + merge/prune cycle working |
+| Per-domain K | general/code/reasoning/knowledge all → **K=1** | All four converge to and hold the floor — **per-domain Core Invariant satisfied** (the gap raised in review). Decay from high-K happens in the first <20 batches, faster than the 20-batch log granularity. |
+| MAML λ | dom 0.288, rel 0.146, eff 0.282, div 0.283 | Emerged from uniform 0.25 and held |
+| avg_loss | ~0.0 | **Caveat (corrected):** `avg_loss` is NOT a language-model loss — it is the gate's **domain-routing cross-entropy** (`apply_gate_gradients` returns `λ_dom · l_dom`). It floored at ~0 because `local_custom` (weight 0.46) dominated the mixture and the gate trivially predicted that domain. The fix: de-skew weights (local_custom 0.10) + use held-out gate routing accuracy (see §7 Hardening). r_i is the meaningful per-step metric, not loss. |
+
+Data: `analysis/trajectory_1m_postfix.csv` (181 points), `analysis/per_domain_k_1m_postfix.json`, `analysis/plots/ri_cluster_1m_postfix.png`.
+
+---
+
+#### Pre-Bug-15 runs (inflated — retained for transparency)
+
+> ⚠️ The 500k/1M figures below were collected *before* Bug 15 was found: a confident gate emitted `k_per_token = 0`, so ~75% of training batches selected zero experts and skipped the train step. Those empty batches are cheap, so **tokens/sec is inflated** and **effective training was ~¼ of the token count**. Superseded by the authoritative run above.
+
+**Runs (MacBook Air M4 16GB, gradients ON, 100% Timeline B during training):**
+
+| Run | Tokens | Batches | Tok/sec | Final loss | Avg R_i | Clusters | Notes |
+|-----|--------|---------|---------|-----------|---------|----------|-------|
+| Clean 10k | 10,167 | 33 | 57 (steady) | 0.0884 | ~0.49 | 3 | First run after routing-memory wiring — clusters > 0 for the first time |
+| Mixture 500k | 500,075 | 1,828 | **528** | **0.2125** | 0.4914 | 3 | Full 24-stream mixture (3 hang-prone disabled); λ moved off uniform |
+| Mixture 1M | 1,000,086 | 3,629 | **747** | **0.1800** | ~0.50 | 4 | 1M tokens in 22 min on a laptop, gradients on |
+
+**Throughput rises with run length** — 57 → 528 → 747 tok/s — as the expert, stream, and routing-cluster caches warm. This is direct empirical support for the "routing becomes more efficient as it trains" thesis (not merely "more tokens = better").
+
+**MAML emergence is now real.** From a controlled, network-free run that isolates the optimiser dynamics, the loss-weights adapt monotonically as the gate sharpens:
+
+| Batch | Tokens | l_eff | **l_dom** | **l_rel** | l_div |
+|-------|--------|-------|-----------|-----------|-------|
+| 10 | 2,035 | 0.265 | 0.268 | 0.222 | 0.245 |
+| 35 | 6,494 | 0.264 | 0.291 | 0.199 | 0.246 |
+| 45 | 8,152 | 0.261 | 0.307 | 0.185 | 0.247 |
+| 55 | 9,539 | 0.266 | 0.314 | 0.175 | 0.245 |
+| 65 | 10,713 | 0.270 | **0.316** | **0.170** | 0.243 |
+
+`l_dom` (domain-routing weight) **rises** and `l_rel` **falls** — the meta-learner reallocating toward the objective that carries signal, which under the prior frozen regime was impossible. Note the gate loss here trends toward 0 because the controlled corpus is small and repeating; on the diverse mixture the loss settles at a healthy 0.18–0.21 (table above).
+
+**Honesty note on remaining gaps** (per the internal review): these runs are single-hardware (M4 16GB) and use a non-repeating streaming mixture; per-domain K-trajectory and blind Central-vs-pipeline quality benchmarks are still outstanding and are listed as future work. What is now *established* is that the engine's learning loop is sound and unsaturated.
+
+---
+
+### Legacy Benchmark — 1M Token Run (Pre-Fix, Saturated-Gate Regime)
+
+> ⚠️ Retained for transparency. The loss 0.0 and confidence 1.000 figures below reflect the **saturated-gate / frozen-MAML** bug (see Bugs 9–10), not genuine convergence. Superseded by the post-fix runs above.
+
+This is the most complete legacy run. All proof metrics, thermal regression, K-trajectory, and expert drift logs captured.
 
 | Metric | Value | Notes |
 |--------|-------|-------|
@@ -827,6 +968,93 @@ Zero OOM errors across 1,000,350 tokens. Available RAM fluctuated between 2,354 
 | Central entropy | Flat or decreasing as K falls | Monitored — no collapse observed |
 | Routing memory hit rate | Rising over session | Partial — 5 clusters, hit rate building |
 | Timeline A rate | Rising with domain familiarity | **PASS — 50% Timeline A rate achieved** after 10M token full protocol run. |
+
+---
+
+---
+
+## Four-Pillar Hardening (2026-06-24)
+
+These four measurements were made after the 10M run. They correct several prior claims.
+
+### Pillar 1 — Loss Metric (corrected)
+
+`avg_loss` recorded by the marathon is the **gate's domain-routing cross-entropy**, not an LM loss. It floored at ~0 because the mixture was 46% `local_custom`, which the gate trivially classified as "general". The old explanation ("trivial LM") was wrong.
+
+**Fix:** De-skewed `DATASET_WEIGHTS` (local_custom 0.46 → 0.10 with auto-renormalisation). Added `data/heldout_eval.jsonl` (40 balanced prompts, 10 per domain, outside all training streams) and `evaluation.py` to track **gate routing accuracy** — a skew-immune metric logged to `logs/eval.csv` every checkpoint.
+
+**Honest baseline:**
+
+| domain | gate routing acc |
+|--------|-----------------|
+| code | 20% |
+| reasoning | 70% |
+| knowledge | 20% |
+| general | 10% |
+| **overall** | **30%** (chance = 25%) |
+
+The old `avg_loss → 0` was hiding near-chance routing. The de-skewed run can now show whether routing actually climbs past chance.
+
+---
+
+### Pillar 2 — Latency Optimisation
+
+Two redundant passes removed. Both are bit-identical to the prior results.
+
+| Optimisation | Before | After | Win |
+|---|---|---|---|
+| Gate: Timeline B ran backbone twice (`forward` + `look_ahead`). Fused via `forward_with_topography()`. | 43.8 ms | 23.9 ms | **1.83×** |
+| Central: `base_hidden` (r_i reference) recomputed via a second 7B pass. Eliminated — causal attention means the question prefix of the synthesis pass IS the base reference. | 794 ms | 587 ms | **1.35×** |
+
+**Correction to a prior claim:** the documentation previously stated the "2× Central 7B passes per batch is architectural and not removable." That was wrong — one of the two IS removable. The single remaining 7B pass is the real floor.
+
+---
+
+### Pillar 3 — Realistic Workload
+
+50 unique queries × 10 surface paraphrases = 500 prompts, shuffled through the routing layer.
+
+**Voronoi tau bug found:** `_recompute_tau` used `VORONOI_ALPHA = 0.30` as the cold-start fallback. Measured separation: paraphrases separate at ~0.018, unrelated queries at ~0.136. `0.30` was 7× too loose — the first cluster swallowed almost everything. Fixed with `VORONOI_TAU_COLD = 0.030` and `VORONOI_TAU_CEIL = 0.040`.
+
+| metric | before fix | after fix |
+|---|---|---|
+| overall hit rate | 88% | 76% |
+| cache warming (1st half → 2nd half) | 84% → 92% | **60% → 93%** |
+| same-query precision | 47% | **56%** |
+| routing latency hit vs miss | 1.0× | **1.0×** |
+
+**Two honest findings:**
+1. The cache **warms** clearly — repeated queries get recognised.
+2. The cache gives **no latency benefit** (1.0×). The gate forward (~23 ms) dominates; expert selection is near-free (~0.2 ms). The Voronoi cache is a routing *consistency* mechanism, not a speed mechanism.
+
+---
+
+### Pillar 4 — Blind Eval (architectural truth)
+
+Reading the code before benchmarking revealed:
+
+- **Central is frozen.** Training updates the gate and experts; Central is never trained or saved.
+- **`expert_forward().output_text` is argmax over INPUT fragment positions** — a scrambled echo of the question, not a generated answer.
+- Therefore **"Sturnus pipeline vs Central-alone" is identical by construction at inference.** The deployed user-facing reply is always `Central.generate(prompt)`.
+
+The harness (`scripts/blind_eval.py`) tests a different question: does injecting expert text into the prompt help? Result on n=3 code queries: expert text changed the output (A≠B) but added only noise — both produced valid answers because Central already knew them.
+
+**This is the most important architectural truth to carry forward:**
+
+> As currently wired, the MoE expert pipeline is a **training-time apparatus**. Experts and the gate matter for the learning objectives (r_i, routing, TKL), but the deployed reply is base Central. To make experts contribute to answers, the design needs: (a) a meaningful expert summary injected into generation (not the argmax echo), or (b) training Central itself (which `scripts/lora_finetune.py --data mixture` does).
+
+---
+
+### New Artifacts
+
+| file | purpose |
+|---|---|
+| `data/heldout_eval.jsonl` | 40-prompt balanced held-out set (10 per domain) |
+| `evaluation.py` | gate routing accuracy, r_i, expert MSE — skew-immune |
+| `scripts/eval_heldout.py` | CLI: cheap gate-only eval by default, `--full` for pipeline |
+| `scripts/realistic_workload.py` | cache warming / tau study (`--full` for end-to-end overhead) |
+| `scripts/blind_eval.py` | A/B quality harness + GPT-judge scaffold |
+| `logs/eval.csv` | per-checkpoint held-out gate accuracy (written by finetune.py) |
 
 ---
 
@@ -1168,6 +1396,32 @@ python finetune.py --max-tokens 1000000 --batch-size 256
 python scripts/benchmark.py
 ```
 
+### Monitoring and Validation
+
+A training run can be watched live and its metrics extracted for the paper:
+
+```bash
+# Live monitor — batch#, tokens, loss, λ, K, tok/s, ETA
+python scripts/monitor_validation.py
+# or tail the raw log
+tail -f logs/validation_1m.log
+
+# After a run completes, extract metrics + plots
+python scripts/extract_validation_metrics.py
+#   → analysis/metrics_1m.json      all raw metrics
+#   → analysis/metrics_1m.csv       loss/λ/clusters/K per checkpoint
+#   → analysis/plots/convergence.png        loss, confidence, clusters, K
+#   → analysis/plots/lambda_evolution.png   MAML weight emergence
+
+# Skew-immune held-out evals (see §7 Hardening)
+python scripts/eval_heldout.py             # cheap: gate routing accuracy
+python scripts/eval_heldout.py --full      # heavy: + r_i and expert MSE
+python scripts/realistic_workload.py       # cache warming / tau study
+python scripts/blind_eval.py --n 8         # A/B quality harness
+```
+
+**What a healthy run shows:** loss (routing CE) converges, λ diverges from `[0.25]×4` (MAML working), clusters grow above 0, K drops toward 1, gate confidence rises, and tok/s stays stable (no thermal throttle). The authoritative signal is **held-out gate routing accuracy** in `logs/eval.csv`, not `avg_loss` — see §7.
+
 **MLX memory management note:** `mx.metal.get_active_memory()` returns 0 on M4. Available RAM is measured via `vm_stat` subprocess, parsing free + inactive pages with a 5 GB reservation for the OS, Gate, and Central. This runs before every batch.
 
 **Tokeniser boundary note:** Gate and Experts use the Qwen2.5 tokeniser. Central uses the Mistral tokeniser. Expert outputs are decoded to text before passing to Central. Raw Qwen2.5 token IDs never cross this boundary.
@@ -1189,6 +1443,7 @@ Sturnus/
 ├── training.py                All losses, peer gradients, two-stage gradient cascade
 ├── meta.py                    MAML, λ optimisation, K-Velocity
 ├── inference.py               Timeline A/B, Shadow Loop, dead-time B dispatch
+├── evaluation.py              Held-out eval module (gate routing accuracy, r_i, expert MSE)
 ├── data.py                    Streaming, tokenisation, Universal Buffet data supply, HF auth
 ├── diagnostics.py             Hardware observer, incremental OLS regression, X_next prediction
 ├── main.py                    Boot, Universal Buffet, session lifecycle, dead-time loop
@@ -1200,7 +1455,10 @@ Sturnus/
     ├── train_phase3.py        Expert fine-tuning
     ├── benchmark.py           Central vs Pipeline scoring
     ├── validate.py            Routing distribution + E2E test
-    └── run_all.py             Full pipeline orchestration
+    ├── run_all.py             Full pipeline orchestration
+    ├── eval_heldout.py        Held-out gate routing accuracy (skew-immune)
+    ├── realistic_workload.py  Cache warming + tau study on repeated/paraphrased queries
+    └── blind_eval.py          A/B quality harness: Central vs Central+expert-text
 ```
 
 **File ownership rules:**
@@ -1259,7 +1517,19 @@ All six must pass simultaneously before capacity scaling:
 
 ---
 
-## 12. Related Work
+## 12. Limitations and Future Work
+
+| Limitation | Detail |
+|---|---|
+| **MoE pipeline is training-only** | The deployed reply is always `Central.generate(prompt)`. Experts and the gate train routing and r_i scores, but expert outputs never reach the user-facing text. This is the #1 architectural gap. Future: inject a real expert summary into Central's context, or train Central on the MoE mixture via `scripts/lora_finetune.py --data mixture`. |
+| **Gate routing accuracy near chance** | On a balanced 40-prompt held-out set the gate routes at 30% (chance = 25%). The domain mixture was skewed, masking this with a near-zero routing CE loss. The de-skewed mixture (local_custom 0.10) + `logs/eval.csv` tracking sets up the next run to actually measure improvement. |
+| **Voronoi cache: consistency, not speed** | Hit rate warms to 93% on repeated queries but latency speedup is 1.0×. The gate forward (~23 ms) dominates; expert selection is near-free. Cache value is routing consistency across paraphrases, not raw speed. |
+| **Single hardware validation** | All numbers measured on one MacBook Air M4 16 GB. Multi-device and cross-hardware validation outstanding. |
+| **`avg_loss` is routing CE, not LM loss** | Never use `avg_loss → 0` as evidence of language-modeling quality. The correct metric is held-out gate routing accuracy and r_i. |
+
+---
+
+## 13. Related Work
 
 **Mixture-of-Experts:** Shazeer et al. (2017) introduced sparsely-gated MoE layers. Switch Transformer (Fedus et al., 2021) scaled to trillion parameters with one-expert-per-token routing. GLaM (Du et al., 2021) demonstrated MoE quality matching at a fraction of dense activated parameters. Critical distinction from all prior work: every existing MoE system treats K as fixed at design time. Sturnus treats K as the primary observable of system health and drives it toward zero across sessions.
 
@@ -1271,7 +1541,7 @@ All six must pass simultaneously before capacity scaling:
 
 ---
 
-## References
+## 14. References
 
 - [1] Shazeer et al. (2017). Outrageously Large Neural Networks: The Sparsely-Gated Mixture-of-Experts Layer. ICLR 2017.
 - [2] Fedus, Zoph, Shazeer (2021). Switch Transformers. JMLR.

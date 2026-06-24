@@ -1,0 +1,17 @@
+{
+  "log_metrics": {
+    "batches": [],
+    "tokens": [],
+    "loss": [],
+    "lambdas": [],
+    "clusters": [],
+    "r_i": [],
+    "k": [],
+    "confidence": [],
+    "tok_s": [],
+    "experts": [],
+    "elapsed": []
+  },
+  "final_stats": {},
+  "lambda_trajectory": {}
+}

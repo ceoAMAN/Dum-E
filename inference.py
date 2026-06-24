@@ -20,16 +20,30 @@ from splitter import (
     prefetch_next_batch,
     ExpertFragment,
 )
-from tools import route_and_execute_tool
-from bios import BIOS, route_bios_intent
-from conversational_memory import ConversationalMemory
-from code_executor import CodeExecutor
-from self_correction import SelfCorrection
-from k_velocity import KVelocity
-from emotional import EmotionalCalibration
-from predictive import PredictiveAssistant
-from world_model import WorldModel
-from vision_module import VisionSystem
+# --- Optional BRIAN/Manny capability stack --------------------------------
+# Sturnus runs standalone without these modules. When the Manny layer is
+# present they are imported and wired in; when absent (a clean Sturnus
+# checkout) every call site below is already guarded by a truthiness check,
+# so the engine boots and runs unchanged.
+try:
+    from tools import route_and_execute_tool
+    from bios import BIOS, route_bios_intent
+    from conversational_memory import ConversationalMemory
+    from code_executor import CodeExecutor
+    from self_correction import SelfCorrection
+    from k_velocity import KVelocity
+    from emotional import EmotionalCalibration
+    from predictive import PredictiveAssistant
+    from world_model import WorldModel
+    from vision_module import VisionSystem
+    BRIAN_AVAILABLE = True
+except ImportError:
+    route_and_execute_tool = None
+    route_bios_intent = None
+    BIOS = ConversationalMemory = CodeExecutor = SelfCorrection = None
+    KVelocity = EmotionalCalibration = PredictiveAssistant = None
+    WorldModel = VisionSystem = None
+    BRIAN_AVAILABLE = False
 
 
 @dataclass
@@ -85,8 +99,8 @@ class InferenceEngine:
         self._current_x = configs.X_MAX
         self._tokens_processed = 0
 
-        # BRIAN capability stack
-        self.bios = bios or BIOS()
+        # BRIAN capability stack (all optional; None when Manny layer absent)
+        self.bios = bios or (BIOS() if BIOS is not None else None)
         self.conv_memory = conv_memory
         self.code_executor = code_executor
         self.self_correction = self_correction
@@ -137,12 +151,13 @@ class InferenceEngine:
             except Exception:
                 pass
 
-        try:
-            tool_context = route_and_execute_tool(input_text)
-            if tool_context:
-                input_text = f"[Real-Time Information Context]\n{tool_context}\n\nUser Question: {input_text}"
-        except Exception:
-            pass
+        if route_and_execute_tool is not None:
+            try:
+                tool_context = route_and_execute_tool(input_text)
+                if tool_context:
+                    input_text = f"[Real-Time Information Context]\n{tool_context}\n\nUser Question: {input_text}"
+            except Exception:
+                pass
 
         context_parts = []
         if memory_context:

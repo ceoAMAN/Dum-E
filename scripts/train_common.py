@@ -2,7 +2,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterator, List
+from typing import Any, Dict, Iterator
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim

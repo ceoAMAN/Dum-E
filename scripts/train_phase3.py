@@ -60,7 +60,17 @@ def run() -> None:
         optimizer = optim.Adam(learning_rate=configs.LEARNING_RATE)
 
         def _expert_loss(m: nn.Module, input_ids: mx.array) -> mx.array:
-            output = m(input_ids)
+            # Single backbone pass: get hidden states, then derive logits cheaply
+            if hasattr(m, 'model'):
+                hidden_out = m.model(input_ids)
+                # Derive logits from hidden states (just the lm_head, no second pass)
+                if hasattr(m, 'lm_head'):
+                    output = m.lm_head(hidden_out)
+                else:
+                    output = m(input_ids)
+            else:
+                output = m(input_ids)
+                hidden_out = output
             if output.ndim == 3:
                 logits = output[:, :-1, :]
                 targets = input_ids[:, 1:]
@@ -69,7 +79,11 @@ def run() -> None:
                 soft_targets = mx.softmax(mx.stop_gradient(soft_logits), axis=-1)
                 log_probs = mx.log(mx.softmax(soft_logits, axis=-1) + 1e-10)
                 distill_loss = -mx.mean(mx.sum(soft_targets * log_probs, axis=-1)) * 4.0
-                hidden = mx.mean(output, axis=1)
+                # Use backbone hidden states for alignment (not vocab logits)
+                if hidden_out.ndim == 3:
+                    hidden = mx.mean(hidden_out, axis=1)
+                else:
+                    hidden = hidden_out
                 alignment_loss = _cross_expert_alignment_loss(hidden)
             else:
                 task_loss = mx.mean(output)
