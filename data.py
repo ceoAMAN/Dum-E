@@ -43,13 +43,22 @@ def _extract_text(example: Dict[str, Any]) -> str:
                 parts.append(f"{role}: {value}")
         if parts:
             return "\n".join(parts)
-    if "conversations" in example and isinstance(example["conversations"], list):
+    # "conversations" (plural, ShareGPT) or "conversation" (singular, Agent-FLAN).
+    conv = example.get("conversations")
+    if conv is None:
+        conv = example.get("conversation")
+    if isinstance(conv, list) and conv:
         parts = []
-        for m in example["conversations"]:
+        for m in conv:
+            if not isinstance(m, dict):
+                parts.append(str(m))
+                continue
             role = m.get("from", m.get("role", ""))
             value = m.get("value", m.get("content", ""))
-            parts.append(f"{role}: {value}")
-        return "\n".join(parts)
+            if isinstance(value, str) and value.strip():
+                parts.append(f"{role}: {value}")
+        if parts:
+            return "\n".join(parts)
     if "instruction" in example and "output" in example:
         parts = []
         instruction = example.get("instruction")
@@ -122,6 +131,48 @@ def _extract_text(example: Dict[str, Any]) -> str:
             parts.append(f"answer: {expected_answer}")
         if parts:
             return "\n".join(parts)
+    # xlam function-calling format: instruction + tool definitions + answers
+    if "functions" in example and "answers" in example:
+        parts = []
+        instr = example.get("instruction", "")
+        if isinstance(instr, str) and instr.strip():
+            parts.append(f"instruction: {instr}")
+        functions = example.get("functions", "")
+        if isinstance(functions, str) and functions.strip():
+            parts.append(f"tools: {functions}")
+        answers = example.get("answers", "")
+        if isinstance(answers, str) and answers.strip():
+            parts.append(f"tool_calls: {answers}")
+        if parts:
+            return "\n".join(parts)
+
+    # glaive function-calling format: system + raw chat string
+    if "chat" in example:
+        parts = []
+        system = example.get("system", "")
+        if isinstance(system, str) and system.strip():
+            parts.append(system.strip())
+        chat = example.get("chat", "")
+        if isinstance(chat, str) and chat.strip():
+            parts.append(chat.strip())
+        if parts:
+            return "\n".join(parts)
+
+    # agent trajectory format (AgentInstruct / Agent-FLAN ReAct traces)
+    if "trajectory" in example and isinstance(example["trajectory"], list):
+        parts = []
+        instr = example.get("instruction", example.get("task", ""))
+        if isinstance(instr, str) and instr.strip():
+            parts.append(f"task: {instr}")
+        for step in example["trajectory"][:8]:
+            if isinstance(step, dict):
+                for key in ("thought", "reasoning", "action", "observation", "result"):
+                    v = step.get(key, "")
+                    if isinstance(v, str) and v.strip():
+                        parts.append(f"{key}: {v.strip()[:300]}")
+        if parts:
+            return "\n".join(parts)
+
     for key in _TEXT_KEYS:
         value = example.get(key)
         if isinstance(value, str) and value.strip():
@@ -145,7 +196,10 @@ def _load_stream(dataset_key: str):
     print(f"[data] Opening stream {dataset_key} ({dataset_id})")
     kwargs: Dict[str, Any] = {"split": dataset_split, "streaming": True}
     if dataset_cfg:
-        kwargs["name"] = dataset_cfg
+        if isinstance(dataset_cfg, dict):
+            kwargs["data_files"] = dataset_cfg
+        else:
+            kwargs["name"] = dataset_cfg
     if configs.HF_TOKEN:
         kwargs["token"] = configs.HF_TOKEN
     ds = load_dataset(dataset_id, **kwargs)
@@ -192,15 +246,21 @@ def iter_mixture_samples(seed: int = 42) -> Iterator[Sample]:
     streams = {}
     cold_streams = set()
     failed_keys = set()
-    print(f"[data] Initialising mixture streams: {list(configs.DATASET_WEIGHTS.keys())}")
-    for key in configs.DATASET_WEIGHTS:
+    # Only initialise streams with positive weight. Zero-weight datasets (e.g.
+    # disabled because they hang on the HF stream open) must NOT be opened at all,
+    # otherwise their slow/timeout load still stalls boot even though they're never
+    # sampled.
+    enabled_keys = [k for k, w in configs.DATASET_WEIGHTS.items() if w > 0.0]
+    print(f"[data] Initialising mixture streams: {enabled_keys}")
+    for key in enabled_keys:
         try:
             streams[key] = iter_dataset_samples(key)
             cold_streams.add(key)
         except Exception as e:
             print(f"[data] Failed to load {key}: {e}")
             failed_keys.add(key)
-    active_weights = {k: v for k, v in configs.DATASET_WEIGHTS.items() if k not in failed_keys}
+    active_weights = {k: v for k, v in configs.DATASET_WEIGHTS.items()
+                      if k not in failed_keys and v > 0.0}
     if not active_weights:
         raise RuntimeError("All datasets failed to load.")
     total = sum(active_weights.values())
@@ -225,7 +285,7 @@ def iter_mixture_samples(seed: int = 42) -> Iterator[Sample]:
                 yield sample
             except Exception:
                 failed_keys.add(chosen)
-                active_weights = {k: v for k, v in configs.DATASET_WEIGHTS.items() if k not in failed_keys}
+                active_weights = {k: v for k, v in configs.DATASET_WEIGHTS.items() if k not in failed_keys and v > 0.0}
                 if not active_weights:
                     return
                 total = sum(active_weights.values())
@@ -233,7 +293,7 @@ def iter_mixture_samples(seed: int = 42) -> Iterator[Sample]:
         except Exception as e:
             print(f"[data] Error reading {chosen}: {e}")
             failed_keys.add(chosen)
-            active_weights = {k: v for k, v in configs.DATASET_WEIGHTS.items() if k not in failed_keys}
+            active_weights = {k: v for k, v in configs.DATASET_WEIGHTS.items() if k not in failed_keys and v > 0.0}
             if not active_weights:
                 return
             total = sum(active_weights.values())

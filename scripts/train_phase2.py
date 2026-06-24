@@ -62,7 +62,11 @@ def run() -> None:
     optimizer = optim.Adam(learning_rate=configs.LEARNING_RATE)
 
     def _gate_loss(m: nn.Module, input_ids: mx.array, attention_mask: mx.array) -> mx.array:
-        output = m(input_ids)
+        # Use backbone to get hidden states, not vocabulary logits
+        if hasattr(m, 'model'):
+            output = m.model(input_ids)
+        else:
+            output = m(input_ids)
         if output.ndim == 3:
             hidden = mx.mean(output, axis=1)
         else:
@@ -93,7 +97,11 @@ def run() -> None:
 
         # log component losses for visibility (no-grad, cheap)
         with mx.no_grad() if hasattr(mx, "no_grad") else __import__("contextlib").nullcontext():
-            output = model(input_ids)
+            # Use backbone for hidden states (matches loss function)
+            if hasattr(model, 'model'):
+                output = model.model(input_ids)
+            else:
+                output = model(input_ids)
             if output.ndim == 3:
                 hidden = mx.mean(output, axis=1)
             else:

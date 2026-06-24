@@ -1,0 +1,40 @@
+{"text": "Write a Python function that returns the nth Fibonacci number using memoization.", "domain": "code"}
+{"text": "def quicksort(arr): implement an in-place quicksort and explain the partition step.", "domain": "code"}
+{"text": "How do I reverse a linked list in C? Provide the struct and the loop.", "domain": "code"}
+{"text": "Write a SQL query that joins orders and customers and returns total spend per customer.", "domain": "code"}
+{"text": "Implement a debounce function in JavaScript that delays calls by 300ms.", "domain": "code"}
+{"text": "import numpy as np — how do I vectorize this for-loop that sums row products?", "domain": "code"}
+{"text": "Write a bash script that finds and deletes all .tmp files older than 7 days.", "domain": "code"}
+{"text": "Create a React component with a useState counter and an increment button.", "domain": "code"}
+{"text": "Explain how a hash map handles collisions and write a simple open-addressing version.", "domain": "code"}
+{"text": "Write a recursive function to compute the factorial of n and add an iterative version.", "domain": "code"}
+{"text": "Prove that the square root of 2 is irrational.", "domain": "reasoning"}
+{"text": "If a train travels 60 km in 45 minutes, what is its average speed in km/h?", "domain": "reasoning"}
+{"text": "Solve the integral of x^2 times e^x with respect to x using integration by parts.", "domain": "reasoning"}
+{"text": "A bag has 3 red and 5 blue balls. What is the probability of drawing two red balls without replacement?", "domain": "reasoning"}
+{"text": "Find the derivative of f(x) = ln(x^2 + 1) and state where it is increasing.", "domain": "reasoning"}
+{"text": "Prove by induction that the sum of the first n odd numbers equals n squared.", "domain": "reasoning"}
+{"text": "Three friends split a bill of $87 unevenly: one pays twice another. Set up the equations.", "domain": "reasoning"}
+{"text": "What is the limit of (1 + 1/n)^n as n approaches infinity, and why?", "domain": "reasoning"}
+{"text": "Given a triangle with sides 3, 4, and 5, prove it is a right triangle.", "domain": "reasoning"}
+{"text": "Solve the system: 2x + 3y = 12 and x - y = 1. Show each step.", "domain": "reasoning"}
+{"text": "Who was the first president of the United States and in what year was he inaugurated?", "domain": "knowledge"}
+{"text": "What causes the seasons on Earth, and why are they reversed between hemispheres?", "domain": "knowledge"}
+{"text": "Explain the main causes of the First World War.", "domain": "knowledge"}
+{"text": "What is photosynthesis and which organelle carries it out?", "domain": "knowledge"}
+{"text": "When did the Roman Empire fall and what were the major contributing factors?", "domain": "knowledge"}
+{"text": "What is the capital of Australia and why is it not Sydney?", "domain": "knowledge"}
+{"text": "Describe how vaccines train the immune system to recognize pathogens.", "domain": "knowledge"}
+{"text": "What is the difference between weather and climate?", "domain": "knowledge"}
+{"text": "Who wrote the theory of general relativity and what did it change about physics?", "domain": "knowledge"}
+{"text": "What are tectonic plates and how do they cause earthquakes?", "domain": "knowledge"}
+{"text": "I'm feeling a bit down today, can you cheer me up?", "domain": "general"}
+{"text": "What should I cook for dinner if I only have eggs, rice, and some vegetables?", "domain": "general"}
+{"text": "Recommend a good weekend trip within a few hours of a big city.", "domain": "general"}
+{"text": "Tell me a fun fact to share at a party.", "domain": "general"}
+{"text": "How do I stay motivated when working from home?", "domain": "general"}
+{"text": "What's a thoughtful birthday gift for a friend who loves gardening?", "domain": "general"}
+{"text": "Help me write a short, friendly message to reschedule a meeting.", "domain": "general"}
+{"text": "I want to start journaling — any tips for keeping the habit?", "domain": "general"}
+{"text": "Suggest some relaxing activities for a rainy Sunday afternoon.", "domain": "general"}
+{"text": "What's a good icebreaker question for meeting new coworkers?", "domain": "general"}
