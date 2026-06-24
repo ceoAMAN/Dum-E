@@ -1,7 +1,6 @@
 from __future__ import annotations
-import time
 from dataclasses import dataclass
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 import mlx.core as mx
 import numpy as np
 import configs
@@ -20,33 +19,38 @@ class CentralModel:
         self.model = None
         self.tokenizer = None
         self._loaded = False
+        # Default reply length; the voice daemon lowers this for snappy speech.
+        self.gen_max_tokens = 256
     def load(self):
         if self._loaded:
             return
         from mlx_lm import load as mlx_load
+        from mlx_lm.tuner.utils import linear_to_lora_layers
+        from pathlib import Path
         self.model, self.tokenizer = mlx_load(configs.CENTRAL_MODEL_ID)
+        self.model.freeze()
+        lora_config = {"rank": configs.LORA_R, "scale": configs.LORA_ALPHA, "dropout": configs.LORA_DROPOUT}
+        num_layers = len(self.model.layers) if hasattr(self.model, "layers") else len(self.model.model.layers)
+        linear_to_lora_layers(self.model, num_layers, lora_config)
+        weights_path = Path(configs.CHECKPOINT_DIR) / "central" / "weights.safetensors"
+        if weights_path.exists():
+            self.model.load_weights(str(weights_path), strict=False)
+        self.model.train()
         self._loaded = True
-    def _compute_hidden_mean(self, token_ids: List[int]) -> mx.array:
-        tokens = mx.array([token_ids[:configs.MAX_SEQ_LEN]])
-        if hasattr(self.model, "model"):
-            hidden_out = self.model.model(tokens)
-            mx.eval(hidden_out)
-        else:
-            hidden_out = self.model(tokens)
-            mx.eval(hidden_out)
-        if hidden_out.ndim == 3:
-            hidden_mean = mx.mean(hidden_out[0], axis=0)
-        else:
-            hidden_mean = mx.mean(hidden_out, axis=0)
-        mx.eval(hidden_mean)
-        return hidden_mean
-    def _build_input_ids(self, original_input: str, expert_outputs: List[Dict[str, Any]]) -> List[int]:
+    def _build_input_ids(self, original_input: str, expert_outputs: List[Dict[str, Any]]):
+        """Returns (input_ids, n_question) where n_question is the number of
+        leading tokens that are the original question (before any expert output
+        is appended). Because attention is causal, the synthesis backbone's
+        hidden states at positions [0:n_question) equal what a question-only
+        forward would produce — so the caller can recover base_hidden from the
+        synthesis pass and skip a second 7B forward."""
         limit = configs.MAX_SEQ_LEN
         reserve = 128
         base_limit = max(configs.FRAGMENT_MIN, limit - reserve)
         input_ids = self.tokenizer.encode(original_input)[:base_limit]
+        n_question = len(input_ids)
         if len(input_ids) >= limit:
-            return input_ids
+            return input_ids[:limit], min(n_question, limit)
         newline_ids = self.tokenizer.encode("\n")
         for eo in expert_outputs:
             text = str(eo.get("output_text", ""))
@@ -62,42 +66,44 @@ class CentralModel:
                 if remaining <= 0:
                     break
             input_ids.extend(part_ids[:remaining])
-        return input_ids[:limit]
+        return input_ids[:limit], n_question
     def forward(self, original_input: str, expert_outputs: List[Dict[str, Any]], send_to_user: bool = True) -> CentralOutput:
         self.load()
-        base_input_ids = self.tokenizer.encode(original_input)[:configs.MAX_SEQ_LEN]
-        input_ids = self._build_input_ids(original_input, expert_outputs)
+        input_ids, n_question = self._build_input_ids(original_input, expert_outputs)
         tokens = mx.array([input_ids])
-        t_start = time.perf_counter()
-        # Single backbone pass: extract hidden states, then derive logits cheaply
-        if hasattr(self.model, 'model'):
+        # ONE backbone pass over [question | expert outputs].
+        has_backbone = hasattr(self.model, 'model')
+        if has_backbone:
             hidden_out = self.model.model(tokens)
-            mx.eval(hidden_out)
-            # Derive logits from hidden states (just the lm_head projection, no second pass)
-            if hasattr(self.model, 'lm_head'):
+        else:
+            hidden_out = self.model(tokens)
+        seq_hidden = hidden_out[0] if hidden_out.ndim == 3 else hidden_out  # (T, D)
+        # Synthesis = mean over the whole sequence (question + expert context).
+        synthesis_hidden = mx.mean(seq_hidden, axis=0)
+        # Base = mean over JUST the question prefix of the SAME pass. Causal
+        # attention means those positions never saw the expert tokens, so this is
+        # identical to a separate question-only forward — but free. Eliminates the
+        # second 7B backbone pass that used to dominate per-batch cost.
+        n_q = max(1, min(int(n_question), int(seq_hidden.shape[0])))
+        base_hidden = mx.mean(seq_hidden[:n_q], axis=0)
+        min_dim = min(base_hidden.shape[0], synthesis_hidden.shape[0])
+        contribution_hidden = synthesis_hidden[:min_dim] - base_hidden[:min_dim]
+        # Single sync for everything training needs (lets MLX fuse/pipeline the rest).
+        mx.eval(synthesis_hidden, contribution_hidden)
+        # The lm_head vocab projection (512 x 32k matmul) + argmax + decode exist ONLY
+        # to produce synthesis_text for the user reply. Training never reads it, so
+        # skip the whole thing unless we're actually replying — a free per-batch win.
+        if send_to_user:
+            if has_backbone and hasattr(self.model, 'lm_head'):
                 logits = self.model.lm_head(hidden_out)
             else:
                 logits = self.model(tokens)
             mx.eval(logits)
+            last_logits = logits[0, -1, :] if logits.ndim == 3 else logits[-1, :]
+            token_id = int(mx.argmax(last_logits).item())
+            synthesis_text = self.tokenizer.decode([token_id])
         else:
-            logits = self.model(tokens)
-            mx.eval(logits)
-            hidden_out = logits
-        t_end = time.perf_counter()
-        # Synthesis hidden from the backbone pass we already did (no extra pass)
-        if hidden_out.ndim == 3:
-            synthesis_hidden = mx.mean(hidden_out[0], axis=0)
-        else:
-            synthesis_hidden = mx.mean(hidden_out, axis=0)
-        mx.eval(synthesis_hidden)
-        # Base hidden still needs its own pass (the delta reference)
-        base_hidden = self._compute_hidden_mean(base_input_ids)
-        min_dim = min(base_hidden.shape[0], synthesis_hidden.shape[0])
-        contribution_hidden = synthesis_hidden[:min_dim] - base_hidden[:min_dim]
-        mx.eval(contribution_hidden)
-        last_logits = logits[0, -1, :] if logits.ndim == 3 else logits[-1, :]
-        token_id = int(mx.argmax(last_logits).item())
-        synthesis_text = self.tokenizer.decode([token_id])
+            synthesis_text = ""
         expert_scores = {}
         expert_tkl_scores = {}
         for eo in expert_outputs:
@@ -175,7 +181,21 @@ class CentralModel:
         return entropy
     def format_prompt(self, input_text: str) -> str:
         return f"<s> [INST] {input_text} [/INST]"
-    def generate(self, input_text: str, max_tokens: int = 256) -> str:
+    def generate(self, input_text: str, max_tokens: Optional[int] = None) -> str:
         self.load()
         from mlx_lm import generate as mlx_generate
-        return mlx_generate(self.model, self.tokenizer, prompt=self.format_prompt(input_text), max_tokens=max_tokens)
+        mt = max_tokens if max_tokens is not None else self.gen_max_tokens
+        return mlx_generate(self.model, self.tokenizer, prompt=self.format_prompt(input_text), max_tokens=mt)
+
+    def generate_stream(self, input_text: str, max_tokens: Optional[int] = None):
+        """Yield text deltas as they are generated (for low-latency speech)."""
+        self.load()
+        from mlx_lm import stream_generate
+        mt = max_tokens if max_tokens is not None else self.gen_max_tokens
+        for response in stream_generate(
+            self.model, self.tokenizer,
+            prompt=self.format_prompt(input_text), max_tokens=mt,
+        ):
+            text = getattr(response, "text", "")
+            if text:
+                yield text
