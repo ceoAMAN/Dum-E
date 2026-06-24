@@ -26,13 +26,23 @@ class MAMLOptimiser:
         self.lambdas = mx.array(configs.LAMBDA_INIT, dtype=mx.float32)
         self.alpha_lr = configs.ALPHA_LR
         self.beta_lr = configs.BETA_LR
+        # Dedicated rate for the loss-weight (lambda) meta-update. beta_lr stays
+        # tied to alpha_lr (10:1) for the gate-parameter MAML; the lambdas need a
+        # much larger rate or they never move off the uniform init.
+        self.lambda_meta_lr = getattr(configs, "LAMBDA_META_LR", configs.BETA_LR)
         self._validate_lr_ratio()
         self.state = MAMLState(lambdas=self.lambdas)
         self._prev_lambda_norm: Optional[float] = None
     def _normalise_lambdas(self, lambdas: mx.array) -> mx.array:
-        clipped = mx.maximum(lambdas, mx.array(1e-6, dtype=mx.float32))
+        # Project onto the simplex with a per-element floor so no loss term is
+        # ever fully zeroed: normalised = floor + (1 - n*floor) * base.
+        n = int(lambdas.shape[0])
+        floor = float(getattr(configs, "LAMBDA_FLOOR", 0.0))
+        floor = max(0.0, min(floor, 1.0 / max(n, 1)))  # guard: n*floor <= 1
+        clipped = mx.maximum(lambdas, mx.array(0.0, dtype=mx.float32))
         total = mx.sum(clipped) + 1e-8
-        normalised = clipped / total
+        base = clipped / total
+        normalised = floor + (1.0 - n * floor) * base
         mx.eval(normalised)
         return normalised
     def _validate_lr_ratio(self):
@@ -65,7 +75,7 @@ class MAMLOptimiser:
             return compute_l_meta_fn(theta_prime, lam)
         lambda_grad_fn = mx.grad(meta_loss)
         lambda_grads = lambda_grad_fn(self.lambdas)
-        return self.lambdas - self.beta_lr * lambda_grads
+        return self.lambdas - self.lambda_meta_lr * lambda_grads
     def _outer_step_second_order(self, theta_prime: Dict, compute_l_meta_fn) -> mx.array:
         def meta_loss(lam):
             return compute_l_meta_fn(theta_prime, lam)
@@ -76,7 +86,7 @@ class MAMLOptimiser:
             [mx.ones_like(meta_value)],
         )
         lambda_grads = lambda_vjps[0]
-        return self.lambdas - self.beta_lr * lambda_grads
+        return self.lambdas - self.lambda_meta_lr * lambda_grads
     def _check_instability(self, new_lambdas: mx.array):
         new_norm = float(mx.sum(mx.abs(new_lambdas)).item())
         if self._prev_lambda_norm is not None:
