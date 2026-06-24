@@ -16,6 +16,11 @@ def _load_local_env() -> None:
         os.environ.setdefault(key, value)
 _load_local_env()
 HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
+WOLFRAM_APP_ID = os.getenv("WOLFRAM_APP_ID", "").strip()
+NEWSAPI_KEY = os.getenv("NEWSAPI_KEY", "").strip()
+OPENWEATHERMAP_KEY = os.getenv("OPENWEATHERMAP_KEY", "").strip()
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "").strip()
+DEPLOYMENT = os.getenv("STURNUS_DEPLOYMENT", "False").lower() in ("true", "1", "yes")
 GATE_MODEL_ID = "mlx-community/Qwen2.5-0.5B-Instruct-4bit"
 EXPERT_MODEL_ID = "mlx-community/Qwen2.5-1.5B-Instruct-4bit"
 CENTRAL_MODEL_ID = "mlx-community/Mistral-7B-Instruct-v0.3-4bit"
@@ -39,10 +44,27 @@ MONOPOLY_THRESHOLD = 0.85
 CALIBRATION_PATH = "state/calibration.npz"
 LATENCY_STORE_PATH = "state/latency_store.npz"
 VORONOI_ALPHA = 0.3
+# Voronoi route-cache acceptance threshold (cosine distance). Measured on the
+# gate's mean-pooled fingerprints (scripts/realistic_workload.py): paraphrases of
+# the SAME query sit at cosine dist ~0.018 (p90 0.033); UNRELATED queries at
+# ~0.136 (p10 0.063). So a tau in [0.033, 0.063] cleanly separates "same intent"
+# from "different intent". The old cold-start fallback used VORONOI_ALPHA (0.30)
+# directly when <2 clusters existed — ~7x too loose, so the first cluster
+# swallowed everything before the cache could tighten (same-base hit accuracy
+# was 47%, barely above chance). These bound the threshold to the measured band.
+# Set near the within-paraphrase p90 (0.033): favours PRECISION because a false
+# cache hit routes to the wrong experts, whereas a miss merely re-runs expert
+# selection — which the workload harness showed is near-free (the gate pass, not
+# selection, is the routing cost). Sweep (scripts/realistic_workload.py):
+#   tau≈0.06  → 86% hit / 69% same-query precision
+#   tau≈0.033 → 84% hit / ~80% precision   (this default)
+#   tau≈0.020 → 75% hit / 91% precision    (tighter; risks missing real rewrites)
+VORONOI_TAU_COLD = 0.030   # absolute tau when <2 clusters exist (cold cache)
+VORONOI_TAU_CEIL = 0.040   # cap on the warm tau = ALPHA * mean_inter_centroid_dist
 CLUSTER_CAP_RATE = 50
 CLUSTER_PRUNE_AGE = 10_000
 CLUSTER_CONFIDENCE_FLOOR = 0.4
-FAST_PATH_THRESHOLD = 0.99
+FAST_PATH_THRESHOLD = 0.70
 THERMAL_SAMPLE_INTERVAL = 1
 THERMAL_THROTTLE_TEMP = 85.0
 DIAGNOSTICS_SAVE_PATH = "state/diagnostics.pkl"
@@ -51,6 +73,17 @@ X_MAX = 7
 LAMBDA_INIT = [0.25, 0.25, 0.25, 0.25]
 ALPHA_LR = 1e-4
 BETA_LR = 1e-5
+# MAML lambda meta-update rate. SEPARATE from ALPHA/BETA (which govern the
+# gate-parameter MAML inner/outer steps and keep their structural 10:1 ratio).
+# At BETA_LR=1e-5 the loss-weight lambdas moved ~3e-6/step — effectively frozen,
+# so the "emergence" loop was dead. This rate lets the lambdas adapt to per-domain
+# training signal within a few thousand tokens. Paired with LAMBDA_FLOOR so the
+# (linear) meta-loss can't collapse the weights onto a single objective.
+LAMBDA_META_LR = 0.03
+# Minimum weight every loss term keeps after the meta-update. Prevents degenerate
+# collapse (e.g. all weight on l_eff, zeroing the l_dom routing loss). With 4
+# lambdas and floor 0.05, each stays in [0.05, 0.85] and the sum stays 1.0.
+LAMBDA_FLOOR = 0.05
 T_CHECKPOINT = 5
 L_EFF_EPS = 1e-8
 L_REL_GAMMA = 0.95
@@ -60,17 +93,113 @@ ALPHA_PROTECTION_THRESHOLD = 0.5
 EMA_DECAY = 0.99
 STARVATION_MIN_ACTIVATIONS = 5   # expert must have this many activations in domain before eviction
 OUTER_LOOP_TOKEN_INTERVAL = 500
-DATASET_WEIGHTS = {
-    "redpajama": 0.25,
-    "the_stack": 0.25,
-    "metamath": 0.25,
-    "openhermes": 0.25,
+DATASET_WEIGHTS_MAC = {
+    # ── own data ───────────────────────────────────────────────────────────
+    # De-skewed from 0.46 → 0.10. At 0.46 the "general"-classified local_custom
+    # dominated the mixture, so the gate's domain-routing CE (the recorded loss)
+    # collapsed to ~0 almost immediately — an uninformative training signal. At
+    # 0.10 the four domains are represented closely enough that the routing loss
+    # stays meaningful and the held-out eval (scripts/eval_heldout.py) is honest.
+    "local_custom": 0.10,
+    # ── action / tool-calling layer (highest-leverage new additions) ───────
+    "xlam_function_calling": 0.05,   # Salesforce 60k function-call examples
+    "hermes_function_calling": 0.05,  # NousResearch multi-turn tool use
+    "glaive_function_calling": 0.03,  # glaive breadth set
+    "agent_flan": 0.03,               # Agent-FLAN (includes negative samples)
+    "agentinstruct_zai": 0.02,        # ReAct-style gold trajectories
+    # ── existing datasets (scaled ~0.84× to make room) ────────────────────
+    "slimorca": 0.03,
+    "wizardlm_evol": 0.03,
+    "tulu_v2": 0.04,
+    "open_platypus": 0.02,
+    "ultrachat": 0.04,
+    "metamath": 0.03,
+    "math": 0.02,
+    "gsm8k": 0.02,
+    "the_stack": 0.03,
+    "github_code": 0.03,
+    "python_instructions": 0.01,
+    "camel_science": 0.01,
+    "ai2_arc": 0.01,
+    "redpajama": 0.02,
+    "dolma": 0.02,
+    "openhermes": 0.0,      # SKIP: timeout/hang
+    "wikipedia": 0.0,       # SKIP: timeout/hang
+    "openassistant": 0.0,   # SKIP: stream deadlock
 }
+
+DATASET_WEIGHTS_TAB = {
+    "local_custom": 0.10,
+    "xlam_function_calling": 0.05,
+    "hermes_function_calling": 0.05,
+    "glaive_function_calling": 0.03,
+    "agent_flan": 0.03,
+    "agentinstruct_zai": 0.02,
+    "slimorca": 0.03,
+    "wizardlm_evol": 0.03,
+    "tulu_v2": 0.04,
+    "open_platypus": 0.02,
+    "ultrachat": 0.04,
+    "metamath": 0.03,
+    "math": 0.02,
+    "gsm8k": 0.02,
+    "the_stack": 0.03,
+    "github_code": 0.03,
+    "python_instructions": 0.01,
+    "camel_science": 0.01,
+    "ai2_arc": 0.01,
+    "redpajama": 0.02,
+    "dolma": 0.02,
+    "openhermes": 0.0,      # SKIP: timeout/hang
+    "wikipedia": 0.0,       # SKIP: timeout/hang
+    "openassistant": 0.0,   # SKIP: stream deadlock
+}
+
+DATASET_WEIGHTS = DATASET_WEIGHTS_MAC
+
+# Renormalise the positive weights to sum to 1.0. Lets us edit any single weight
+# (e.g. drop local_custom to de-skew) without hand-balancing the other ~18 by
+# arithmetic — relative proportions of the rest are preserved, the disabled
+# (0.0) streams stay disabled, and validate_config's sum==1.0 check still holds.
+_w_total = sum(w for w in DATASET_WEIGHTS.values() if w > 0.0)
+if _w_total > 0:
+    DATASET_WEIGHTS = {
+        k: (w / _w_total if w > 0.0 else 0.0) for k, w in DATASET_WEIGHTS.items()
+    }
+
+# Local-only override: when STURNUS_LOCAL_ONLY=1, train purely on the local
+# custom_prompts.jsonl (no network streams). Used for fast, deterministic
+# engine-validation runs (clean convergence curves) when HF streaming is slow.
+if os.getenv("STURNUS_LOCAL_ONLY", "").lower() in ("1", "true", "yes"):
+    DATASET_WEIGHTS = {"local_custom": 1.0}
+
 DATASET_IDS = {
-    "redpajama": ("togethercomputer/RedPajama-Data-V2", "default", "train"),
-    "the_stack": ("bigcode/the-stack-dedup", None, "train"),
+    "local_custom": ("json", {"train": "data/custom_prompts.jsonl"}, "train"),
+    # ── action / tool-calling layer ────────────────────────────────────────
+    "xlam_function_calling": ("Salesforce/xlam-function-calling-60k", None, "train"),
+    "hermes_function_calling": ("NousResearch/hermes-function-calling-v1", None, "train"),
+    "glaive_function_calling": ("glaiveai/glaive-function-calling-v2", None, "train"),
+    "agent_flan": ("internlm/Agent-FLAN", None, "agent_instruct_react"),
+    "agentinstruct_zai": ("zai-org/AgentInstruct", None, "os"),
+    # ── existing datasets ─────────────────────────────────────────────────
+    "slimorca": ("Open-Orca/SlimOrca", None, "train"),
+    "wizardlm_evol": ("WizardLM/WizardLM_evol_instruct_V2_196k", None, "train"),
+    "tulu_v2": ("allenai/tulu-v2-sft-mixture", None, "train"),
+    "open_platypus": ("garage-bAInd/Open-Platypus", None, "train"),
+    "ultrachat": ("HuggingFaceH4/ultrachat_200k", None, "train_sft"),
     "metamath": ("meta-math/MetaMathQA", None, "train"),
+    "math": ("HuggingFaceH4/MATH-500", "default", "test"),
+    "gsm8k": ("openai/gsm8k", "main", "train"),
+    "the_stack": ("m-a-p/CodeFeedback-Filtered-Instruction", None, "train"),
+    "github_code": ("HuggingFaceH4/CodeAlpaca_20K", None, "train"),
+    "python_instructions": ("iamtarun/python_code_instructions_18k_alpaca", None, "train"),
+    "camel_science": ("sciq", None, "train"),
+    "ai2_arc": ("allenai/ai2_arc", "ARC-Challenge", "train"),
+    "redpajama": ("HuggingFaceFW/fineweb-edu", "sample-10BT", "train"),
+    "dolma": ("allenai/c4", "en", "train"),
     "openhermes": ("teknium/OpenHermes-2.5", None, "train"),
+    "wikipedia": ("wikimedia/wikipedia", "20231101.en", "train"),
+    "openassistant": ("OpenAssistant/oasst2", None, "train"),
 }
 DATASET_BOOT_TIMEOUT = 60.0
 DATASET_SAMPLE_TIMEOUT = 5.0
@@ -79,6 +208,92 @@ LAMBDA_SAVE_PATH = "state/lambdas.npz"
 CHECKPOINT_DIR = Path("state/checkpoints/")
 LOG_DIR = Path("logs/")
 DEVICE = None
+
+# ---------------------------------------------------------------------------
+# BRIAN capability stack
+# ---------------------------------------------------------------------------
+
+# BIOS — system control
+BIOS_ENABLED = True
+BIOS_TIMEOUT = 30
+
+# Conversational memory
+CONV_MEMORY_DIR = "state/conversations"
+CONV_MEMORY_MAX_CONVERSATIONS = 1000
+
+# Code execution
+CODE_EXEC_TIMEOUT = 30
+CODE_EXEC_MAX_OUTPUT = 32768
+
+# Self-correction
+SELF_CORRECTION_ENABLED = True
+SELF_CORRECTION_CONFIDENCE_FLOOR = 0.3
+SELF_CORRECTION_ENTROPY_CEILING = 2.5
+SELF_CORRECTION_MAX_RETRIES = 2
+
+# Proactive monitoring
+PROACTIVE_ENABLED = True
+PROACTIVE_CHECK_INTERVAL = 30.0
+PROACTIVE_CPU_THRESHOLD = 85.0
+PROACTIVE_RAM_THRESHOLD_MB = 1024.0
+PROACTIVE_THERMAL_THRESHOLD = 80.0
+PROACTIVE_DISK_THRESHOLD_GB = 10.0
+PROACTIVE_BATTERY_THRESHOLD = 15
+
+# K-Velocity learning
+K_VELOCITY_DECAY = 0.995
+K_VELOCITY_LR = 0.01
+K_VELOCITY_HISTORY = "state/k_velocity.json"
+
+# Persona
+ASSISTANT_NAME = "Manny"
+# Manny speaks the user's languages (English + Hindi) — NOT Spanish. The Mexican
+# accent comes from rendering English text through the Mexican voice "Juan"
+# (verified ~91% intelligible: Spanish phonetics applied to English = the accent).
+# Hindi (Devanagari) text auto-switches to a native Hindi voice, since Juan
+# cannot pronounce Devanagari. A true custom accent would need an XTTS/Piper model.
+SAY_VOICE = os.getenv("STURNUS_SAY_VOICE", "Juan").strip()        # English, Mexican-accented
+HINDI_VOICE = os.getenv("STURNUS_HINDI_VOICE", "Lekha").strip()   # Hindi (Devanagari)
+
+# Voice pipeline
+VOICE_ENABLED = os.getenv("STURNUS_VOICE", "True").lower() in ("true", "1", "yes")
+WHISPER_MODEL = "mlx-community/whisper-base-mlx"
+# Wake activation (voice-only daemon)
+WAKE_WORD_MODEL = "mlx-community/whisper-tiny-mlx"   # tiny = fast always-on spotting
+WAKE_CLAP_ENABLED = True
+WAKE_WORD_ENABLED = True
+WAKE_CHUNK_SECONDS = 1.2
+WAKE_CLAP_PEAK = 0.28
+WAKE_CLAP_CREST = 6.0
+WAKE_COMMAND_SECONDS = 6.0          # how long to listen for the actual command
+WAKE_FOLLOWUP_SECONDS = 8.0         # stay awake this long for follow-ups
+VOICE_MAX_TOKENS = 120             # short replies = snappy speech
+TTS_ENGINE = "say"
+TTS_VOICE = "en_US-lessac-medium"  # piper model id (only used if piper installed)
+VOICE_SAMPLE_RATE = 16000
+VOICE_VAD_THRESHOLD = 0.02
+
+# Autonomous tasks
+AUTONOMOUS_MAX_STEPS = 10
+AUTONOMOUS_STEP_TIMEOUT = 60
+
+# Vision — real Apple-Vision encoder (state/vision_helper). Screen capture still
+# needs macOS Screen Recording permission for the terminal/host process.
+VISION_ENABLED = os.getenv("STURNUS_VISION", "True").lower() in ("true", "1", "yes")
+VISION_OUTPUT_DIR = "state/screenshots"
+
+# Emotional calibration
+EMOTIONAL_ENABLED = True
+
+# Predictive assistance
+PREDICTIVE_ENABLED = True
+PREDICTIVE_HISTORY = "state/predictive.json"
+PREDICTIVE_LOOKBACK_DAYS = 30
+
+# World model
+WORLD_MODEL_ENABLED = True
+WORLD_MODEL_PATH = "state/world_model.json"
+WORLD_MODEL_MAX_ENTITIES = 5000
 CENTRAL_TRAIN_MODEL_ID = CENTRAL_MODEL_ID
 GATE_TRAIN_MODEL_ID = GATE_MODEL_ID
 EXPERT_TRAIN_MODEL_ID = EXPERT_MODEL_ID
