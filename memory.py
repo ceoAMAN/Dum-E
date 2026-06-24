@@ -30,12 +30,19 @@ class RoutingMemory:
     def _to_numpy(self, mx_hidden: mx.array) -> np.ndarray:
         return np.array(mx_hidden.tolist(), dtype=np.float32)
     def _recompute_tau(self):
+        # Cold cache (<2 clusters): use a tight absolute threshold, not the old
+        # VORONOI_ALPHA fallback (0.30) which let the first cluster falsely match
+        # almost any prompt. VORONOI_TAU_COLD sits inside the measured
+        # same/different-intent separation band.
         if len(self.clusters) < 2:
-            self.tau = float(configs.VORONOI_ALPHA)
+            self.tau = float(configs.VORONOI_TAU_COLD)
             return
         centroids = [c.centroid for c in self.clusters]
         mean_dist = compute_mean_inter_centroid_distance(centroids)
-        self.tau = max(1e-6, float(configs.VORONOI_ALPHA) * mean_dist)
+        # Warm: scale by mean inter-centroid spread, but cap so a diverse cache
+        # can't loosen tau past the point where unrelated prompts start matching.
+        self.tau = max(1e-6, min(float(configs.VORONOI_TAU_CEIL),
+                                 float(configs.VORONOI_ALPHA) * mean_dist))
     def get_dynamic_tau(self) -> float:
         return self.tau
     def get_domain_mean_k(self) -> int:
@@ -149,6 +156,7 @@ class SessionTracker:
         self.token_count: int = 0
         self._timeline_a_tokens: int = 0
         self._warmup_logged: bool = False
+        self._last_warmup_log_tokens: int = -1
     def record_activation(self, expert_id, tokens, r_i, wall_time, tkl_score=0.0, domain="general"):
         self.activations[expert_id].append({"tokens": tokens, "r_i": r_i, "wall_time": wall_time, "tkl": tkl_score})
         self.domain_tkl[domain].append(tkl_score)
@@ -200,12 +208,15 @@ class SessionTracker:
     def get_timeline_a_rate(self):
         return self._timeline_a_tokens / max(self.token_count, 1)
     def log_warmup(self, token_count):
-        if not self._warmup_logged:
-            if token_count < 500:
-                print(f"[warmup] {token_count} tokens processed")
-            else:
-                print(f"[warmup] {token_count} tokens processed — warmup complete")
-                self._warmup_logged = True
+        if self._warmup_logged:
+            return
+        if token_count >= 500:
+            print(f"[warmup] {token_count} tokens processed — warmup complete")
+            self._warmup_logged = True
+        elif token_count > 0 and self._last_warmup_log_tokens <= 0:
+            # Single boot confirmation when the first tokens are processed
+            print(f"[warmup] {token_count} tokens processed — warming up")
+            self._last_warmup_log_tokens = token_count
     def reset(self):
         self.activations.clear()
         self.domain_tkl.clear()
