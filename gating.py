@@ -34,7 +34,6 @@ class GateModel:
         if self._loaded:
             return
         from mlx_lm import load as mlx_load
-        import mlx.core as mx
         from pathlib import Path
         self.model, self.tokenizer = mlx_load(configs.GATE_MODEL_ID)
         from mlx_lm.tuner.utils import linear_to_lora_layers
@@ -47,14 +46,21 @@ class GateModel:
             self.model.load_weights(str(weights_path), strict=False)
         self.model.train()
         self._loaded = True
-    def look_ahead(self, tokens: mx.array) -> DomainTopography:
+    def _backbone(self, tokens: mx.array) -> mx.array:
+        """One full backbone pass → per-token hidden states (1, T, D). Shared by
+        forward(), look_ahead() and forward_with_topography() so a single request
+        never runs the backbone twice."""
         self.load()
+        if hasattr(self.model, 'model'):
+            hidden = self.model.model(tokens.reshape(1, -1))
+        else:
+            hidden = self.model(tokens.reshape(1, -1))
+        mx.eval(hidden)
+        return hidden
+    def _topography_from_hidden(self, hidden: mx.array, total: int) -> DomainTopography:
         domain_map: Dict[int, str] = {}
-        total = tokens.shape[0]
         if total == 0:
             return DomainTopography(domain_map={}, domain_proportions={}, total_tokens=0)
-        hidden = self.model(tokens.reshape(1, -1))
-        mx.eval(hidden)
         domain_counts: Dict[str, int] = {}
         chunk_size = max(1, total // 10)
         for start in range(0, total, chunk_size):
@@ -69,6 +75,20 @@ class GateModel:
             domain_counts[domain] = domain_counts.get(domain, 0) + (end - start)
         domain_proportions = {d: c / total for d, c in domain_counts.items()}
         return DomainTopography(domain_map=domain_map, domain_proportions=domain_proportions, total_tokens=total)
+    def look_ahead(self, tokens: mx.array) -> DomainTopography:
+        total = int(tokens.shape[0])
+        if total == 0:
+            return DomainTopography(domain_map={}, domain_proportions={}, total_tokens=0)
+        return self._topography_from_hidden(self._backbone(tokens), total)
+    def forward_with_topography(self, tokens: mx.array):
+        """Fused: ONE backbone pass → (GateOutput, DomainTopography). Timeline B
+        previously paid for two full gate passes per request (forward() then
+        look_ahead()); this collapses them into one — the single biggest routing
+        overhead on the inference path."""
+        hidden = self._backbone(tokens)
+        gate_out = self.forward(tokens, hidden=hidden)
+        topo = self._topography_from_hidden(hidden, int(tokens.shape[0]))
+        return gate_out, topo
     def _classify_domain(self, hidden_values: list) -> str:
         if not hidden_values:
             return "general"
@@ -81,18 +101,43 @@ class GateModel:
         if mean_abs < 0.3:
             return "knowledge"
         return "general"
-    def forward(self, tokens: mx.array) -> GateOutput:
+    def forward(self, tokens: mx.array, hidden: mx.array = None) -> GateOutput:
         self.load()
-        hidden = self.model(tokens.reshape(1, -1))
-        mx.eval(hidden)
+        # Reuse a precomputed backbone pass when the caller already ran one
+        # (forward_with_topography). Otherwise run it here. Either way the gate
+        # backbone executes exactly once per request.
+        if hidden is None:
+            hidden = self._backbone(tokens)
         mean_hidden = mx.mean(hidden[0], axis=0)
         mean_hidden = mx.clip(mean_hidden, -1e4, 1e4)
         mx.eval(mean_hidden)
-        domain_logits = mean_hidden[:configs.K_MAX]
+        # Guard against NaN hidden states (corrupt checkpoint or exploding backbone).
+        import math as _math
+        spot_vals = mean_hidden[:8].tolist()
+        if any(not _math.isfinite(v) for v in spot_vals):
+            domain_logits = mx.zeros(4)
+            k = configs.K_DEFAULT
+            return GateOutput(
+                hidden_states=mean_hidden,
+                k_per_token=k,
+                domain_logits=domain_logits,
+                timeline_flag="B",
+                confidence=0.0,
+            )
+        # z-score normalise across ALL hidden dims before slicing domain logits.
+        # Raw backbone activations have large magnitudes (e.g. ±100) → softmax
+        # saturates → confidence locks at 1.0 before any training. After
+        # normalisation values are ~N(0,1), entropy is meaningful, and the gate
+        # can actually learn to discriminate domains via l_dom gradients.
+        mu = mx.mean(mean_hidden)
+        sigma = mx.sqrt(mx.mean((mean_hidden - mu) ** 2) + 1e-8)
+        normed = (mean_hidden - mu) / (sigma + 1e-8)
+        domain_logits = normed[:4]   # 4 slots: code / reasoning / knowledge / general
+        mx.eval(domain_logits)
         probs = mx.softmax(domain_logits)
         mx.eval(probs)
         entropy = -float(mx.sum(probs * mx.log(probs + 1e-10)).item())
-        max_entropy = math.log(max(configs.K_MAX, 2))
+        max_entropy = math.log(4)    # 4 domain classes
         confidence = max(0.0, min(1.0, 1.0 - (entropy / max_entropy)))
         if confidence > configs.FAST_PATH_THRESHOLD:
             timeline = "A"
@@ -146,7 +191,12 @@ class TripleKSelector:
             if len(vals) >= len(domains):
                 best_idx = int(np.argmax(vals[:len(domains)]))
                 domain = domains[best_idx]
-        k = gate_output.k_per_token
+        # k=0 means "Timeline A" (no experts) — but that path never calls
+        # select_experts. Whenever we ARE selecting (Timeline B / training), we need
+        # at least one expert; otherwise selected[:0] == [] and the caller skips the
+        # batch entirely (no gate/expert gradient). A confident gate emits k=0, which
+        # was silently zeroing ~75% of training batches.
+        k = max(1, gate_output.k_per_token)
         domain_pool = self.k_d.get(domain, self.k_all)
         masked = masking_schedule.get_masked_experts(self.alpha_experts.get(domain, []), batch_id)
         candidates = []
