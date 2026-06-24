@@ -20,30 +20,6 @@ from splitter import (
     prefetch_next_batch,
     ExpertFragment,
 )
-# --- Optional BRIAN/Manny capability stack --------------------------------
-# Sturnus runs standalone without these modules. When the Manny layer is
-# present they are imported and wired in; when absent (a clean Sturnus
-# checkout) every call site below is already guarded by a truthiness check,
-# so the engine boots and runs unchanged.
-try:
-    from tools import route_and_execute_tool
-    from bios import BIOS, route_bios_intent
-    from conversational_memory import ConversationalMemory
-    from code_executor import CodeExecutor
-    from self_correction import SelfCorrection
-    from k_velocity import KVelocity
-    from emotional import EmotionalCalibration
-    from predictive import PredictiveAssistant
-    from world_model import WorldModel
-    from vision_module import VisionSystem
-    BRIAN_AVAILABLE = True
-except ImportError:
-    route_and_execute_tool = None
-    route_bios_intent = None
-    BIOS = ConversationalMemory = CodeExecutor = SelfCorrection = None
-    KVelocity = EmotionalCalibration = PredictiveAssistant = None
-    WorldModel = VisionSystem = None
-    BRIAN_AVAILABLE = False
 
 
 @dataclass
@@ -76,15 +52,6 @@ class InferenceEngine:
         session_tracker: SessionTracker,
         triple_k: TripleKSelector,
         masking_schedule: MaskingSchedule,
-        bios: Optional[BIOS] = None,
-        conv_memory: Optional[ConversationalMemory] = None,
-        code_executor: Optional[CodeExecutor] = None,
-        self_correction: Optional[SelfCorrection] = None,
-        k_velocity: Optional[KVelocity] = None,
-        emotional: Optional[EmotionalCalibration] = None,
-        predictive: Optional[PredictiveAssistant] = None,
-        world_model: Optional[WorldModel] = None,
-        vision: Optional[VisionSystem] = None,
     ):
         self.gate = gate
         self.expert_pool = expert_pool
@@ -99,96 +66,12 @@ class InferenceEngine:
         self._current_x = configs.X_MAX
         self._tokens_processed = 0
 
-        # BRIAN capability stack (all optional; None when Manny layer absent)
-        self.bios = bios or (BIOS() if BIOS is not None else None)
-        self.conv_memory = conv_memory
-        self.code_executor = code_executor
-        self.self_correction = self_correction
-        self.k_velocity = k_velocity
-        self.emotional = emotional
-        self.predictive = predictive
-        self.world_model = world_model
-        self.vision = vision
-
-    def _augment_input(self, input_text: str, min_experts: int) -> tuple:
-        """Inject all BRIAN context (memory, emotional, world-model, BIOS, vision,
-        code, tools, predictive) into the prompt and apply the K-velocity routing
-        boost. Shared by run() and stream_reply() so both get identical context."""
-        emotional_context = ""
-        memory_context = ""
-
-        if self.emotional and configs.EMOTIONAL_ENABLED:
-            self.emotional.update_from_text(input_text)
-            emotional_context = self.emotional.get_style_instruction()
-
-        if self.conv_memory:
-            memory_context = self.conv_memory.recall_context(input_text)
-
-        if self.world_model and configs.WORLD_MODEL_ENABLED:
-            self.world_model.observe(input_text)
-
-        if self.bios and configs.BIOS_ENABLED:
-            try:
-                bios_result = route_bios_intent(input_text, self.bios)
-                if bios_result:
-                    input_text = f"[System Information]\n{bios_result}\n\nUser Question: {input_text}"
-            except Exception:
-                pass
-
-        if self.vision and configs.VISION_ENABLED:
-            try:
-                vision_result = self._check_vision_intent(input_text)
-                if vision_result:
-                    input_text = f"[Vision]\n{vision_result}\n\nUser Question: {input_text}"
-            except Exception:
-                pass
-
-        if self.code_executor:
-            try:
-                code_context = self._check_code_intent(input_text)
-                if code_context:
-                    input_text = f"[Code Execution Result]\n{code_context}\n\nUser Question: {input_text}"
-            except Exception:
-                pass
-
-        if route_and_execute_tool is not None:
-            try:
-                tool_context = route_and_execute_tool(input_text)
-                if tool_context:
-                    input_text = f"[Real-Time Information Context]\n{tool_context}\n\nUser Question: {input_text}"
-            except Exception:
-                pass
-
-        context_parts = []
-        if memory_context:
-            context_parts.append(memory_context)
-        if emotional_context:
-            context_parts.append(emotional_context)
-        if self.world_model and configs.WORLD_MODEL_ENABLED:
-            wm_context = self.world_model.get_context_for_query(input_text)
-            if wm_context:
-                context_parts.append(wm_context)
-        if self.predictive and configs.PREDICTIVE_ENABLED:
-            pred_context = self.predictive.get_prediction_context()
-            if pred_context:
-                context_parts.append(pred_context)
-        if context_parts:
-            input_text = "\n".join(context_parts) + "\n\n" + input_text
-
-        if self.k_velocity:
-            suggested_k = self.k_velocity.suggest_k(self._domain_from_text_hint(input_text))
-            if suggested_k > min_experts:
-                min_experts = suggested_k
-
-        return input_text, min_experts
-
     def stream_reply(self, input_text: str, on_sentence, conversation_id: str = "",
                      should_stop=None) -> str:
-        """Low-latency voice path: same context as run(), central-only, streamed
-        sentence-by-sentence to `on_sentence` so speech starts ~1s in. Returns the
-        full reply. `should_stop()` (optional) lets the caller abort mid-stream
-        (barge-in). Records to memory/k-velocity/predictive afterward."""
-        augmented, _ = self._augment_input(input_text, 0)
+        """Low-latency streaming path: central-only, streamed sentence-by-sentence
+        to `on_sentence` so output starts ~1s in. Returns the full reply.
+        `should_stop()` (optional) lets the caller abort mid-stream."""
+        augmented = input_text
         self.central.load()
         buffer = ""
         full = ""
@@ -209,19 +92,6 @@ class InferenceEngine:
                         break
         if buffer.strip() and not (should_stop is not None and should_stop()):
             on_sentence(buffer.strip())
-
-        # Post-inference recording (lightweight result; timeline A, no experts).
-        result = InferenceResult(
-            output_text=full, k_used=0, experts_activated=[], timeline="A",
-            send_to_user=True, domain=self._domain_from_text_hint(input_text),
-            token_count=len(full.split()), reconstruction_entropy=0.0,
-            confidence=1.0, mean_r_i=0.0, x_next=self._current_x,
-            thermal_state=0.0, ram_headroom_mb=0.0, ssd_read_rate_mb=0.0,
-        )
-        try:
-            self._post_inference(result, input_text, conversation_id, allow_correction=False)
-        except Exception:
-            pass
         return full
 
     def run(
@@ -235,9 +105,6 @@ class InferenceEngine:
     ) -> InferenceResult:
         if configs.DEPLOYMENT and not force_timeline_b:
             force_timeline_a = True
-
-        if send_to_user:
-            input_text, min_experts = self._augment_input(input_text, min_experts)
 
         self.gate.load()
         tokenizer = self.gate.tokenizer
@@ -359,10 +226,6 @@ class InferenceEngine:
             ram_headroom_mb=ram,
             ssd_read_rate_mb=ssd,
         )
-        # Timeline A still records to memory/k-velocity/predictive (no self-correction —
-        # the fast path has no experts to re-route).
-        if send_to_user:
-            result = self._post_inference(result, input_text, conversation_id, allow_correction=False)
         return result
     def _timeline_b(
         self,
@@ -575,107 +438,7 @@ class InferenceEngine:
             ram_headroom_mb=ram,
             ssd_read_rate_mb=ssd,
         )
-        # --- Post-inference BRIAN hooks ---
-        if send_to_user:
-            result = self._post_inference(result, input_text, conversation_id)
         return result
-
-    def _post_inference(
-        self,
-        result: InferenceResult,
-        input_text: str,
-        conversation_id: str,
-        allow_correction: bool = True,
-    ) -> InferenceResult:
-        # Self-correction — never in deployment (fast path), never during a
-        # correction retry (the retry sets _in_correction to avoid recursion).
-        if (
-            allow_correction
-            and self.self_correction
-            and configs.SELF_CORRECTION_ENABLED
-            and not configs.DEPLOYMENT
-            and not getattr(self, "_in_correction", False)
-        ):
-            if self.self_correction.needs_correction(result.confidence, result.reconstruction_entropy, result.mean_r_i):
-                self._in_correction = True
-                try:
-                    correction = self.self_correction.run_correction_loop(self, input_text, result)
-                    if correction.corrected:
-                        result = replace(result, output_text=correction.final_output, was_corrected=True)
-                finally:
-                    self._in_correction = False
-
-        # Skip side-effect recording when this call is itself a correction retry
-        # (the outer user turn records once; retries must not double-count).
-        if getattr(self, "_in_correction", False):
-            return result
-
-        # K-Velocity recording
-        if self.k_velocity:
-            self.k_velocity.record_event(
-                expert_ids=result.experts_activated,
-                domain=result.domain,
-                k_used=result.k_used,
-                confidence=result.confidence,
-                mean_r_i=result.mean_r_i,
-                query_text=input_text[:200],
-            )
-
-        # Conversational memory storage
-        if self.conv_memory and conversation_id:
-            self.conv_memory.store_turn(conversation_id, "user", input_text, result.domain)
-            if result.output_text:
-                self.conv_memory.store_turn(conversation_id, "assistant", result.output_text, result.domain)
-
-        # Predictive recording
-        if self.predictive and configs.PREDICTIVE_ENABLED:
-            quality = result.confidence * 0.5 + result.mean_r_i * 0.5
-            self.predictive.record_interaction(result.domain, result.timeline, input_text[:100], quality)
-
-        return result
-
-    def _check_code_intent(self, text: str) -> Optional[str]:
-        import re
-        q = text.lower()
-        if not any(kw in q for kw in ["run this", "execute", "run the code", "run code", "```"]):
-            return None
-        code_match = re.search(r"```(?:\w+)?\n(.*?)```", text, re.DOTALL)
-        if not code_match:
-            return None
-        code = code_match.group(1).strip()
-        lang = self.code_executor.detect_language(code)
-        result = self.code_executor.execute(code, lang)
-        if result.returncode == 0:
-            return f"[{lang}] Exit 0\n{result.stdout[:1000]}"
-        return f"[{lang}] Exit {result.returncode}\nstdout: {result.stdout[:500]}\nstderr: {result.stderr[:500]}"
-
-    def _check_vision_intent(self, text: str) -> Optional[str]:
-        import re
-        q = text.lower()
-        screen_kw = ["my screen", "on screen", "what do you see", "look at my screen",
-                     "what's on my screen", "whats on my screen", "see my screen", "read my screen"]
-        if any(kw in q for kw in screen_kw):
-            info = self.vision.see_screen()
-            if "error" in info:
-                return f"(Could not capture screen: {info['error']})"
-            parts = [f"Visual content: {info.get('visual_content', '?')}"]
-            text_seen = info.get("text_on_screen", "")
-            if text_seen and text_seen != "(no text detected)":
-                parts.append(f"Text on screen:\n{text_seen[:1200]}")
-            if info.get("changes"):
-                parts.append(info["changes"])
-            return "\n".join(parts)
-        # "look at <path>" / "read image <path>"
-        img_match = re.search(r"(?:look at|read|describe|see)\s+(?:the\s+)?(?:image|picture|photo|file)?\s*([~/\w.\-]+\.(?:png|jpg|jpeg|heic|gif|bmp|tiff))", q)
-        if img_match:
-            info = self.vision.read_image(img_match.group(1))
-            if "error" in info:
-                return f"(Could not read image: {info['error']})"
-            parts = [f"Visual content: {info.get('visual_content', '?')}"]
-            if info.get("text_extracted") and info["text_extracted"] != "(no text)":
-                parts.append(f"Text in image:\n{info['text_extracted'][:1200]}")
-            return "\n".join(parts)
-        return None
 
     def _domain_from_text_hint(self, text: str) -> str:
         q = text.lower()

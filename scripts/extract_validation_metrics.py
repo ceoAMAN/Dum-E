@@ -18,8 +18,13 @@ from pathlib import Path
 from collections import defaultdict
 
 try:
-    import matplotlib.pyplot as plt
     import numpy as np
+    HAS_NUMPY = True
+except ImportError:
+    HAS_NUMPY = False
+
+try:
+    import matplotlib.pyplot as plt
     HAS_PLOT = True
 except ImportError:
     HAS_PLOT = False

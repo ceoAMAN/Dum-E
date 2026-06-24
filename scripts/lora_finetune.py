@@ -57,9 +57,9 @@ def iter_texts():
 
 def iter_mixture_texts():
     """Infinite generator over the full 24-dataset streaming mixture (incl. the
-    action/tool-calling datasets). This is what lets Central — the model that
-    actually answers in voice deployment (timeline A) — learn the Jarvis action
-    layer, not just the local custom prompts."""
+    action/tool-calling datasets). This lets Central — the model that produces the
+    user-facing reply on the timeline-A fast path — train on the full mixture,
+    not just the local custom prompts."""
     from data import authenticate_huggingface, iter_mixture_samples
     authenticate_huggingface()
     for sample in iter_mixture_samples():
