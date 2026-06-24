@@ -103,8 +103,6 @@ class ExpertPool:
             try:
                 model, tokenizer = mlx_load(configs.EXPERT_MODEL_ID)
                 from mlx_lm.tuner.utils import linear_to_lora_layers
-                import mlx.core as mx
-                from pathlib import Path
                 model.freeze()
                 lora_config = {"rank": configs.LORA_R, "scale": configs.LORA_ALPHA, "dropout": configs.LORA_DROPOUT}
                 num_layers = len(model.layers) if hasattr(model, "layers") else len(model.model.layers)
@@ -131,7 +129,6 @@ class ExpertPool:
             self._touch_lru(eid)
     def unload_experts(self, expert_ids: List[int], keep_buffer: Optional[Set[int]] = None):
         keep = keep_buffer or set()
-        import mlx.core as mx
         for eid in expert_ids:
             if eid in keep:
                 continue
@@ -141,7 +138,6 @@ class ExpertPool:
                 del self.loaded_tokenizers[eid]
         mx.clear_cache()
     def save_experts(self, expert_ids: Optional[List[int]] = None):
-        from mlx.utils import tree_flatten
         targets = expert_ids if expert_ids is not None else list(self.loaded_experts.keys())
         for eid in targets:
             model = self.loaded_experts.get(eid)
@@ -219,7 +215,6 @@ class ExpertPool:
             return False
         return True
     def reassign_expert(self, expert_id: int, new_domain: str):
-        old_domain = self.current_domain.get(expert_id, "unknown")
         self.domain_scores[expert_id][new_domain] = 0.0
         self.token_allocation_history[expert_id] = deque(maxlen=configs.TKL_HISTORY_LEN)
         self.current_domain[expert_id] = new_domain
