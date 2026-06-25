@@ -149,7 +149,53 @@ class ExpertPool:
             checkpoint_dir = Path(configs.CHECKPOINT_DIR) / f"expert_{eid:03d}"
             checkpoint_dir.mkdir(parents=True, exist_ok=True)
             mx.save_safetensors(str(checkpoint_dir / "weights.safetensors"), flat_params)
-    def expert_forward(self, expert_id: int, fragment_tokens: mx.array) -> ExpertOutput:
+    def _generate_expert_text(self, model: Any, tokenizer: Any, fragment_tokens: mx.array) -> str:
+        """Produce a REAL generated answer from the expert (audit A.2.4).
+
+        The old path took argmax(logits) over the expert's own input positions —
+        a teacher-forced, per-position next-token prediction, i.e. a scrambled
+        echo of the question rather than a response. This generates an actual
+        continuation that can be injected into Central's prompt so the expert
+        pool reaches the user-facing reply. Greedy (no sampler) for determinism,
+        matching CentralModel.generate. Only called when the text will be shown."""
+        try:
+            from mlx_lm import generate as mlx_generate
+            prompt_text = tokenizer.decode(fragment_tokens.reshape(-1).tolist())
+            if not prompt_text.strip():
+                return ""
+            # Disable LoRA dropout during generation for stable, repeatable text.
+            was_training = bool(getattr(model, "training", False))
+            if was_training:
+                model.eval()
+            try:
+                text = mlx_generate(
+                    model, tokenizer, prompt=prompt_text,
+                    max_tokens=configs.EXPERT_GEN_MAX_TOKENS,
+                )
+            finally:
+                if was_training:
+                    model.train()
+            return text.strip()
+        except Exception as e:
+            print(f"[warn] expert text generation failed: {e}")
+            return ""
+
+    def _argmax_text(self, logits: mx.array, tokenizer: Any) -> str:
+        """Cheap, no-generation expert text for the training/measurement path.
+
+        Not user-facing — it only perturbs Central's synthesis input so the r_i
+        contribution delta (synthesis_hidden - base_hidden) stays non-trivial.
+        Kept argmax-cheap to preserve training throughput; the real reply path
+        uses _generate_expert_text instead."""
+        if logits.ndim == 3:
+            token_ids = mx.argmax(logits[0], axis=-1).tolist()
+        elif logits.ndim == 2:
+            token_ids = mx.argmax(logits, axis=-1).tolist()
+        else:
+            token_ids = [int(mx.argmax(logits).item())]
+        return tokenizer.decode(token_ids)
+
+    def expert_forward(self, expert_id: int, fragment_tokens: mx.array, generate_text: bool = False) -> ExpertOutput:
         if expert_id not in self.loaded_experts:
             raise RuntimeError(f"Expert {expert_id} not loaded.")
         model = self.loaded_experts[expert_id]
@@ -172,14 +218,14 @@ class ExpertPool:
             hidden_out = logits
         t_end = time.perf_counter()
         wall_time = t_end - t_start
-        # Proper argmax to convert logits → token IDs
-        if logits.ndim == 3:
-            token_ids = mx.argmax(logits[0], axis=-1).tolist()
-        elif logits.ndim == 2:
-            token_ids = mx.argmax(logits, axis=-1).tolist()
+        # generate_text=True (Timeline B reply): a real expert answer that reaches
+        # Central's generation prompt. generate_text=False (training/measurement):
+        # the cheap argmax echo, used only to perturb Central's synthesis input for
+        # r_i scoring — never shown to the user. See audit A.2.4.
+        if generate_text:
+            output_text = self._generate_expert_text(model, tokenizer, fragment_tokens)
         else:
-            token_ids = [int(mx.argmax(logits).item())]
-        output_text = tokenizer.decode(token_ids)
+            output_text = self._argmax_text(logits, tokenizer)
         # Hidden states already computed above (no extra pass)
         if hidden_out.ndim == 3:
             hidden_mean = mx.mean(hidden_out[0], axis=0)

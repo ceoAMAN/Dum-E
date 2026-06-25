@@ -379,7 +379,12 @@ class InferenceEngine:
                     continue
                 if fragment.expert_id not in loaded_ids:
                     continue
-                eo = self.expert_pool.expert_forward(fragment.expert_id, fragment.tokens)
+                # Generate a real expert answer only when it will reach the user
+                # (audit A.2.4). For training/dead-time (send_to_user=False) keep
+                # the cheap echo — it only feeds the r_i contribution delta.
+                eo = self.expert_pool.expert_forward(
+                    fragment.expert_id, fragment.tokens, generate_text=send_to_user
+                )
                 all_expert_outputs.append(eo)
             self._tokens_processed += len(batch.token_indices)
             x_next = self.diagnostics.update(
@@ -401,7 +406,10 @@ class InferenceEngine:
             {"expert_id": eo.expert_id, "output_text": eo.output_text, "hidden_states": eo.hidden_states, "wall_time": eo.wall_time}
             for eo in all_expert_outputs
         ]
-        central_out = self.central.forward(input_text, expert_data, send_to_user=send_to_user)
+        # forward() is the self-supervision measurement pass (contribution_hidden,
+        # r_i, reconstruction entropy). It is never the user reply now — the reply
+        # is generated below with expert text injected — so skip its lm_head token.
+        central_out = self.central.forward(input_text, expert_data, send_to_user=False)
         r_i_scores: List[float] = []
         for eo in all_expert_outputs:
             r_i = self.central.compute_r_i(eo.hidden_states, central_out.contribution_hidden, eo.wall_time)
@@ -417,9 +425,11 @@ class InferenceEngine:
         x_next, thermal, ram, ssd = self._latest_diagnostics(available_ram)
         self._batch_counter += 1
         if send_to_user:
-            output_text = central_out.synthesis_text
-            if not output_text.strip():
-                output_text = self.central.generate(input_text)
+            # Deployed reply: condition Central's generation on the experts' actual
+            # generated analyses so the MoE pipeline reaches the user-facing answer
+            # (audit A.2.4). No expert text → plain Central-only generation.
+            expert_texts = [eo.output_text for eo in all_expert_outputs if eo.output_text.strip()]
+            output_text = self.central.generate(input_text, expert_context=expert_texts or None)
         else:
             output_text = ""
         result = InferenceResult(

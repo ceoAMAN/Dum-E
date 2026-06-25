@@ -179,13 +179,28 @@ class CentralModel:
         if not np.isfinite(entropy):
             return 0.0
         return entropy
-    def format_prompt(self, input_text: str) -> str:
+    def format_prompt(self, input_text: str, expert_context: Optional[List[str]] = None) -> str:
+        # Audit A.2.4: when the expert pool actually ran (Timeline B), inject the
+        # experts' generated analyses into Central's generation prompt so the MoE
+        # machinery reaches the deployed reply instead of being a training-only
+        # apparatus. With no expert context this is the plain question prompt, so
+        # Timeline A and the no-expert fallbacks are unchanged.
+        if expert_context:
+            notes = "\n".join(f"- {c.strip()}" for c in expert_context if c and c.strip())
+            if notes:
+                return (
+                    f"<s> [INST] {input_text}\n\n"
+                    f"Expert analyses to consider:\n{notes}\n\n"
+                    f"Use the analyses where they help and give the best final answer. [/INST]"
+                )
         return f"<s> [INST] {input_text} [/INST]"
-    def generate(self, input_text: str, max_tokens: Optional[int] = None) -> str:
+    def generate(self, input_text: str, max_tokens: Optional[int] = None,
+                 expert_context: Optional[List[str]] = None) -> str:
         self.load()
         from mlx_lm import generate as mlx_generate
         mt = max_tokens if max_tokens is not None else self.gen_max_tokens
-        return mlx_generate(self.model, self.tokenizer, prompt=self.format_prompt(input_text), max_tokens=mt)
+        prompt = self.format_prompt(input_text, expert_context)
+        return mlx_generate(self.model, self.tokenizer, prompt=prompt, max_tokens=mt)
 
     def generate_stream(self, input_text: str, max_tokens: Optional[int] = None):
         """Yield text deltas as they are generated (for low-latency speech)."""
