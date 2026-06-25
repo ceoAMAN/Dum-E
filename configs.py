@@ -38,6 +38,12 @@ K_MIN = 0
 K_MAX = 20
 K_DEFAULT = 4
 MAX_SEQ_LEN = 512
+# Tokens each activated expert generates as its contribution to Central synthesis.
+# Only spent on the user-facing reply path (Timeline B with send_to_user=True);
+# training/measurement keeps the cheap echo. Audit A.2.4: experts now produce a
+# real generated analysis that is injected into Central's prompt instead of a
+# scrambled argmax echo of the input that never reached the reply.
+EXPERT_GEN_MAX_TOKENS = 48
 TKL_FLOOR = 32
 TKL_HISTORY_LEN = 10
 MONOPOLY_THRESHOLD = 0.85

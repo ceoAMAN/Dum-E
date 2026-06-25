@@ -5,15 +5,15 @@ Reading the code reveals two things that decide what this eval *can* show:
   1. Central is FROZEN. Training updates the gate (routing) and the experts
      (hidden-state alignment), but never Central. The user-facing reply is
      always produced by base Central.
-  2. expert_forward().output_text is argmax over the INPUT fragment positions
-     (next-token prediction per input token), not a generated answer. So the
-     deployed Timeline-A reply = Central.generate(prompt), and the experts do
-     not feed into that text at all.
+  2. Since the audit A.2.4 fix, expert_forward(..., generate_text=True) produces
+     a REAL generated answer (not the old argmax echo of the input), and the
+     Timeline-B reply now injects that expert text into Central's prompt. This
+     harness calls experts with generate_text=True so column B measures the same
+     expert-conditioned reply the deployed Timeline-B path now produces.
 
-So "Sturnus pipeline vs Central-alone" would be identical by construction. The
-meaningful question is: if we DO inject what the experts produce into the
-prompt, does the answer get better or worse? That tells us whether the MoE
-machinery is a training-only apparatus or an inference-time quality lever.
+The meaningful question this answers: does conditioning on what the experts
+produce make the answer better or worse? That quantifies whether the (now wired)
+MoE machinery is a net quality lever or injected noise — the A.5 next step.
 
 Configs compared per query:
   A. central_alone        — Central.generate(question)             [deployed reply]
@@ -98,7 +98,7 @@ def run_pipeline_experts(gate, expert_pool, central, triple_k, masking, session_
         ft = tokens[fs:fe]
         if ft.shape[0] < configs.FRAGMENT_MIN:
             continue
-        eo = expert_pool.expert_forward(sel.expert_id, ft)
+        eo = expert_pool.expert_forward(sel.expert_id, ft, generate_text=True)
         texts.append(eo.output_text)
     return texts, len(texts)
 
