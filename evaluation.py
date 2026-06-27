@@ -17,7 +17,7 @@ Both are immune to mixture skew because the eval set is balanced 10/10/10/10.
 from __future__ import annotations
 import json
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 import mlx.core as mx
 import numpy as np
@@ -103,8 +103,6 @@ def heldout_expert_quality(
     """Heavy. Mean r_i and mean expert MSE-to-synthesis on held-out prompts —
     the experts' actual training objective, measured on unseen data. Mirrors the
     Timeline-B forward in scripts/finetune.py without taking any gradient step."""
-    from gating import SelectedExpert
-
     if not samples:
         return {"mean_r_i": 0.0, "mean_expert_mse": 0.0, "n": 0}
     gate.load()
@@ -152,7 +150,7 @@ def heldout_expert_quality(
         ]
         central_out = central.forward(text, expert_data, send_to_user=False)
         for eo in expert_outputs:
-            r_i = central.compute_r_i(eo.hidden_states, central_out.contribution_hidden, eo.wall_time)
+            r_i = central.compute_r_i(eo.hidden_states, central_out.contribution_hidden, eo.wall_time, synthesis_hidden=central_out.synthesis_hidden)
             r_i_all.append(r_i)
             # expert MSE-to-synthesis (the apply_expert_gradients objective)
             if eo.hidden_states is not None and central_out.synthesis_hidden is not None:

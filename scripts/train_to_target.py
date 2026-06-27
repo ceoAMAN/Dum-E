@@ -92,6 +92,7 @@ def run_targeted_training(target_score=0.95, check_interval=10):
                 gate_out.hidden_states,
                 central_out.contribution_hidden,
                 1.0,  # wall_time placeholder
+                synthesis_hidden=central_out.synthesis_hidden,
             )
             # Also factor in reconstruction entropy as a quality signal
             re = central_out.reconstruction_entropy

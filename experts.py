@@ -149,28 +149,23 @@ class ExpertPool:
             checkpoint_dir = Path(configs.CHECKPOINT_DIR) / f"expert_{eid:03d}"
             checkpoint_dir.mkdir(parents=True, exist_ok=True)
             mx.save_safetensors(str(checkpoint_dir / "weights.safetensors"), flat_params)
-    def _generate_expert_text(self, model: Any, tokenizer: Any, fragment_tokens: mx.array) -> str:
-        """Produce a REAL generated answer from the expert (audit A.2.4).
-
-        The old path took argmax(logits) over the expert's own input positions —
-        a teacher-forced, per-position next-token prediction, i.e. a scrambled
-        echo of the question rather than a response. This generates an actual
-        continuation that can be injected into Central's prompt so the expert
-        pool reaches the user-facing reply. Greedy (no sampler) for determinism,
-        matching CentralModel.generate. Only called when the text will be shown."""
+    def _generate_expert_text(self, model: Any, tokenizer: Any, fragment_tokens: mx.array, max_tokens: int) -> str:
+        """Generate the expert's REAL analysis of its fragment — a genuine
+        continuation Central reads as context, never a scrambled echo. Greedy (no
+        sampler) for determinism, dropout disabled. Length is governed by the
+        caller (apex-nadir R_out), not a fixed constant."""
         try:
             from mlx_lm import generate as mlx_generate
             prompt_text = tokenizer.decode(fragment_tokens.reshape(-1).tolist())
             if not prompt_text.strip():
                 return ""
-            # Disable LoRA dropout during generation for stable, repeatable text.
             was_training = bool(getattr(model, "training", False))
             if was_training:
                 model.eval()
             try:
                 text = mlx_generate(
                     model, tokenizer, prompt=prompt_text,
-                    max_tokens=configs.EXPERT_GEN_MAX_TOKENS,
+                    max_tokens=max(1, int(max_tokens)),
                 )
             finally:
                 if was_training:
@@ -180,53 +175,29 @@ class ExpertPool:
             print(f"[warn] expert text generation failed: {e}")
             return ""
 
-    def _argmax_text(self, logits: mx.array, tokenizer: Any) -> str:
-        """Cheap, no-generation expert text for the training/measurement path.
-
-        Not user-facing — it only perturbs Central's synthesis input so the r_i
-        contribution delta (synthesis_hidden - base_hidden) stays non-trivial.
-        Kept argmax-cheap to preserve training throughput; the real reply path
-        uses _generate_expert_text instead."""
-        if logits.ndim == 3:
-            token_ids = mx.argmax(logits[0], axis=-1).tolist()
-        elif logits.ndim == 2:
-            token_ids = mx.argmax(logits, axis=-1).tolist()
-        else:
-            token_ids = [int(mx.argmax(logits).item())]
-        return tokenizer.decode(token_ids)
-
-    def expert_forward(self, expert_id: int, fragment_tokens: mx.array, generate_text: bool = False) -> ExpertOutput:
+    def expert_forward(
+        self,
+        expert_id: int,
+        fragment_tokens: mx.array,
+        generate_text: bool = True,
+        max_tokens: Optional[int] = None,
+    ) -> ExpertOutput:
+        """Run an expert over its fragment and return BOTH channels it hands to
+        Central: the hidden-state knowledge vector (always) and its real generated
+        text (when generate_text). No lm_head/echo: the old path projected the full
+        ~152k vocab every step only to argmax a gibberish echo — that vocab matmul
+        is gone. hidden_states come straight from the backbone; the answer, when
+        wanted, comes from real generation sized by apex-nadir R_out."""
         if expert_id not in self.loaded_experts:
             raise RuntimeError(f"Expert {expert_id} not loaded.")
         model = self.loaded_experts[expert_id]
         tokenizer = self.loaded_tokenizers[expert_id]
         input_embeds = fragment_tokens.reshape(1, -1)
         t_start = time.perf_counter()
-        # Single backbone pass: get hidden states, then derive logits cheaply
-        if hasattr(model, 'model'):
-            hidden_out = model.model(input_embeds)
-            mx.eval(hidden_out)
-            # Derive logits from hidden states (just the lm_head, no second pass)
-            if hasattr(model, 'lm_head'):
-                logits = model.lm_head(hidden_out)
-            else:
-                logits = model(input_embeds)
-            mx.eval(logits)
-        else:
-            logits = model(input_embeds)
-            mx.eval(logits)
-            hidden_out = logits
+        hidden_out = model.model(input_embeds) if hasattr(model, 'model') else model(input_embeds)
+        mx.eval(hidden_out)
         t_end = time.perf_counter()
         wall_time = t_end - t_start
-        # generate_text=True (Timeline B reply): a real expert answer that reaches
-        # Central's generation prompt. generate_text=False (training/measurement):
-        # the cheap argmax echo, used only to perturb Central's synthesis input for
-        # r_i scoring — never shown to the user. See audit A.2.4.
-        if generate_text:
-            output_text = self._generate_expert_text(model, tokenizer, fragment_tokens)
-        else:
-            output_text = self._argmax_text(logits, tokenizer)
-        # Hidden states already computed above (no extra pass)
         if hidden_out.ndim == 3:
             hidden_mean = mx.mean(hidden_out[0], axis=0)
         elif hidden_out.ndim == 2:
@@ -234,6 +205,8 @@ class ExpertPool:
         else:
             hidden_mean = hidden_out
         mx.eval(hidden_mean)
+        gen_len = max_tokens if max_tokens is not None else configs.EXPERT_GEN_MAX_TOKENS
+        output_text = self._generate_expert_text(model, tokenizer, fragment_tokens, gen_len) if generate_text else ""
         tc = fragment_tokens.shape[0]
         self.record_token_allocation(expert_id, tc)
         return ExpertOutput(
@@ -244,6 +217,27 @@ class ExpertPool:
             token_count=tc,
             from_cache=False,
         )
+    def expert_weight_std(self, expert_ids: List[int]) -> float:
+        """Monitoring signal for the L_div / specialisation acceptance criterion:
+        the mean per-dimension std across the loaded experts' (normalised) weight
+        vectors. Rising over training = experts diverging = peer repulsion working.
+        Pure measurement — no gradient, no persistent snapshot store needed."""
+        vecs = []
+        for eid in expert_ids:
+            model = self.loaded_experts.get(eid)
+            if model is None:
+                continue
+            flat = tree_flatten(model.trainable_parameters())
+            if not flat:
+                continue
+            v = mx.concatenate([x.reshape(-1) for _, x in flat])
+            vecs.append(v / (mx.linalg.norm(v) + 1e-8))
+        if len(vecs) < 2:
+            return 0.0
+        stacked = mx.stack(vecs, axis=0)
+        std = mx.mean(mx.std(stacked, axis=0))
+        mx.eval(std)
+        return float(std.item())
     def get_masking_rate(self, expert_id: int, domain: str) -> float:
         expert_score = self.domain_scores[expert_id].get(domain, 0.0)
         domain_mean = self.session_tracker.get_domain_mean_score(domain)
