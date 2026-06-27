@@ -11,6 +11,11 @@ class ExpertCurves:
     apex_ceiling: float = 256.0
     nadir_floor: float = float(configs.FRAGMENT_MIN)
     r_out_cached: Optional[float] = None
+    # True once this expert's curves have been fitted from real data (calibration
+    # or live latency). While False the expert is "cold" — compute_r_out reports
+    # no estimate so the caller falls back to EXPERT_BOOTSTRAP_TOKENS for the first
+    # run, then apex-nadir takes over.
+    has_data: bool = False
 class ApexNadirConvolution:
     def __init__(self, calibration_path: str, latency_store_path: str):
         self.calibration_path = calibration_path
@@ -63,6 +68,25 @@ class ApexNadirConvolution:
         if not expert_ids:
             return float(configs.MAX_SEQ_LEN) / configs.K_DEFAULT
         return float(np.mean([self.compute_r_out(eid) for eid in expert_ids]))
+    def has_calibration(self, expert_id: int) -> bool:
+        """True once this expert's curves carry real data (calibration or live
+        latency). False = cold; callers should use EXPERT_BOOTSTRAP_TOKENS."""
+        return self.expert_curves[expert_id].has_data
+    def r_out_or_bootstrap(self, expert_id: int) -> float:
+        """INPUT fragment size for this expert: its convolution R_out once the
+        curves have data, otherwise the cold-start bootstrap size. Governs how many
+        tokens the expert READS (gathers context from)."""
+        if self.expert_curves[expert_id].has_data:
+            return self.compute_r_out(expert_id)
+        return float(configs.EXPERT_BOOTSTRAP_TOKENS)
+    def generation_length(self, expert_id: int) -> int:
+        """OUTPUT length for this expert's generated analysis: R_out once calibrated,
+        else the EXPERT_GEN_MAX_TOKENS safety valve. Governed SEPARATELY from the
+        input fragment — reading a big context to calibrate (bootstrap) does not mean
+        writing a long analysis. Central truncates over-long analyses anyway."""
+        if self.expert_curves[expert_id].has_data:
+            return max(1, int(self.compute_r_out(expert_id)))
+        return int(configs.EXPERT_GEN_MAX_TOKENS)
     def update_latency(self, expert_id: int, token_count: int, wall_time: float):
         curves = self.expert_curves[expert_id]
         measured_rate = wall_time / max(token_count, 1)
@@ -70,6 +94,7 @@ class ApexNadirConvolution:
         new_slope = configs.EMA_DECAY * old_slope + (1.0 - configs.EMA_DECAY) * measured_rate
         curves.latency_coeffs = np.array([0.0, new_slope])
         curves.r_out_cached = None
+        curves.has_data = True   # a real latency measurement is real data
     def check_monopoly_ceiling(self, expert_id: int, current_allocation: int) -> bool:
         curves = self.expert_curves[expert_id]
         return current_allocation > curves.apex_ceiling * configs.MONOPOLY_THRESHOLD
@@ -107,10 +132,16 @@ class ApexNadirConvolution:
             if len(tc) > 0:
                 curves.latency_coeffs = np.array([0.0, float(np.mean(wt / np.maximum(tc, 1)))])
         curves.r_out_cached = None
+        curves.has_data = True   # curves fitted from calibration → no longer cold
     def reset_r_t_curve(self, expert_id: int):
+        # Called on lateral migration. The latency curve is domain/hardware-bound,
+        # so it resets and the expert goes cold (has_data=False) → it re-bootstraps
+        # and re-convolves in the new domain. The structural apex/nadir curves are
+        # left intact: they describe the expert's own capacity and travel with it.
         curves = self.expert_curves[expert_id]
         curves.latency_coeffs = np.array([0.0, 0.001])
         curves.r_out_cached = None
+        curves.has_data = False
     def save(self):
         from pathlib import Path
         Path(self.calibration_path).parent.mkdir(parents=True, exist_ok=True)
@@ -143,6 +174,8 @@ class ApexNadirConvolution:
                     meta = data[f"meta_{eid}"]
                     curves.apex_ceiling = float(meta[0])
                     curves.nadir_floor = float(meta[1])
+                if f"apex_{eid}" in data or f"latency_{eid}" in data:
+                    curves.has_data = True   # persisted calibration → warm at boot
                 curves.r_out_cached = None
         except FileNotFoundError:
             pass

@@ -2,8 +2,10 @@ from __future__ import annotations
 import math
 import random
 from dataclasses import dataclass
-from typing import Dict, List, Set
+from pathlib import Path
+from typing import Dict, List, Optional, Set
 import mlx.core as mx
+import mlx.nn as nn
 import numpy as np
 import configs
 from apex_nadir_convolution import ApexNadirConvolution
@@ -19,24 +21,44 @@ class GateOutput:
     domain_logits: mx.array
     timeline_flag: str
     confidence: float
+    # Learned per-expert routing preference from GateNet.route_head (shape
+    # [EXPERT_POOL_SIZE]). None only on the NaN-guard fallback path. select_experts
+    # blends this with apex-nadir distance-to-peak.
+    route_logits: Optional[mx.array] = None
 @dataclass
 class SelectedExpert:
     expert_id: int
     distance_to_peak: float
     domain: str
     is_alpha: bool
+class GateNet(nn.Module):
+    """The trainable gate as one unit, so a single value_and_grad call updates the
+    backbone's LoRA params and the expert-routing head together. `backbone` is the
+    LoRA'd Qwen (only its LoRA adapters are unfrozen); `route_head` maps the pooled
+    gate hidden state to one preference logit per expert — the differentiable path
+    that L_eff/L_rel use to teach the gate which experts to prefer."""
+    def __init__(self, backbone: nn.Module, d_model: int, n_experts: int):
+        super().__init__()
+        self.backbone = backbone
+        self.route_head = nn.Linear(d_model, n_experts)
+
 class GateModel:
     def __init__(self):
-        self.model = None
+        self.model = None        # LoRA'd Qwen backbone (also held by self.net.backbone)
         self.tokenizer = None
+        self.net = None          # GateNet: backbone + route_head, the trainable unit
         self._loaded = False
+    @property
+    def route_head(self):
+        return self.net.route_head if self.net is not None else None
+    def _route_head_path(self) -> Path:
+        return Path(configs.CHECKPOINT_DIR) / "gate" / "route_head.safetensors"
     def load(self):
         if self._loaded:
             return
         from mlx_lm import load as mlx_load
-        from pathlib import Path
-        self.model, self.tokenizer = mlx_load(configs.GATE_MODEL_ID)
         from mlx_lm.tuner.utils import linear_to_lora_layers
+        self.model, self.tokenizer = mlx_load(configs.GATE_MODEL_ID)
         self.model.freeze()
         lora_config = {"rank": configs.LORA_R, "scale": configs.LORA_ALPHA, "dropout": configs.LORA_DROPOUT}
         num_layers = len(self.model.layers) if hasattr(self.model, "layers") else len(self.model.model.layers)
@@ -44,8 +66,20 @@ class GateModel:
         weights_path = Path(configs.CHECKPOINT_DIR) / "gate" / "weights.safetensors"
         if weights_path.exists():
             self.model.load_weights(str(weights_path), strict=False)
+        # Wrap backbone + a fresh routing head into the trainable unit. The head's
+        # own checkpoint is restored separately so it survives restarts.
+        self.net = GateNet(self.model, configs.GATE_D_MODEL, configs.EXPERT_POOL_SIZE)
+        rh_path = self._route_head_path()
+        if rh_path.exists():
+            self.net.route_head.load_weights(str(rh_path), strict=False)
+        mx.eval(self.net.route_head.parameters())
         self.model.train()
         self._loaded = True
+    def save_route_head(self):
+        from mlx.utils import tree_flatten
+        p = self._route_head_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        mx.save_safetensors(str(p), dict(tree_flatten(self.net.route_head.parameters())))
     def _backbone(self, tokens: mx.array) -> mx.array:
         """One full backbone pass → per-token hidden states (1, T, D). Shared by
         forward(), look_ahead() and forward_with_topography() so a single request
@@ -133,7 +167,9 @@ class GateModel:
         sigma = mx.sqrt(mx.mean((mean_hidden - mu) ** 2) + 1e-8)
         normed = (mean_hidden - mu) / (sigma + 1e-8)
         domain_logits = normed[:4]   # 4 slots: code / reasoning / knowledge / general
-        mx.eval(domain_logits)
+        # Learned per-expert routing preference from the same pooled hidden state.
+        route_logits = self.net.route_head(mean_hidden)
+        mx.eval(domain_logits, route_logits)
         probs = mx.softmax(domain_logits)
         mx.eval(probs)
         entropy = -float(mx.sum(probs * mx.log(probs + 1e-10)).item())
@@ -144,7 +180,7 @@ class GateModel:
         else:
             timeline = "B"
         k = max(configs.K_MIN, min(configs.K_MAX, int((1.0 - confidence) * configs.K_MAX)))
-        return GateOutput(hidden_states=mean_hidden, k_per_token=k, domain_logits=domain_logits, timeline_flag=timeline, confidence=confidence)
+        return GateOutput(hidden_states=mean_hidden, k_per_token=k, domain_logits=domain_logits, timeline_flag=timeline, confidence=confidence, route_logits=route_logits)
     def parameters(self) -> dict:
         if self.model is not None:
             return self.model.parameters()
@@ -183,14 +219,11 @@ class TripleKSelector:
             self.beta_experts[domain] = experts[n_alpha:]
             self.k_pd[domain] = list(experts)
     def select_experts(self, gate_output: GateOutput, session_tracker, masking_schedule: MaskingSchedule, batch_id: int = 0, loaded_experts=None) -> List[SelectedExpert]:
+        domains = ["code", "reasoning", "knowledge", "general"]
         domain = "general"
         logits = gate_output.domain_logits
-        if logits is not None and logits.shape[0] > 0:
-            vals = logits.tolist()
-            domains = ["code", "reasoning", "knowledge", "general"]
-            if len(vals) >= len(domains):
-                best_idx = int(np.argmax(vals[:len(domains)]))
-                domain = domains[best_idx]
+        if logits is not None and logits.shape[0] >= len(domains):
+            domain = domains[int(mx.argmax(logits[:len(domains)]).item())]
         # k=0 means "Timeline A" (no experts) — but that path never calls
         # select_experts. Whenever we ARE selecting (Timeline B / training), we need
         # at least one expert; otherwise selected[:0] == [] and the caller skips the
@@ -199,6 +232,12 @@ class TripleKSelector:
         k = max(1, gate_output.k_per_token)
         domain_pool = self.k_d.get(domain, self.k_all)
         masked = masking_schedule.get_masked_experts(self.alpha_experts.get(domain, []), batch_id)
+        # The gate's learned routing preference (one softmax pull). Blended into the
+        # ranking below: apex-nadir distance-to-peak keeps things grounded, the head
+        # tilts selection toward experts it has learned are efficient/fresh.
+        route_pref = None
+        if gate_output.route_logits is not None:
+            route_pref = mx.softmax(gate_output.route_logits).tolist()
         candidates = []
         for eid in domain_pool:
             if eid in masked:
@@ -207,6 +246,8 @@ class TripleKSelector:
             dist = self.convolution.get_distance_to_peak(eid, current_alloc)
             if loaded_experts and eid in loaded_experts:
                 dist *= 0.1  # Huge discount for RAM-resident experts to avoid SSD latency
+            if route_pref is not None and eid < len(route_pref):
+                dist -= configs.ROUTE_BIAS_W * route_pref[eid]   # learned preference lowers rank-distance
             jitter = self._rng.random() * 1e-6
             is_alpha = eid in self.alpha_experts.get(domain, [])
             candidates.append(SelectedExpert(expert_id=eid, distance_to_peak=dist + jitter, domain=domain, is_alpha=is_alpha))

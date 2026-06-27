@@ -104,12 +104,15 @@ class CentralModel:
             synthesis_text = self.tokenizer.decode([token_id])
         else:
             synthesis_text = ""
-        expert_scores = {}
-        expert_tkl_scores = {}
-        for eo in expert_outputs:
-            eid = eo.get("expert_id", 0)
-            r_i = self._compute_r_i_from_hidden(eo.get("hidden_states"), contribution_hidden, eo.get("wall_time", 1.0))
-            expert_scores[eid] = r_i
+        # expert_scores used to be computed here (one compute_r_i per expert, each
+        # forcing 2 mx.eval host-syncs + 3 .item() device->host pulls). Nothing
+        # ever read CentralOutput.expert_scores — the training loop recomputes the
+        # identical r_i at finetune.py via central.compute_r_i(eo.hidden_states,
+        # central_out.contribution_hidden, ...) from the same inputs. So this loop
+        # was a per-expert-per-batch duplicate of work done later; dropped. Kept
+        # the field as an empty dict for backward-compatible callers.
+        expert_scores: Dict[int, float] = {}
+        expert_tkl_scores: Dict[int, float] = {}
         entropy = self.compute_reconstruction_entropy(synthesis_hidden)
         return CentralOutput(
             synthesis_text=synthesis_text,
@@ -120,36 +123,74 @@ class CentralModel:
             reconstruction_entropy=entropy,
             send_to_user=send_to_user,
         )
-    def compute_r_i(self, expert_output_hidden: mx.array, contribution_hidden: mx.array, wall_time: float) -> float:
+    def _cosine_terms(self, a: mx.array, b: mx.array):
+        """Mean-centred cosine of two vectors, returned UNEVALUATED as
+        (sim, min_norm) mx scalars so callers can batch the host-sync. sim is raw
+        cosine in [-1, 1]; min_norm lets the caller reject degenerate (~zero) vecs."""
+        a = a.reshape(-1)
+        b = b.reshape(-1)
+        m = min(int(a.shape[0]), int(b.shape[0]))
+        a = a[:m] - mx.mean(a[:m])
+        b = b[:m] - mx.mean(b[:m])
+        a_norm = mx.linalg.norm(a)
+        b_norm = mx.linalg.norm(b)
+        sim = mx.sum((a / (a_norm + 1e-8)) * (b / (b_norm + 1e-8)))
+        return sim, mx.minimum(a_norm, b_norm)
+    def compute_r_i(
+        self,
+        expert_output_hidden: mx.array,
+        contribution_hidden: mx.array,
+        wall_time: float,
+        synthesis_hidden: Optional[mx.array] = None,
+    ) -> float:
+        """Expert contribution score in [0, 1] — alignment only (speed is folded in
+        later by compute_tkl via /C_e, so it must NOT be double-counted here).
+
+        Two complementary signals (audit: 'both are needed'):
+          - direction:     cosine(expert, contribution_hidden) — did the expert push
+                           Central in the direction it actually moved?
+          - compatibility: cosine(expert, synthesis_hidden)    — does the expert
+                           agree with Central's final synthesised view?
+        With no synthesis_hidden it degrades to the direction signal alone (keeps
+        older callers working). One mx.eval + one host pull for the whole score."""
         if expert_output_hidden is None or contribution_hidden is None:
             return 0.0
-        expert_vec = expert_output_hidden.reshape(-1)
-        contribution_vec = contribution_hidden.reshape(-1)
-        min_dim = min(int(expert_vec.shape[0]), int(contribution_vec.shape[0]))
-        if min_dim <= 0:
+        dir_sim, dir_norm = self._cosine_terms(expert_output_hidden, contribution_hidden)
+        if synthesis_hidden is not None:
+            comp_sim, comp_norm = self._cosine_terms(expert_output_hidden, synthesis_hidden)
+            combined = 0.5 * (dir_sim + 1.0) * 0.5 + 0.5 * (comp_sim + 1.0) * 0.5
+            min_norm = mx.minimum(dir_norm, comp_norm)
+        else:
+            combined = (dir_sim + 1.0) * 0.5
+            min_norm = dir_norm
+        packed = mx.stack([combined, min_norm])
+        mx.eval(packed)
+        score, norm = (float(x) for x in packed.tolist())
+        if norm < 1e-8 or score != score:   # degenerate vector or NaN
             return 0.0
-        expert_vec = expert_vec[:min_dim]
-        contribution_vec = contribution_vec[:min_dim]
-        expert_vec = expert_vec - mx.mean(expert_vec)
-        contribution_vec = contribution_vec - mx.mean(contribution_vec)
-        eo_norm = mx.linalg.norm(expert_vec)
-        contrib_norm = mx.linalg.norm(contribution_vec)
-        mx.eval(eo_norm, contrib_norm)
-        if float(eo_norm.item()) < 1e-8 or float(contrib_norm.item()) < 1e-8:
-            return 0.0
-        sim = mx.sum((expert_vec / (eo_norm + 1e-8)) * (contribution_vec / (contrib_norm + 1e-8)))
-        mx.eval(sim)
-        raw_sim = float(sim.item())
-        if not (raw_sim == raw_sim):
-            return 0.0
-        score = (raw_sim + 1.0) * 0.5
         return max(0.0, min(1.0, score))
-    def _compute_r_i_from_hidden(self, expert_hidden, contribution_hidden, wall_time):
-        if expert_hidden is None:
+    def compute_l_eff(
+        self,
+        expert_output_hidden: mx.array,
+        synthesis_hidden: mx.array,
+        token_count: int,
+        wall_time: float,
+    ) -> float:
+        """Raw efficiency score for one expert (the gate's routing head learns to
+        prefer high values). Per the manual: synthesis_compatibility + throughput.
+        Returned un-normalised; the caller L1-normalises across the active experts
+        before building the gate's L_eff target. Higher = more useful per second."""
+        if expert_output_hidden is None or synthesis_hidden is None:
             return 0.0
-        if isinstance(expert_hidden, mx.array):
-            return self.compute_r_i(expert_hidden, contribution_hidden, wall_time)
-        return 0.0
+        sim, min_norm = self._cosine_terms(expert_output_hidden, synthesis_hidden)
+        packed = mx.stack([sim, min_norm])
+        mx.eval(packed)
+        raw_sim, norm = (float(x) for x in packed.tolist())
+        if norm < 1e-8 or raw_sim != raw_sim:
+            return 0.0
+        compatibility = (raw_sim + 1.0) * 0.5                  # [0, 1]
+        throughput = token_count / max(wall_time, configs.L_EFF_EPS)
+        return max(0.0, compatibility + throughput)
     def compute_tkl(self, r_i: float, r_out: float, historical_anchor: float, c_e: float) -> float:
         if c_e < 1e-9:
             c_e = 1e-9

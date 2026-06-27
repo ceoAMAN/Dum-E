@@ -26,6 +26,10 @@ EXPERT_MODEL_ID = "mlx-community/Qwen2.5-1.5B-Instruct-4bit"
 CENTRAL_MODEL_ID = "mlx-community/Mistral-7B-Instruct-v0.3-4bit"
 EXPERT_POOL_SIZE = 100
 NUM_EXPERTS = EXPERT_POOL_SIZE
+# Fallback RAM-per-expert estimate. Measured for real at boot via
+# splitter.measure_expert_ram_mb() (loads one expert, reads the delta) and the
+# measured value replaces this at runtime, so X/Y geometry uses the true cost on
+# whatever hardware Sturnus runs on rather than a hardcoded guess.
 EXPERT_RAM_MB = 850
 CENTRAL_RAM_MB = 4096
 MIN_BOOT_RAM_MB = 6000
@@ -37,12 +41,19 @@ OVERLAP_FRACTION = 0.175
 K_MIN = 0
 K_MAX = 20
 K_DEFAULT = 4
+# Input-tokenisation safety ceiling ONLY — the longest token sequence we ever
+# read in for a single sample. It is NOT the expert operating point: how many
+# tokens each expert actually processes/generates is governed per-expert by the
+# Apex-Nadir Convolution (R_out), bootstrapped from EXPERT_BOOTSTRAP_TOKENS until
+# the curves have data. Keep generous; apex-nadir decides the real working size.
 MAX_SEQ_LEN = 512
-# Tokens each activated expert generates as its contribution to Central synthesis.
-# Only spent on the user-facing reply path (Timeline B with send_to_user=True);
-# training/measurement keeps the cheap echo. Audit A.2.4: experts now produce a
-# real generated analysis that is injected into Central's prompt instead of a
-# scrambled argmax echo of the input that never reached the reply.
+# Cold-start expert fragment/generation size, used ONLY before the convolution has
+# enough latency/quality data to produce an R_out for an expert (compute_r_out
+# returns None until then). Once R_out exists it governs and this is ignored —
+# the "first run gathers context, apex-nadir takes over" handshake.
+EXPERT_BOOTSTRAP_TOKENS = 256
+# Hard safety valve for expert generation length when R_out is unknown or the
+# convolution call fails. Not the operating point — apex-nadir's R_out is.
 EXPERT_GEN_MAX_TOKENS = 48
 TKL_FLOOR = 32
 TKL_HISTORY_LEN = 10
@@ -222,6 +233,12 @@ LORA_R = 8
 LORA_ALPHA = 16
 LORA_DROPOUT = 0.05
 LEARNING_RATE = 2e-5
+# The gate's learned expert-routing head (gating.GateNet.route_head) emits a
+# preference logit per expert. select_experts blends that learned preference with
+# the Apex-Nadir distance-to-peak: final_rank = distance_to_peak - ROUTE_BIAS_W *
+# softmax(route_logits). Apex-nadir keeps routing grounded while the head is still
+# learning; raise this as the head matures to let the gate drive selection.
+ROUTE_BIAS_W = 0.5
 EXPERT_GROUPS = {
     "code": list(range(0, 25)),
     "reasoning": list(range(25, 50)),

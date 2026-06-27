@@ -163,6 +163,33 @@ def validate_overlap_grads(grads: mx.array, overlap_len: int, expert_id: int) ->
         max_val = mx.abs(overlap_grads).max().item()
         raise AssertionError(f"Expert {expert_id}: Overlap gradient NOT zero. Max abs: {max_val:.6e}. Mask must be inside masked_loss.")
     return True
+def measure_expert_ram_mb() -> float:
+    """Measure the real resident cost of one expert by loading it and reading the
+    RAM delta, then update configs.EXPERT_RAM_MB in place so every downstream X/Y
+    consumer uses the measured value. Returns the measured MB (falls back to the
+    configured estimate on any failure). Called once at boot — never per batch."""
+    try:
+        before = get_active_memory_mb()
+        from mlx_lm import load as mlx_load
+        model, _tok = mlx_load(configs.EXPERT_MODEL_ID)
+        mx.eval(model.parameters())
+        after = get_active_memory_mb()
+        measured = after - before
+        del model
+        mx.clear_cache()
+        if measured > 1.0:
+            configs.EXPERT_RAM_MB = round(measured)
+            return float(configs.EXPERT_RAM_MB)
+    except Exception as e:
+        print(f"[boot] expert RAM measurement failed, using configured {configs.EXPERT_RAM_MB} MB: {e}")
+    return float(configs.EXPERT_RAM_MB)
+def get_active_memory_mb() -> float:
+    """MLX-reported active (resident) memory in MB. Preferred RAM signal on Apple
+    Silicon — no subprocess, reflects the unified-memory allocator's real use."""
+    try:
+        return float(mx.get_active_memory()) / (1024 * 1024)
+    except Exception:
+        return 0.0
 def get_available_ram_mb() -> float:
     try:
         out = subprocess.check_output(["vm_stat"], text=True)

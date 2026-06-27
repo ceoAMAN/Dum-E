@@ -1,9 +1,11 @@
 import argparse
 import json
+import queue
 import signal
+import threading
 import time
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Iterable, Iterator
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -21,12 +23,45 @@ from experts import ExpertPool
 from gating import GateModel, TripleKSelector, MaskingSchedule, SelectedExpert
 from memory import RoutingMemory, SessionTracker
 from meta import MAMLOptimiser
-from splitter import get_available_ram_mb
+from splitter import get_available_ram_mb, measure_expert_ram_mb
 from training import (
     apply_gate_gradients,
     apply_expert_gradients,
+    peer_weight_vector,
 )
 from evaluation import load_eval_set, gate_routing_accuracy
+
+_PREFETCH_SENTINEL = object()
+
+def prefetch(iterable: Iterable, size: int = 8) -> Iterator:
+    """Pull from `iterable` on a background thread into a bounded queue so the
+    main training loop never blocks on network streaming / _extract_text while
+    the GPU is idle. The producer fetches the NEXT sample(s) during the current
+    batch's forward/backward passes; the main loop just pops a ready sample.
+
+    Order-preserving (single FIFO producer) so the mixture RNG is consumed in the
+    exact same sequence — training is bit-identical, only wall-clock improves.
+    Daemon thread: dies with the process on Ctrl-C. A bounded queue (size) caps
+    how far ahead it reads so a fast producer can't run away with memory."""
+    q: "queue.Queue" = queue.Queue(maxsize=size)
+
+    def producer():
+        try:
+            for item in iterable:
+                q.put(item)
+        except Exception as e:
+            q.put((_PREFETCH_SENTINEL, e))
+            return
+        q.put(_PREFETCH_SENTINEL)
+
+    threading.Thread(target=producer, daemon=True).start()
+    while True:
+        item = q.get()
+        if item is _PREFETCH_SENTINEL:
+            return
+        if isinstance(item, tuple) and len(item) == 2 and item[0] is _PREFETCH_SENTINEL:
+            return  # producer raised; stop cleanly (error already surfaced upstream)
+        yield item
 
 class MarathonState:
     def __init__(self):
@@ -83,6 +118,7 @@ def save_checkpoint(state: MarathonState, convolution, routing_memory, maml, gat
     gate_dir = Path(configs.CHECKPOINT_DIR) / "gate"
     gate_dir.mkdir(parents=True, exist_ok=True)
     mx.save_safetensors(str(gate_dir / "weights.safetensors"), dict(tree_flatten(gate.model.trainable_parameters())))
+    gate.save_route_head()   # persist the learned expert-routing head alongside the LoRA
     
     a_rate = state.timeline_a_count / max(state.timeline_a_count + state.timeline_b_count, 1)
     lam = [float(x) for x in maml.get_lambdas().tolist()]
@@ -137,6 +173,7 @@ def run_marathon(
     seed: int = 42,
     clean: bool = False,
     deployment: bool = False,
+    max_batches: int = 0,
 ):
     configs.validate_config()
     if deployment:
@@ -147,6 +184,10 @@ def run_marathon(
             shutil.rmtree("state")
         if Path("logs/marathon_metrics.json").exists():
             Path("logs/marathon_metrics.json").unlink()
+    # Per-batch logging (trajectory.csv) and checkpoints write into these dirs;
+    # create them up front so the first print can't crash on a missing directory.
+    Path("logs").mkdir(parents=True, exist_ok=True)
+    Path("state").mkdir(parents=True, exist_ok=True)
 
     print("=" * 60)
     print("  STURNUS — Learning Marathon")
@@ -165,14 +206,8 @@ def run_marathon(
     session_tracker = SessionTracker()
 
     gate = GateModel()
-    gate.load()
-    from mlx_lm.tuner.utils import linear_to_lora_layers
-    gate.model.freeze()
-    lora_config = {"rank": configs.LORA_R, "scale": configs.LORA_ALPHA, "dropout": configs.LORA_DROPOUT}
-    num_layers = len(gate.model.layers) if hasattr(gate.model, "layers") else len(gate.model.model.layers)
-    linear_to_lora_layers(gate.model, num_layers, lora_config)
-    gate.model.train()
-    print("[boot] Gate loaded and trainable")
+    gate.load()   # applies LoRA to the backbone AND builds GateNet (backbone + routing head)
+    print("[boot] Gate loaded and trainable (LoRA backbone + learned routing head)")
 
     central = CentralModel()
     print("[boot] Central deferred")
@@ -188,13 +223,15 @@ def run_marathon(
     gate_tokenizer = get_tokenizer(configs.GATE_MODEL_ID)
 
     boot_ram = get_available_ram_mb()
+    measure_expert_ram_mb()   # updates configs.EXPERT_RAM_MB in place to the real per-expert cost
     current_ram = boot_ram   # cached; refreshed every RAM_REFRESH_BATCHES (vm_stat is a subprocess — too costly per batch)
     RAM_REFRESH_BATCHES = 25
+    FINITE_CHECK_EVERY = 20   # finite-ness guards force a host sync; amortise them
     expert_budget = max(0, boot_ram - 4000)
     hw_max = min(max(1, int(expert_budget / configs.EXPERT_RAM_MB)), configs.K_MAX)
     cache_size = max(2, hw_max)
     expert_pool = ExpertPool(convolution=convolution, session_tracker=session_tracker, max_loaded=cache_size)
-    print(f"[boot] RAM={boot_ram:.0f}MB | expert_cap={hw_max} | cache={cache_size}")
+    print(f"[boot] RAM={boot_ram:.0f}MB | expert_ram={configs.EXPERT_RAM_MB:.0f}MB(measured) | expert_cap={hw_max} | cache={cache_size}")
 
     state = MarathonState()
 
@@ -211,11 +248,15 @@ def run_marathon(
 
     print(f"[boot] Starting from {state.total_tokens:,} tokens\n")
 
-    data_iter = iter(iter_mixture_samples(seed=seed))
+    # Background prefetch: network streaming + _extract_text for the NEXT sample
+    # overlap with the current batch's GPU compute instead of stalling it.
+    data_iter = iter(prefetch(iter_mixture_samples(seed=seed)))
     sample = next(data_iter, None)
 
     while sample is not None:
         if state.interrupted or state.total_tokens >= max_tokens:
+            break
+        if max_batches and state.total_batches >= max_batches:
             break
 
         text = sample.text
@@ -316,21 +357,30 @@ def run_marathon(
             sample = next(data_iter, None)
             continue
 
-        fragment_size = max(configs.FRAGMENT_MIN, n_tokens // max(len(expert_ids), 1))
+        # Per-expert fragment + generation length governed by Apex-Nadir R_out
+        # (bootstrap size until that expert's curves have data) — the "first run
+        # gathers context, apex-nadir takes over" handshake; no fixed uniform split.
         expert_outputs = []
         expert_frag_tokens = []
-
-        for i, sel in enumerate(selected):
-            frag_start = i * fragment_size
-            frag_end = min(frag_start + fragment_size, n_tokens)
+        frag_start = 0
+        for sel in selected:
             if frag_start >= n_tokens:
                 break
+            t_expert = max(configs.FRAGMENT_MIN, int(convolution.r_out_or_bootstrap(sel.expert_id)))
+            frag_end = min(frag_start + t_expert, n_tokens)
             frag_tokens = tokens[frag_start:frag_end]
             if frag_tokens.shape[0] < configs.FRAGMENT_MIN:
-                continue
-            eo = expert_pool.expert_forward(sel.expert_id, frag_tokens)
+                break
+            # Experts hand Central BOTH channels — hidden states + a REAL generated
+            # analysis (no echo). Input size = R_out/bootstrap (above); generation
+            # length is governed separately (R_out when calibrated, else safety valve).
+            eo = expert_pool.expert_forward(
+                sel.expert_id, frag_tokens, generate_text=True,
+                max_tokens=convolution.generation_length(sel.expert_id),
+            )
             expert_outputs.append(eo)
             expert_frag_tokens.append(frag_tokens)
+            frag_start = frag_end
 
         if not expert_outputs:
             state.total_tokens += n_tokens
@@ -341,15 +391,32 @@ def run_marathon(
         expert_data = [{"expert_id": eo.expert_id, "output_text": eo.output_text, "hidden_states": eo.hidden_states, "wall_time": eo.wall_time} for eo in expert_outputs]
         central_out = central.forward(text, expert_data, send_to_user=False)
 
+        lambdas = maml.get_lambdas()
+        check_finite = (state.total_batches % FINITE_CHECK_EVERY == 0)
+        active_ids = [eo.expert_id for eo in expert_outputs]
+
         batch_r_i_scores = []
-        tkl_scores = {}        # expert_id -> tkl, for ranking cluster.top_experts
+        tkl_scores = {}        # expert_id -> tkl, ranks cluster.top_experts
         r_out_snapshot = {}    # expert_id -> r_out, stored on the cluster
+        l_eff_targets = {}     # expert_id -> efficiency score, trains the gate routing head (L_eff)
+        staleness = {}         # expert_id -> [0,1], 1 = coasting on stale reputation (L_rel)
 
         for eo in expert_outputs:
-            r_i = central.compute_r_i(eo.hidden_states, central_out.contribution_hidden, eo.wall_time)
+            # Dual R_i: direction (vs contribution) + compatibility (vs synthesis).
+            r_i = central.compute_r_i(
+                eo.hidden_states, central_out.contribution_hidden, eo.wall_time,
+                synthesis_hidden=central_out.synthesis_hidden,
+            )
             r_out = convolution.compute_r_out(eo.expert_id)
             anchor = expert_pool.get_historical_anchor(eo.expert_id)
             tkl = central.compute_tkl(r_i, r_out, anchor, eo.wall_time)
+            l_eff_targets[eo.expert_id] = central.compute_l_eff(
+                eo.hidden_states, central_out.synthesis_hidden, eo.token_count, eo.wall_time
+            )
+            # Staleness = how far this batch's r_i fell below the expert's running
+            # reputation (EMA read BEFORE this batch updates it).
+            ema = expert_pool.domain_scores[eo.expert_id].get(domain, 0.0)
+            staleness[eo.expert_id] = max(0.0, min(1.0, 1.0 - r_i / (ema + 1e-6))) if ema > 1e-6 else 0.0
 
             session_tracker.record_activation(eo.expert_id, eo.token_count, r_i, eo.wall_time, tkl, domain)
             expert_pool.update_domain_score(eo.expert_id, domain, r_i)
@@ -359,32 +426,47 @@ def run_marathon(
             tkl_scores[eo.expert_id] = tkl
             r_out_snapshot[eo.expert_id] = r_out
 
-        # Domain target for l_dom (the only term that trains the gate): one-hot
-        # over the 4 domains, matching the 4-dim domain_logits.
+        # Domain target for L_dom: one-hot over the 4 domains.
         domains = ["code", "reasoning", "knowledge", "general"]
         true_domain_idx = domains.index(domain) if domain in domains else 3
         target_list = [0.0, 0.0, 0.0, 0.0]
         target_list[true_domain_idx] = 1.0
         cluster_counts = mx.array(target_list)
 
+        # L_gate = λ_eff·L_eff + λ_dom·L_dom + λ_rel·L_rel — trained through the gate's
+        # LoRA backbone AND its learned routing head (GateNet), in one step.
         batch_loss = apply_gate_gradients(
-            gate_model=gate.model,
+            gate_net=gate.net,
             gate_optimizer=gate_optimizer,
             tokens=tokens,
-            lambdas=maml.get_lambdas(),
+            lambdas=lambdas,
             routing_density=cluster_counts,
+            active_expert_ids=active_ids,
+            l_eff_targets=l_eff_targets,
+            staleness=staleness,
+            check_finite=check_finite,
         )
-        
+
+        # Peer weight vectors snapshotted BEFORE any expert update, so every expert
+        # repels the same fixed peer set this batch (L_div repulsion, weight λ_div).
+        peer_vecs = {eid: peer_weight_vector(expert_pool.loaded_experts[eid])
+                     for eid in active_ids if eid in expert_pool.loaded_experts}
+        l_div_weight = float(lambdas[3])
+
         for eo, f_tokens in zip(expert_outputs, expert_frag_tokens):
             if eo.expert_id in expert_pool.loaded_experts:
                 expert_model = expert_pool.loaded_experts[eo.expert_id]
                 if eo.expert_id not in expert_optimizers:
                     expert_optimizers[eo.expert_id] = optim.Adam(learning_rate=configs.LEARNING_RATE)
+                peers = [v for j, v in peer_vecs.items() if j != eo.expert_id and v is not None]
                 apply_expert_gradients(
                     expert_model=expert_model,
                     expert_optimizer=expert_optimizers[eo.expert_id],
                     tokens=f_tokens,
-                    central_synthesis=central_out.synthesis_hidden
+                    central_synthesis=central_out.synthesis_hidden,
+                    peer_weights=peers,
+                    l_div_weight=l_div_weight,
+                    check_finite=check_finite,
                 )
 
         mean_r_i = float(np.mean(batch_r_i_scores)) if batch_r_i_scores else 0.0
@@ -519,6 +601,7 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--clean", action="store_true")
     parser.add_argument("--deployment", action="store_true")
+    parser.add_argument("--max-batches", type=int, default=0, help="Stop after N batches (0 = unlimited). For smoke tests.")
     args = parser.parse_args()
     ckpt_every = args.checkpoint_every_batches or args.checkpoint_every
     run_marathon(
@@ -529,4 +612,5 @@ if __name__ == "__main__":
         seed=args.seed,
         clean=args.clean,
         deployment=args.deployment,
+        max_batches=args.max_batches,
     )

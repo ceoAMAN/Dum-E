@@ -12,6 +12,7 @@ from gating import GateModel, TripleKSelector, MaskingSchedule
 from inference import InferenceEngine
 from memory import RoutingMemory, SessionTracker
 from meta import MAMLOptimiser
+from splitter import measure_expert_ram_mb
 
 
 @dataclass
@@ -51,6 +52,7 @@ def boot_system() -> SystemComponents:
     gate = GateModel()
     gate.load()
     central = CentralModel()
+    measure_expert_ram_mb()   # measure real per-expert RAM so X/Y geometry is grounded in fact
     expert_pool = ExpertPool(convolution=convolution, session_tracker=session_tracker)
     triple_k = TripleKSelector(convolution=convolution)
     masking_schedule = MaskingSchedule()

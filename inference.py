@@ -379,11 +379,14 @@ class InferenceEngine:
                     continue
                 if fragment.expert_id not in loaded_ids:
                     continue
-                # Generate a real expert answer only when it will reach the user
-                # (audit A.2.4). For training/dead-time (send_to_user=False) keep
-                # the cheap echo — it only feeds the r_i contribution delta.
+                # Experts always hand Central both channels — hidden states + a
+                # REAL generated analysis (no echo). Generation length is governed
+                # by apex-nadir (R_out when calibrated, else the safety valve),
+                # separate from the input fragment size.
                 eo = self.expert_pool.expert_forward(
-                    fragment.expert_id, fragment.tokens, generate_text=send_to_user
+                    fragment.expert_id, fragment.tokens,
+                    generate_text=True,
+                    max_tokens=self.convolution.generation_length(fragment.expert_id),
                 )
                 all_expert_outputs.append(eo)
             self._tokens_processed += len(batch.token_indices)
@@ -412,7 +415,7 @@ class InferenceEngine:
         central_out = self.central.forward(input_text, expert_data, send_to_user=False)
         r_i_scores: List[float] = []
         for eo in all_expert_outputs:
-            r_i = self.central.compute_r_i(eo.hidden_states, central_out.contribution_hidden, eo.wall_time)
+            r_i = self.central.compute_r_i(eo.hidden_states, central_out.contribution_hidden, eo.wall_time, synthesis_hidden=central_out.synthesis_hidden)
             r_out = self.convolution.compute_r_out(eo.expert_id)
             anchor = self.expert_pool.get_historical_anchor(eo.expert_id)
             tkl = self.central.compute_tkl(r_i, r_out, anchor, eo.wall_time)
