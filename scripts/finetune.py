@@ -23,7 +23,13 @@ from experts import ExpertPool
 from gating import GateModel, TripleKSelector, MaskingSchedule, SelectedExpert
 from memory import RoutingMemory, SessionTracker
 from meta import MAMLOptimiser
-from splitter import get_available_ram_mb, measure_expert_ram_mb
+from splitter import (
+    get_available_ram_mb,
+    measure_expert_ram_mb,
+    compute_xy,
+    build_geography_batches,
+    compute_x_expert_splits,
+)
 from training import (
     apply_gate_gradients,
     apply_expert_gradients,
@@ -274,7 +280,10 @@ def run_marathon(
         tokens = mx.array(token_ids)
         n_tokens = len(token_ids)
 
-        gate_out = gate.forward(tokens)
+        # Geography-first look-ahead: ONE gate backbone pass yields both the routing
+        # output and the full-prompt domain topography used to build homogeneous
+        # expert batches below.
+        gate_out, topo = gate.forward_with_topography(tokens)
         k = gate_out.k_per_token
         confidence = gate_out.confidence
         timeline = gate_out.timeline_flag
@@ -357,30 +366,36 @@ def run_marathon(
             sample = next(data_iter, None)
             continue
 
-        # Per-expert fragment + generation length governed by Apex-Nadir R_out
-        # (bootstrap size until that expert's curves have data) — the "first run
-        # gathers context, apex-nadir takes over" handshake; no fixed uniform split.
+        # ── X/Y GEOGRAPHY ───────────────────────────────────────────────────
+        # Split the sequence into domain-homogeneous batches (from the look-ahead
+        # topography), then divide each batch across the selected experts by their
+        # R_out share. X = concurrent experts, Y = cycles; OOM-proof by construction
+        # (Y scales time, never RAM). Each expert hands Central BOTH channels —
+        # hidden states + a REAL generated analysis (length governed by R_out, else
+        # the safety valve). Input fragment size is the R_out share computed here.
+        r_out_mean = max(1.0, convolution.compute_r_out_mean(expert_ids))
+        geometry = compute_xy(
+            max(1, n_tokens), r_out_mean,
+            max(current_ram, float(configs.EXPERT_RAM_MB)),
+            x_override=len(expert_ids),
+        )
+        geo_batches = build_geography_batches(tokens, topo.domain_map, geometry.Y)
         expert_outputs = []
         expert_frag_tokens = []
-        frag_start = 0
-        for sel in selected:
-            if frag_start >= n_tokens:
-                break
-            t_expert = max(configs.FRAGMENT_MIN, int(convolution.r_out_or_bootstrap(sel.expert_id)))
-            frag_end = min(frag_start + t_expert, n_tokens)
-            frag_tokens = tokens[frag_start:frag_end]
-            if frag_tokens.shape[0] < configs.FRAGMENT_MIN:
-                break
-            # Experts hand Central BOTH channels — hidden states + a REAL generated
-            # analysis (no echo). Input size = R_out/bootstrap (above); generation
-            # length is governed separately (R_out when calibrated, else safety valve).
-            eo = expert_pool.expert_forward(
-                sel.expert_id, frag_tokens, generate_text=True,
-                max_tokens=convolution.generation_length(sel.expert_id),
-            )
-            expert_outputs.append(eo)
-            expert_frag_tokens.append(frag_tokens)
-            frag_start = frag_end
+        for gb in geo_batches:
+            if len(gb.token_indices) == 0:
+                continue
+            for frag in compute_x_expert_splits(gb, selected, geometry.X, convolution):
+                if frag.below_nadir or frag.expert_id not in expert_pool.loaded_experts:
+                    continue
+                if frag.tokens.shape[0] < configs.FRAGMENT_MIN:
+                    continue
+                eo = expert_pool.expert_forward(
+                    frag.expert_id, frag.tokens, generate_text=True,
+                    max_tokens=convolution.generation_length(frag.expert_id),
+                )
+                expert_outputs.append(eo)
+                expert_frag_tokens.append(frag.tokens)
 
         if not expert_outputs:
             state.total_tokens += n_tokens
