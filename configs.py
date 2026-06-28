@@ -31,6 +31,12 @@ NUM_EXPERTS = EXPERT_POOL_SIZE
 # measured value replaces this at runtime, so X/Y geometry uses the true cost on
 # whatever hardware Sturnus runs on rather than a hardcoded guess.
 EXPERT_RAM_MB = 850
+# Unified-memory safety. Overcommitting the GPU makes Metal abort the whole process
+# (a command-buffer error, not a catchable Python exception), so concurrent-expert
+# sizing reserves Central + this headroom for 7B activations / expert generation KV
+# cache / the MLX allocator, and never exceeds the hard ceiling regardless of RAM.
+GPU_HEADROOM_MB = 3000
+MAX_CONCURRENT_EXPERTS = 4
 CENTRAL_RAM_MB = 4096
 MIN_BOOT_RAM_MB = 6000
 GATE_D_MODEL = 896
