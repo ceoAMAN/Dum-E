@@ -112,14 +112,13 @@ STARVATION_MIN_ACTIVATIONS = 5   # expert must have this many activations in dom
 OUTER_LOOP_TOKEN_INTERVAL = 500
 DATASET_WEIGHTS_MAC = {
     # ── own data ───────────────────────────────────────────────────────────
-    # De-skewed from 0.46 → 0.10. At 0.46 the "general"-classified local_custom
-    # dominated the mixture, so the gate's domain-routing CE (the recorded loss)
-    # collapsed to ~0 almost immediately — an uninformative training signal. At
-    # 0.10 the four domains are represented closely enough that the routing loss
-    # stays meaningful and the held-out eval (scripts/eval_heldout.py) is honest.
-    "local_custom": 0.10,
+    # 0.0 until data/custom_prompts.jsonl exists — the file is absent, so a non-zero
+    # weight just spams "[data] Error reading local_custom" every loop. Restore to
+    # ~0.10 once own-data is added (it was de-skewed from 0.46 to keep the gate's
+    # routing CE informative).
+    "local_custom": 0.0,
     # ── action / tool-calling layer (highest-leverage new additions) ───────
-    "xlam_function_calling": 0.05,   # Salesforce 60k function-call examples
+    "xlam_function_calling": 0.0,    # SKIP: gated on HF (no access) — request access then restore ~0.05
     "hermes_function_calling": 0.05,  # NousResearch multi-turn tool use
     "glaive_function_calling": 0.03,  # glaive breadth set
     "agent_flan": 0.03,               # Agent-FLAN (includes negative samples)
@@ -146,8 +145,8 @@ DATASET_WEIGHTS_MAC = {
 }
 
 DATASET_WEIGHTS_TAB = {
-    "local_custom": 0.10,
-    "xlam_function_calling": 0.05,
+    "local_custom": 0.0,             # SKIP: no data/custom_prompts.jsonl yet
+    "xlam_function_calling": 0.0,    # SKIP: gated on HF (no access)
     "hermes_function_calling": 0.05,
     "glaive_function_calling": 0.03,
     "agent_flan": 0.03,
