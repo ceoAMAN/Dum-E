@@ -190,6 +190,26 @@ def get_active_memory_mb() -> float:
         return float(mx.get_active_memory()) / (1024 * 1024)
     except Exception:
         return 0.0
+def get_peak_memory_mb() -> float:
+    """MLX high-water-mark memory (MB) since the last reset — captures the transient
+    spike of a forward+generation, which is what actually triggers a Metal OOM."""
+    try:
+        return float(mx.get_peak_memory()) / (1024 * 1024)
+    except Exception:
+        return 0.0
+def reset_peak_memory() -> None:
+    try:
+        mx.reset_peak_memory()
+    except Exception:
+        pass
+def total_physical_ram_mb() -> float:
+    """Physical RAM (MB) from sysctl hw.memsize — a measured hardware fact, not a
+    config constant. Used as the absolute ceiling the MLX peak must stay under."""
+    try:
+        out = subprocess.check_output(["sysctl", "-n", "hw.memsize"], text=True).strip()
+        return float(int(out)) / (1024 * 1024)
+    except Exception:
+        return 0.0
 def get_available_ram_mb() -> float:
     try:
         out = subprocess.check_output(["vm_stat"], text=True)

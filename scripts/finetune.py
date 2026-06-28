@@ -25,11 +25,15 @@ from memory import RoutingMemory, SessionTracker
 from meta import MAMLOptimiser
 from splitter import (
     get_available_ram_mb,
+    get_active_memory_mb,
+    total_physical_ram_mb,
+    reset_peak_memory,
     measure_expert_ram_mb,
     compute_xy,
     build_geography_batches,
     compute_x_expert_splits,
 )
+from diagnostics import Diagnostics
 from training import (
     apply_gate_gradients,
     apply_expert_gradients,
@@ -234,20 +238,21 @@ def run_marathon(
 
     gate_tokenizer = get_tokenizer(configs.GATE_MODEL_ID)
 
-    boot_ram = get_available_ram_mb()
-    measure_expert_ram_mb()   # updates configs.EXPERT_RAM_MB in place to the real per-expert cost
-    current_ram = boot_ram   # cached; refreshed every RAM_REFRESH_BATCHES (vm_stat is a subprocess — too costly per batch)
-    RAM_REFRESH_BATCHES = 25
     FINITE_CHECK_EVERY = 20   # finite-ness guards force a host sync; amortise them
-    # Reserve Central (deferred-loaded, ~CENTRAL_RAM_MB) + GPU headroom for 7B
-    # activations / expert generation / allocator, and cap concurrency hard — an
-    # over-committed unified memory makes Metal abort the whole run.
-    reserve_mb = configs.CENTRAL_RAM_MB + configs.GPU_HEADROOM_MB
-    expert_budget = max(0, boot_ram - reserve_mb)
-    hw_max = min(max(1, int(expert_budget / configs.EXPERT_RAM_MB)), configs.K_MAX, configs.MAX_CONCURRENT_EXPERTS)
-    cache_size = max(1, hw_max)
+    measure_expert_ram_mb()   # measures real per-expert weight RAM -> configs.EXPERT_RAM_MB (cold-start floor)
+    # Load Central now (it would load on batch 1 anyway) so we can measure the real
+    # resident base, then hand the memory governor a MEASURED baseline. No hard
+    # expert cap — concurrency is derived live from measured memory/thermal/load.
+    central.load()
+    base_resident = get_active_memory_mb()
+    usable_peak = base_resident + get_available_ram_mb()   # ceiling the MLX peak may reach
+    diagnostics = Diagnostics()
+    diagnostics.set_memory_baseline(base_resident, usable_peak)
+    x_cap = configs.X_MIN     # cold start: 1 expert; ramps up as real cost is measured
+    cache_size = max(1, diagnostics.memory_ceiling())   # LRU pool size from the measured ceiling
     expert_pool = ExpertPool(convolution=convolution, session_tracker=session_tracker, max_loaded=cache_size)
-    print(f"[boot] RAM={boot_ram:.0f}MB | expert_ram={configs.EXPERT_RAM_MB:.0f}MB(measured) | expert_cap={hw_max} | cache={cache_size}")
+    print(f"[boot] phys={total_physical_ram_mb():.0f}MB base={base_resident:.0f}MB usable_peak={usable_peak:.0f}MB | "
+          f"expert_ram={configs.EXPERT_RAM_MB:.0f}MB(measured) | x_start={x_cap} mem_ceiling={diagnostics.memory_ceiling()} cache={cache_size}")
 
     state = MarathonState()
     bench = BenchmarkRecorder(str(configs.LOG_DIR))   # paper benchmark record (losses, A.2.4, observables)
@@ -268,6 +273,7 @@ def run_marathon(
     # Background prefetch: network streaming + _extract_text for the NEXT sample
     # overlap with the current batch's GPU compute instead of stalling it.
     data_iter = iter(prefetch(iter_mixture_samples(seed=seed)))
+    reset_peak_memory()   # clean high-water mark so batch-1 memory cost is measured fresh
     sample = next(data_iter, None)
 
     while sample is not None:
@@ -352,10 +358,9 @@ def run_marathon(
             sample = next(data_iter, None)
             continue
 
-        if state.total_batches % RAM_REFRESH_BATCHES == 0:
-            current_ram = get_available_ram_mb()   # refresh occasionally, not every batch
-        max_c = min(max(1, int(current_ram // configs.EXPERT_RAM_MB)), configs.K_MAX, hw_max)
-        selected = selected[:max_c]
+        # Concurrency is governed live by the memory/thermal/processing controller
+        # (x_cap), updated at the end of each batch — no static cap.
+        selected = selected[:x_cap]
         requested_ids = [s.expert_id for s in selected]
 
         ids_to_load = [eid for eid in requested_ids if eid not in expert_pool.loaded_experts]
@@ -386,8 +391,7 @@ def run_marathon(
         # the safety valve). Input fragment size is the R_out share computed here.
         r_out_mean = max(1.0, convolution.compute_r_out_mean(expert_ids))
         geometry = compute_xy(
-            max(1, n_tokens), r_out_mean,
-            max(current_ram, float(configs.EXPERT_RAM_MB)),
+            max(1, n_tokens), r_out_mean, usable_peak,
             x_override=len(expert_ids),
         )
         geo_batches = build_geography_batches(tokens, topo.domain_map, geometry.Y)
@@ -548,6 +552,14 @@ def run_marathon(
         state.total_batches += 1
         elapsed = time.time() - t0
 
+        # ── DYNAMIC CONCURRENCY ── learn this batch's real peak-memory cost, fold in
+        # thermal + processing-time, and set next batch's expert count. Cautious
+        # ramp (+1 when healthy, cut under pressure) so it never overshoots into OOM.
+        n_active = len(active_ids)
+        diagnostics.update(state.total_tokens, elapsed, n_active, n_active)
+        diagnostics.observe_memory(n_active)
+        x_cap = diagnostics.recommended_x(n_active)
+
         # ── OBSERVABILITY ── runs UNCONDITIONALLY right after the counter bumps,
         # so logging/checkpointing can never be skipped by a failure in the
         # adaptive block below (the bug that made [learn]/[ckpt] never fire).
@@ -563,6 +575,7 @@ def run_marathon(
                 f"r_i={avg_r_i:.4f} | "
                 f"λ=[eff{lam[0]:.2f} dom{lam[1]:.2f} rel{lam[2]:.2f} div{lam[3]:.2f}] | "
                 f"tok/s={n_tokens/max(elapsed,1e-6):.0f} | "
+                f"x={x_cap}(ceil{diagnostics.memory_ceiling()},{diagnostics._mem_per_expert_mb:.0f}MB/e,{diagnostics._thermal_estimate:.0f}°C) | "
                 f"experts={expert_ids} | "
                 f"{state.elapsed()}",
                 flush=True,
