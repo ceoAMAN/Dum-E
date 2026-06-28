@@ -36,6 +36,7 @@ from training import (
     peer_weight_vector,
 )
 from evaluation import load_eval_set, gate_routing_accuracy
+from benchmarks import BenchmarkRecorder
 
 _PREFETCH_SENTINEL = object()
 
@@ -188,8 +189,13 @@ def run_marathon(
         import shutil
         if Path("state").exists():
             shutil.rmtree("state")
-        if Path("logs/marathon_metrics.json").exists():
-            Path("logs/marathon_metrics.json").unlink()
+        # Wipe per-run append logs so a clean run starts with fresh trajectories
+        # (otherwise benchmark/trajectory rows from a prior run bleed into this one).
+        for _f in ("marathon_metrics.json", "trajectory.csv", "eval.csv",
+                   "benchmarks.csv", "benchmarks_summary.json", "lambda_trajectory.jsonl"):
+            p = Path("logs") / _f
+            if p.exists():
+                p.unlink()
     # Per-batch logging (trajectory.csv) and checkpoints write into these dirs;
     # create them up front so the first print can't crash on a missing directory.
     Path("logs").mkdir(parents=True, exist_ok=True)
@@ -240,6 +246,7 @@ def run_marathon(
     print(f"[boot] RAM={boot_ram:.0f}MB | expert_ram={configs.EXPERT_RAM_MB:.0f}MB(measured) | expert_cap={hw_max} | cache={cache_size}")
 
     state = MarathonState()
+    bench = BenchmarkRecorder(str(configs.LOG_DIR))   # paper benchmark record (losses, A.2.4, observables)
 
     # Balanced held-out set for the mixture-skew-immune signal. Gate routing
     # accuracy is gate-only (cheap) so we can run it at every checkpoint.
@@ -449,8 +456,9 @@ def run_marathon(
         cluster_counts = mx.array(target_list)
 
         # L_gate = λ_eff·L_eff + λ_dom·L_dom + λ_rel·L_rel — trained through the gate's
-        # LoRA backbone AND its learned routing head (GateNet), in one step.
-        batch_loss = apply_gate_gradients(
+        # LoRA backbone AND its learned routing head (GateNet), in one step. Returns
+        # the per-term breakdown for the benchmark record.
+        gate_losses = apply_gate_gradients(
             gate_net=gate.net,
             gate_optimizer=gate_optimizer,
             tokens=tokens,
@@ -468,13 +476,15 @@ def run_marathon(
                      for eid in active_ids if eid in expert_pool.loaded_experts}
         l_div_weight = float(lambdas[3])
 
+        expert_mse_scores = []
+        expert_div_sims = []
         for eo, f_tokens in zip(expert_outputs, expert_frag_tokens):
             if eo.expert_id in expert_pool.loaded_experts:
                 expert_model = expert_pool.loaded_experts[eo.expert_id]
                 if eo.expert_id not in expert_optimizers:
                     expert_optimizers[eo.expert_id] = optim.Adam(learning_rate=configs.LEARNING_RATE)
                 peers = [v for j, v in peer_vecs.items() if j != eo.expert_id and v is not None]
-                apply_expert_gradients(
+                el = apply_expert_gradients(
                     expert_model=expert_model,
                     expert_optimizer=expert_optimizers[eo.expert_id],
                     tokens=f_tokens,
@@ -483,10 +493,27 @@ def run_marathon(
                     l_div_weight=l_div_weight,
                     check_finite=check_finite,
                 )
+                expert_mse_scores.append(el["mse"])
+                expert_div_sims.append(el["l_div_sim"])
 
         mean_r_i = float(np.mean(batch_r_i_scores)) if batch_r_i_scores else 0.0
-        state.loss_history.append(batch_loss)
+        state.loss_history.append(gate_losses["total"])
         state.r_i_history.append(mean_r_i)
+
+        # ── BENCHMARKS ── every loss term, the audit-A.2.4 expert→reply signal
+        # (contribution_norm = ‖synthesis - base‖, the delta experts cause in Central,
+        # + r_i), and the acceptance observables. All from the real run.
+        bench.note_cluster_lookup(cluster_hit is not None)
+        bench.record_batch({
+            "gate_total": gate_losses["total"], "l_eff": gate_losses["l_eff"],
+            "l_dom": gate_losses["l_dom"], "l_rel": gate_losses["l_rel"],
+            "expert_mse": float(np.mean(expert_mse_scores)) if expert_mse_scores else 0.0,
+            "l_div_sim": float(np.mean(expert_div_sims)) if expert_div_sims else 0.0,
+            "r_i": mean_r_i,
+            "contribution_norm": float(mx.linalg.norm(central_out.contribution_hidden).item()),
+            "k": float(len(active_ids)),
+            "recon_entropy": float(central_out.reconstruction_entropy),
+        })
 
         # Routing memory: when this batch routed BETTER than the domain's running
         # average (good route) and we didn't already reuse a cached one, save it as
@@ -551,20 +578,42 @@ def run_marathon(
             # Mixture-skew-immune signal: gate routing accuracy on the balanced
             # held-out set. Unlike avg_loss (gate CE on the skewed mixture) this
             # number is comparable across runs and actually reflects learning.
+            gate_acc = 0.0
             if eval_samples:
                 try:
                     er = gate_routing_accuracy(gate, eval_samples)
+                    gate_acc = er["accuracy"]
                     pd = er["per_domain"]
-                    print(f"[eval] tok={state.total_tokens:,} | gate_acc={er['accuracy']:.1%} | "
+                    print(f"[eval] tok={state.total_tokens:,} | gate_acc={gate_acc:.1%} | "
                           f"code={pd['code']:.0%} reas={pd['reasoning']:.0%} "
                           f"know={pd['knowledge']:.0%} gen={pd['general']:.0%}", flush=True)
                     with open("logs/eval.csv", "a") as _ef:
-                        _ef.write(f"{state.total_batches},{state.total_tokens},{er['accuracy']:.4f},"
+                        _ef.write(f"{state.total_batches},{state.total_tokens},{gate_acc:.4f},"
                                   f"{pd['code']:.4f},{pd['reasoning']:.4f},"
                                   f"{pd['knowledge']:.4f},{pd['general']:.4f}\n")
                         _ef.flush()
                 except Exception as _eval_err:
                     print(f"[warn] held-out eval failed: {type(_eval_err).__name__}: {_eval_err}", flush=True)
+            # Consolidated paper-benchmark row: all loss terms, the A.2.4 expert→reply
+            # signal, and the manual's acceptance observables, in one place.
+            try:
+                k_vels = [v for v in (maml.compute_k_velocity(d) for d in maml.state.k_velocity_records) if v is not None]
+                brow = bench.checkpoint(
+                    batch=state.total_batches,
+                    tokens=state.total_tokens,
+                    cluster_count=len(routing_memory.clusters),
+                    timeline_a_rate=session_tracker.get_timeline_a_rate(),
+                    gate_acc=gate_acc,
+                    expert_weight_std=expert_pool.expert_weight_std(list(expert_pool.loaded_experts.keys())),
+                    k_velocity_mean=float(np.mean(k_vels)) if k_vels else 0.0,
+                )
+                print(f"[bench] L=[eff{brow['l_eff']:.3f} dom{brow['l_dom']:.3f} rel{brow['l_rel']:.3f}] "
+                      f"mse={brow['expert_mse']:.3f} div_sim={brow['l_div_sim']:.3f} | "
+                      f"r_i={brow['r_i']:.3f} contrib={brow['contribution_norm']:.3f} | "
+                      f"wstd={brow['expert_weight_std']:.4f} hit={brow['cluster_hit_rate']:.0%} "
+                      f"kvel={brow['k_velocity_mean']:.2e}", flush=True)
+            except Exception as _bench_err:
+                print(f"[warn] benchmark record failed: {type(_bench_err).__name__}: {_bench_err}", flush=True)
 
         # ── ADAPTIVE ── MAML meta-update + expert migration. Wrapped so any failure
         # here is surfaced as a [warn] instead of silently aborting the rest of the

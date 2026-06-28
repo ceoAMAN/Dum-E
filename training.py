@@ -96,7 +96,7 @@ def apply_gate_gradients(
     l_eff_targets: Optional[Dict[int, float]] = None,
     staleness: Optional[Dict[int, float]] = None,
     check_finite: bool = True,
-) -> float:
+) -> Dict[str, float]:
     """One L_gate step over the whole gate (backbone LoRA + route_head):
 
         L_gate = λ_eff·L_eff + λ_dom·L_dom + λ_rel·L_rel
@@ -108,12 +108,14 @@ def apply_gate_gradients(
     active = active_expert_ids or []
     targets = l_eff_targets or {}
     stale = staleness or {}
+    terms: Dict[str, mx.array] = {}   # capture each L_gate term for benchmark logging
 
     def gate_loss_fn(net):
         domain_logits, route_logits = _gate_route_outputs(net, tokens)
         l_dom = compute_l_dom(domain_logits, routing_density)
         l_eff = compute_l_eff_loss(route_logits, active, targets)
         l_rel = compute_l_rel(route_logits, active, stale)
+        terms["l_eff"], terms["l_dom"], terms["l_rel"] = l_eff, l_dom, l_rel
         return lambdas[0] * l_eff + lambdas[1] * l_dom + lambdas[2] * l_rel
 
     loss, grads = nn.value_and_grad(gate_net, gate_loss_fn)(gate_net)
@@ -121,13 +123,19 @@ def apply_gate_gradients(
     # through corrupts the weights permanently (every later batch goes NaN). Skip
     # the step instead. check_finite only gates the cheaper post-update param sweep.
     if not _is_finite_scalar(loss) or not _tree_is_finite(grads):
-        return 0.0
+        return {"total": 0.0, "l_eff": 0.0, "l_dom": 0.0, "l_rel": 0.0}
     grads, _ = optim.clip_grad_norm(grads, configs.GRAD_CLIP_NORM)
     gate_optimizer.update(gate_net, grads)
     mx.eval(gate_net.parameters(), gate_optimizer.state)
     if check_finite and not _tree_is_finite(gate_net.trainable_parameters()):
-        return 0.0
-    return float(loss.item())
+        return {"total": 0.0, "l_eff": 0.0, "l_dom": 0.0, "l_rel": 0.0}
+    mx.eval(loss, terms["l_eff"], terms["l_dom"], terms["l_rel"])  # cheap scalars, already on the loss graph
+    return {
+        "total": float(loss.item()),
+        "l_eff": float(terms["l_eff"].item()),
+        "l_dom": float(terms["l_dom"].item()),
+        "l_rel": float(terms["l_rel"].item()),
+    }
 
 
 def apply_expert_gradients(
@@ -138,7 +146,7 @@ def apply_expert_gradients(
     peer_weights: Optional[List[mx.array]] = None,
     l_div_weight: float = 0.0,
     check_finite: bool = True,
-) -> float:
+) -> Dict[str, float]:
     """One expert step toward Central's synthesis, plus optional peer repulsion:
 
         L_expert = MSE(expert_hidden, synthesis) + λ_div · mean_j cos(W_i, W_j)
@@ -150,6 +158,7 @@ def apply_expert_gradients(
     specialise instead of collapsing into clones.
     """
     peers = peer_weights or []
+    terms: Dict[str, mx.array] = {}   # capture MSE and peer-similarity for benchmark logging
 
     def expert_loss_fn(model):
         token_batch = mx.array(tokens, dtype=mx.int32).reshape(1, -1)
@@ -161,25 +170,35 @@ def apply_expert_gradients(
         else:
             hidden_mean = hidden_out
         min_dim = min(hidden_mean.shape[0], central_synthesis.shape[0])
-        loss = mx.mean((hidden_mean[:min_dim] - central_synthesis[:min_dim]) ** 2)
+        mse = mx.mean((hidden_mean[:min_dim] - central_synthesis[:min_dim]) ** 2)
+        terms["mse"] = mse
+        loss = mse
         if peers and l_div_weight > 0.0:
             w_i = flatten_params(model.trainable_parameters())
             if w_i is not None:
                 w_i_n = w_i / (mx.linalg.norm(w_i) + 1e-8)
                 sims = mx.stack([mx.sum(w_i_n * pj) for pj in peers])  # cos sim to each peer (pre-normalised, detached)
-                loss = loss + l_div_weight * mx.mean(sims)            # mean repulsion across all peers
+                mean_sim = mx.mean(sims)                               # mean peer similarity (lower = more diverged)
+                terms["sim"] = mean_sim
+                loss = loss + l_div_weight * mean_sim
         return loss
 
     loss, grads = nn.value_and_grad(expert_model, expert_loss_fn)(expert_model)
     # Finite guard is non-optional before the update (see apply_gate_gradients).
     if not _is_finite_scalar(loss) or not _tree_is_finite(grads):
-        return 0.0
+        return {"total": 0.0, "mse": 0.0, "l_div_sim": 0.0}
     grads, _ = optim.clip_grad_norm(grads, configs.GRAD_CLIP_NORM)
     expert_optimizer.update(expert_model, grads)
     mx.eval(expert_model.parameters(), expert_optimizer.state)
     if check_finite and not _tree_is_finite(expert_model.trainable_parameters()):
-        return 0.0
-    return float(loss.item())
+        return {"total": 0.0, "mse": 0.0, "l_div_sim": 0.0}
+    sim_arr = terms.get("sim")
+    mx.eval(loss, terms["mse"], *( [sim_arr] if sim_arr is not None else [] ))
+    return {
+        "total": float(loss.item()),
+        "mse": float(terms["mse"].item()),
+        "l_div_sim": float(sim_arr.item()) if sim_arr is not None else 0.0,
+    }
 
 
 def peer_weight_vector(model) -> Optional[mx.array]:
