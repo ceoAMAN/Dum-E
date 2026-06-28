@@ -239,9 +239,13 @@ def run_marathon(
     current_ram = boot_ram   # cached; refreshed every RAM_REFRESH_BATCHES (vm_stat is a subprocess — too costly per batch)
     RAM_REFRESH_BATCHES = 25
     FINITE_CHECK_EVERY = 20   # finite-ness guards force a host sync; amortise them
-    expert_budget = max(0, boot_ram - 4000)
-    hw_max = min(max(1, int(expert_budget / configs.EXPERT_RAM_MB)), configs.K_MAX)
-    cache_size = max(2, hw_max)
+    # Reserve Central (deferred-loaded, ~CENTRAL_RAM_MB) + GPU headroom for 7B
+    # activations / expert generation / allocator, and cap concurrency hard — an
+    # over-committed unified memory makes Metal abort the whole run.
+    reserve_mb = configs.CENTRAL_RAM_MB + configs.GPU_HEADROOM_MB
+    expert_budget = max(0, boot_ram - reserve_mb)
+    hw_max = min(max(1, int(expert_budget / configs.EXPERT_RAM_MB)), configs.K_MAX, configs.MAX_CONCURRENT_EXPERTS)
+    cache_size = max(1, hw_max)
     expert_pool = ExpertPool(convolution=convolution, session_tracker=session_tracker, max_loaded=cache_size)
     print(f"[boot] RAM={boot_ram:.0f}MB | expert_ram={configs.EXPERT_RAM_MB:.0f}MB(measured) | expert_cap={hw_max} | cache={cache_size}")
 

@@ -78,14 +78,10 @@ else
   rm -f "$LOG_FILE" "$PID_FILE"
 fi
 
-# ── launch caffeinated + detached ────────────────────────────────────────────
+# ── launch caffeinated + detached (with auto-resume loop) ────────────────────
 caffeinate -dimsu & CAF_PID=$!
-nohup env PYTHONUNBUFFERED=1 PYTHONFAULTHANDLER=1 HF_TOKEN="${HF_TOKEN}" \
-  HF_HUB_DISABLE_PROGRESS_BARS=1 TRANSFORMERS_VERBOSITY=error \
-  "$PYTHON_BIN" "$ROOT/scripts/finetune.py" \
-    $CLEAN_ARG --max-tokens "$MAX_TOKENS" \
-    --print-every-batches "$PRINT_EVERY" \
-    --checkpoint-every-batches "$CHECKPOINT_EVERY" --seed "$SEED" \
+nohup bash "$ROOT/scripts/_dume_loop.sh" \
+  "$PYTHON_BIN" "$MAX_TOKENS" "$PRINT_EVERY" "$CHECKPOINT_EVERY" "$SEED" "$CLEAN_ARG" \
   > "$LOG_FILE" 2>&1 &
 PID=$!
 echo "$PID" > "$PID_FILE"
@@ -104,5 +100,5 @@ else
   _err "process died during boot — last log:"; tail -n 30 "$LOG_FILE" 2>/dev/null; exit 1
 fi
 echo ""
-echo -e "${GRN}${BLD}☕ Dum-E is training with the lid open. Monitor: tail -f ${LOG_FILE}${RST}"
-echo -e "${CYN}   stop: kill -INT \$(cat ${PID_FILE})   |   then: kill ${CAF_PID}  (caffeinate)${RST}\n"
+echo -e "${GRN}${BLD}☕ Dum-E is training (auto-resumes on transient GPU errors). Monitor: tail -f ${LOG_FILE}${RST}"
+echo -e "${CYN}   stop: pkill -INT -f finetune.py   (graceful; loop won't resume)  then  pkill caffeinate${RST}\n"
