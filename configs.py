@@ -233,6 +233,11 @@ LORA_R = 8
 LORA_ALPHA = 16
 LORA_DROPOUT = 0.05
 LEARNING_RATE = 2e-5
+# Gradient-norm clip applied before every gate/expert optimizer step. The 3-term
+# L_gate over the routing head can spike on real data; clipping bounds the update
+# so a single bad batch can't blow weights to NaN (the finite guard then skips any
+# residual non-finite step).
+GRAD_CLIP_NORM = 1.0
 # The gate's learned expert-routing head (gating.GateNet.route_head) emits a
 # preference logit per expert. select_experts blends that learned preference with
 # the Apex-Nadir distance-to-peak: final_rank = distance_to_peak - ROUTE_BIAS_W *

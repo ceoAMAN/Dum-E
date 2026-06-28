@@ -2,7 +2,9 @@ from __future__ import annotations
 from typing import Dict, List, Optional
 import mlx.core as mx
 import mlx.nn as nn
+import mlx.optimizers as optim
 from mlx.utils import tree_flatten
+import configs
 
 
 # ── finite guards ───────────────────────────────────────────────────────────
@@ -115,8 +117,12 @@ def apply_gate_gradients(
         return lambdas[0] * l_eff + lambdas[1] * l_dom + lambdas[2] * l_rel
 
     loss, grads = nn.value_and_grad(gate_net, gate_loss_fn)(gate_net)
-    if check_finite and (not _is_finite_scalar(loss) or not _tree_is_finite(grads)):
+    # Finite guard is NON-optional before the update: a NaN/Inf gradient that slips
+    # through corrupts the weights permanently (every later batch goes NaN). Skip
+    # the step instead. check_finite only gates the cheaper post-update param sweep.
+    if not _is_finite_scalar(loss) or not _tree_is_finite(grads):
         return 0.0
+    grads, _ = optim.clip_grad_norm(grads, configs.GRAD_CLIP_NORM)
     gate_optimizer.update(gate_net, grads)
     mx.eval(gate_net.parameters(), gate_optimizer.state)
     if check_finite and not _tree_is_finite(gate_net.trainable_parameters()):
@@ -160,13 +166,15 @@ def apply_expert_gradients(
             w_i = flatten_params(model.trainable_parameters())
             if w_i is not None:
                 w_i_n = w_i / (mx.linalg.norm(w_i) + 1e-8)
-                sims = [mx.sum(w_i_n * pj) for pj in peers]   # pj pre-normalised + detached
-                loss = loss + l_div_weight * (mx.add(*sims) / len(sims) if len(sims) > 1 else sims[0])
+                sims = mx.stack([mx.sum(w_i_n * pj) for pj in peers])  # cos sim to each peer (pre-normalised, detached)
+                loss = loss + l_div_weight * mx.mean(sims)            # mean repulsion across all peers
         return loss
 
     loss, grads = nn.value_and_grad(expert_model, expert_loss_fn)(expert_model)
-    if check_finite and (not _is_finite_scalar(loss) or not _tree_is_finite(grads)):
+    # Finite guard is non-optional before the update (see apply_gate_gradients).
+    if not _is_finite_scalar(loss) or not _tree_is_finite(grads):
         return 0.0
+    grads, _ = optim.clip_grad_norm(grads, configs.GRAD_CLIP_NORM)
     expert_optimizer.update(expert_model, grads)
     mx.eval(expert_model.parameters(), expert_optimizer.state)
     if check_finite and not _tree_is_finite(expert_model.trainable_parameters()):
