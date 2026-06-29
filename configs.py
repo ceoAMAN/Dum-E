@@ -43,7 +43,7 @@ CENTRAL_D_MODEL = 4096
 FRAGMENT_MIN = 32
 OVERLAP_FRACTION = 0.175
 K_MIN = 0
-K_MAX = 20
+K_MAX = 6        # highest experts-per-token the gate may request
 K_DEFAULT = 4
 # Input-tokenisation safety ceiling ONLY — the longest token sequence we ever
 # read in for a single sample. It is NOT the expert operating point: how many
@@ -88,9 +88,17 @@ CLUSTER_CONFIDENCE_FLOOR = 0.4
 FAST_PATH_THRESHOLD = 0.70
 THERMAL_SAMPLE_INTERVAL = 1
 THERMAL_THROTTLE_TEMP = 85.0
+# Concurrency back-off ratios for the live expert governor (diagnostics). These are
+# RELATIVE to runtime metrics (throttle temp / best observed throughput), not
+# absolute walls — back off above THERMAL_BACKOFF_FRAC of the throttle temp, or
+# when throughput drops below THROUGHPUT_COLLAPSE_FRAC of the best seen this run.
+THERMAL_BACKOFF_FRAC = 0.9
+THROUGHPUT_COLLAPSE_FRAC = 0.5
 DIAGNOSTICS_SAVE_PATH = "state/diagnostics.pkl"
 X_MIN = 1
-X_MAX = 7
+X_MAX = 6        # soft ceiling: most experts that may run concurrently. The live
+                 # memory/thermal/throughput governor decides the ACTUAL count <= this
+                 # each batch; this is just the highest it is ever allowed to reach.
 LAMBDA_INIT = [0.25, 0.25, 0.25, 0.25]
 ALPHA_LR = 1e-4
 BETA_LR = 1e-5
@@ -220,6 +228,20 @@ DATASET_IDS = {
     "openhermes": ("teknium/OpenHermes-2.5", None, "train"),
     "wikipedia": ("wikimedia/wikipedia", "20231101.en", "train"),
     "openassistant": ("OpenAssistant/oasst2", None, "train"),
+}
+# Ground-truth domain per dataset — the dataset's provenance IS its domain (gsm8k is
+# reasoning, CodeFeedback is code), so the gate's L_dom target comes from here rather
+# than keyword-sniffing the text. Anything unmapped falls back to general.
+DATASET_DOMAINS = {
+    "the_stack": "code", "github_code": "code", "python_instructions": "code",
+    "gsm8k": "reasoning", "metamath": "reasoning", "math": "reasoning",
+    "camel_science": "knowledge", "ai2_arc": "knowledge", "redpajama": "knowledge",
+    "dolma": "knowledge", "wikipedia": "knowledge",
+    "ultrachat": "general", "slimorca": "general", "wizardlm_evol": "general",
+    "tulu_v2": "general", "open_platypus": "general", "openhermes": "general",
+    "openassistant": "general", "local_custom": "general",
+    "xlam_function_calling": "general", "hermes_function_calling": "general",
+    "glaive_function_calling": "general", "agent_flan": "general", "agentinstruct_zai": "general",
 }
 DATASET_BOOT_TIMEOUT = 60.0
 DATASET_SAMPLE_TIMEOUT = 5.0

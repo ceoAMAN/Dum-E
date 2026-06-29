@@ -6,9 +6,12 @@ from pathlib import Path
 from typing import Dict, List, Optional, Set
 import mlx.core as mx
 import mlx.nn as nn
-import numpy as np
 import configs
 from apex_nadir_convolution import ApexNadirConvolution
+
+# Domain slots, in the order the gate's first 4 domain-logit dims map to and the
+# L_dom one-hot target uses. Single source of truth shared by routing + topography.
+DOMAINS = ["code", "reasoning", "knowledge", "general"]
 @dataclass
 class DomainTopography:
     domain_map: Dict[int, str]
@@ -101,9 +104,7 @@ class GateModel:
             end = min(start + chunk_size, total)
             chunk_hidden = hidden[0, start:end, :]
             mean_hidden = mx.mean(chunk_hidden, axis=0)
-            mx.eval(mean_hidden)
-            vals = mean_hidden.tolist()
-            domain = self._classify_domain(vals)
+            domain = self._domain_from_mean_hidden(mean_hidden)
             for idx in range(start, end):
                 domain_map[idx] = domain
             domain_counts[domain] = domain_counts.get(domain, 0) + (end - start)
@@ -123,18 +124,15 @@ class GateModel:
         gate_out = self.forward(tokens, hidden=hidden)
         topo = self._topography_from_hidden(hidden, int(tokens.shape[0]))
         return gate_out, topo
-    def _classify_domain(self, hidden_values: list) -> str:
-        if not hidden_values:
-            return "general"
-        variance = float(np.var(hidden_values[:64]))
-        mean_abs = float(np.mean(np.abs(hidden_values[:64])))
-        if variance > 2.0:
-            return "code"
-        if mean_abs > 1.5:
-            return "reasoning"
-        if mean_abs < 0.3:
-            return "knowledge"
-        return "general"
+    def _domain_from_mean_hidden(self, mean_hidden: mx.array) -> str:
+        """Domain of a (chunk) mean hidden state from the gate's LEARNED domain head:
+        the same z-score → domain_logits[:4] argmax that forward() uses for routing.
+        No hardcoded variance/magnitude thresholds — the trained gate decides."""
+        h = mx.clip(mean_hidden, -1e4, 1e4)
+        mu = mx.mean(h)
+        sigma = mx.sqrt(mx.mean((h - mu) ** 2) + 1e-8)
+        domain_logits = ((h - mu) / (sigma + 1e-8))[:len(DOMAINS)]
+        return DOMAINS[int(mx.argmax(domain_logits).item())]
     def forward(self, tokens: mx.array, hidden: mx.array = None) -> GateOutput:
         self.load()
         # Reuse a precomputed backbone pass when the caller already ran one
@@ -219,11 +217,10 @@ class TripleKSelector:
             self.beta_experts[domain] = experts[n_alpha:]
             self.k_pd[domain] = list(experts)
     def select_experts(self, gate_output: GateOutput, session_tracker, masking_schedule: MaskingSchedule, batch_id: int = 0, loaded_experts=None) -> List[SelectedExpert]:
-        domains = ["code", "reasoning", "knowledge", "general"]
         domain = "general"
         logits = gate_output.domain_logits
-        if logits is not None and logits.shape[0] >= len(domains):
-            domain = domains[int(mx.argmax(logits[:len(domains)]).item())]
+        if logits is not None and logits.shape[0] >= len(DOMAINS):
+            domain = DOMAINS[int(mx.argmax(logits[:len(DOMAINS)]).item())]
         # k=0 means "Timeline A" (no experts) — but that path never calls
         # select_experts. Whenever we ARE selecting (Timeline B / training), we need
         # at least one expert; otherwise selected[:0] == [] and the caller skips the

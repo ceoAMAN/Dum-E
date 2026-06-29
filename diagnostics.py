@@ -93,7 +93,19 @@ class Diagnostics:
         if self._mem_usable_mb <= 0.0:
             return configs.X_MAX
         room = max(0.0, self._mem_usable_mb - self._mem_base_mb - self._mem_shared_mb)
-        return max(configs.X_MIN, int(room / max(self._mem_per_expert_mb, 1.0)))
+        fits = int(room / max(self._mem_per_expert_mb, 1.0))
+        return max(configs.X_MIN, min(configs.X_MAX, fits))   # soft ceiling X_MAX
+
+    def _time_pressure(self, recent_time: float) -> bool:
+        """True if recent batch time is well above the run's fastest (unthrottled)
+        batch — a RELATIVE, self-calibrating slowdown signal (replaces a hardcoded
+        absolute-seconds wall that mis-fired on every 7B+generation batch)."""
+        if len(self.history) < 3:
+            return False
+        times = [s.time_in_bound for s in self.history if s.time_in_bound > 0.0]
+        if not times:
+            return False
+        return recent_time > 2.0 * min(times)
 
     def _recent_tps(self) -> Optional[float]:
         """Tokens/sec of the most recent batch (per-batch delta / its wall time)."""
@@ -115,16 +127,17 @@ class Diagnostics:
         mem_cap = self.memory_ceiling()
         if mem_cap < x_used_last:                       # memory tightened — drop to fit now
             return max(configs.X_MIN, mem_cap)
-        thermal_hot = bool(self.history) and self.history[-1].thermal_state > configs.THERMAL_THROTTLE_TEMP * 0.9
+        thermal_hot = bool(self.history) and self.history[-1].thermal_state > configs.THERMAL_THROTTLE_TEMP * configs.THERMAL_BACKOFF_FRAC
         tps = self._recent_tps()
         if tps is not None:
             self._best_tps = max(getattr(self, "_best_tps", 0.0), tps)
         throughput_collapse = (
-            tps is not None and getattr(self, "_best_tps", 0.0) > 0.0 and tps < 0.5 * self._best_tps
+            tps is not None and getattr(self, "_best_tps", 0.0) > 0.0
+            and tps < configs.THROUGHPUT_COLLAPSE_FRAC * self._best_tps
         )
         if thermal_hot or throughput_collapse:
             return max(configs.X_MIN, min(mem_cap, x_used_last - 1))   # back off under real pressure
-        return max(configs.X_MIN, min(mem_cap, x_used_last + 1))       # cautious ramp up
+        return max(configs.X_MIN, min(mem_cap, x_used_last + 1))       # cautious ramp up (mem_cap <= X_MAX)
 
     def update(self, tokens_processed: int, time_in_bound: float, x_used: int, k_used: int) -> int:
         ram_headroom_mb = self._read_ram()
@@ -165,7 +178,7 @@ class Diagnostics:
                 not self._thermal_is_exact
                 and len(self.history) >= 3
                 and (
-                    recent_avg_time > 2.5
+                    self._time_pressure(recent_avg_time)
                     or recent_avg_thermal > configs.THERMAL_THROTTLE_TEMP * 0.82
                 )
             )
@@ -353,7 +366,7 @@ class Diagnostics:
                 recent = self.history[-3:]
                 recent_time = sum(snap.time_in_bound for snap in recent) / len(recent)
                 recent_thermal = sum(snap.thermal_state for snap in recent) / len(recent)
-                if recent_time > 2.5 or recent_thermal > configs.THERMAL_THROTTLE_TEMP * 0.82:
+                if self._time_pressure(recent_time) or recent_thermal > configs.THERMAL_THROTTLE_TEMP * 0.82:
                     x_pred = min(x_pred, max(float(configs.X_MIN), float(recent[-1].x_used - 1)))
 
             return max(configs.X_MIN, min(configs.X_MAX, round(x_pred)))
