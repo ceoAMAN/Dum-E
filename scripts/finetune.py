@@ -4,6 +4,8 @@ import queue
 import signal
 import threading
 import time
+from collections import defaultdict, deque
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator
 import sys
@@ -256,6 +258,12 @@ def run_marathon(
 
     state = MarathonState()
     bench = BenchmarkRecorder(str(configs.LOG_DIR))   # paper benchmark record (losses, A.2.4, observables)
+    # Live apex-nadir calibration: accumulate (token_count, r_i quality, wall_time)
+    # per expert and refit its quality/latency curves at checkpoints, so R_alpha/R_out
+    # become per-expert and data-driven during training (no offline buffet needed).
+    expert_calib: Dict[int, Dict[str, deque]] = defaultdict(
+        lambda: {"tc": deque(maxlen=256), "q": deque(maxlen=256), "wt": deque(maxlen=256)}
+    )
 
     # Balanced held-out set for the mixture-skew-immune signal. Gate routing
     # accuracy is gate-only (cheap) so we can run it at every checkpoint.
@@ -287,7 +295,9 @@ def run_marathon(
             sample = next(data_iter, None)
             continue
 
-        domain = classify_domain(text)
+        # Domain label = dataset provenance (ground truth), keyword-sniff only as a
+        # fallback for unmapped/local data.
+        domain = configs.DATASET_DOMAINS.get(sample.source) or classify_domain(text)
         token_ids = gate_tokenizer.encode(text)[:configs.MAX_SEQ_LEN]
         if len(token_ids) < configs.FRAGMENT_MIN:
             sample = next(data_iter, None)
@@ -308,12 +318,11 @@ def run_marathon(
         if deployment or configs.DEPLOYMENT:
             timeline = "A"
         else:
-            # During training always explore timeline B so the gate receives
-            # gradient signal from l_dom. It learns routing via the supervision
-            # from classify_domain(text); we only trust its own confidence for
-            # inference after training is complete.
+            # During training always explore timeline B so the gate receives L_dom/
+            # L_eff/L_rel gradient. The number of experts to RUN is the live governor's
+            # x_cap (memory/thermal/throughput-derived) — not a fixed K.
             timeline = "B"
-            k = configs.K_DEFAULT
+            k = x_cap
 
         if timeline == "A":
             state.timeline_a_count += 1
@@ -342,7 +351,7 @@ def run_marathon(
             sample = next(data_iter, None)
             continue
 
-        k = max(1, k)
+        k = max(1, k)   # = x_cap: the governor's expert count for this batch
 
         cluster_hit = routing_memory.lookup(gate_out.hidden_states)
         if cluster_hit is not None:
@@ -350,7 +359,9 @@ def run_marathon(
             selected = [SelectedExpert(expert_id=eid, distance_to_peak=0.0, domain=domain, is_alpha=False) for eid in selected_ids]
         else:
             loaded_set = set(expert_pool.loaded_experts.keys())
-            selected = triple_k.select_experts(gate_out, session_tracker, masking, state.total_batches, loaded_set)
+            # Force the selection count to the governor's k so the live controller —
+            # not the gate's raw k_per_token — decides how many experts run.
+            selected = triple_k.select_experts(replace(gate_out, k_per_token=k), session_tracker, masking, state.total_batches, loaded_set)
 
         if not selected:
             state.total_tokens += n_tokens
@@ -358,9 +369,6 @@ def run_marathon(
             sample = next(data_iter, None)
             continue
 
-        # Concurrency is governed live by the memory/thermal/processing controller
-        # (x_cap), updated at the end of each batch — no static cap.
-        selected = selected[:x_cap]
         requested_ids = [s.expert_id for s in selected]
 
         ids_to_load = [eid for eid in requested_ids if eid not in expert_pool.loaded_experts]
@@ -451,6 +459,10 @@ def run_marathon(
             session_tracker.record_activation(eo.expert_id, eo.token_count, r_i, eo.wall_time, tkl, domain)
             expert_pool.update_domain_score(eo.expert_id, domain, r_i)
             central.update_r_t(eo.expert_id, eo.token_count, eo.wall_time, convolution)
+
+            # Feed the live apex-nadir calibration: (tokens, quality=r_i, wall_time).
+            cal = expert_calib[eo.expert_id]
+            cal["tc"].append(int(eo.token_count)); cal["q"].append(float(r_i)); cal["wt"].append(float(eo.wall_time))
 
             batch_r_i_scores.append(r_i)
             tkl_scores[eo.expert_id] = tkl
@@ -587,6 +599,15 @@ def run_marathon(
                 _tf.flush()
 
         if state.total_batches % checkpoint_every == 0:
+            # Refit each expert's apex/nadir/latency curves from its accumulated live
+            # (tokens, r_i, wall_time) — needs >=3 samples spanning >=2 token counts.
+            for _eid, _cal in expert_calib.items():
+                if len(_cal["tc"]) >= 3 and len(set(_cal["tc"])) >= 2:
+                    convolution.fit_curves_from_calibration(_eid, {
+                        "token_counts": list(_cal["tc"]),
+                        "quality_scores": list(_cal["q"]),
+                        "wall_times": list(_cal["wt"]),
+                    })
             routing_memory.merge_close_clusters()        # fold near-duplicate routes
             routing_memory.prune_stale(state.total_tokens)  # drop cold low-confidence ones
             save_checkpoint(state, convolution, routing_memory, maml, gate)
