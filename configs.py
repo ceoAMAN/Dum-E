@@ -50,12 +50,12 @@ K_DEFAULT = 4
 # tokens each expert actually processes/generates is governed per-expert by the
 # Apex-Nadir Convolution (R_out), bootstrapped from EXPERT_BOOTSTRAP_TOKENS until
 # the curves have data. Keep generous; apex-nadir decides the real working size.
-MAX_SEQ_LEN = 512
+MAX_SEQ_LEN = 256   # lowered from 512 for 16GB: halves the 7B-forward activation spike
 # Cold-start expert fragment/generation size, used ONLY before the convolution has
 # enough latency/quality data to produce an R_out for an expert (compute_r_out
 # returns None until then). Once R_out exists it governs and this is ignored —
 # the "first run gathers context, apex-nadir takes over" handshake.
-EXPERT_BOOTSTRAP_TOKENS = 256
+EXPERT_BOOTSTRAP_TOKENS = 128
 # Hard safety valve for expert generation length when R_out is unknown or the
 # convolution call fails. Not the operating point — apex-nadir's R_out is.
 EXPERT_GEN_MAX_TOKENS = 48
@@ -122,38 +122,30 @@ ALPHA_PROTECTION_THRESHOLD = 0.5
 EMA_DECAY = 0.99
 STARVATION_MIN_ACTIVATIONS = 5   # expert must have this many activations in domain before eviction
 OUTER_LOOP_TOKEN_INTERVAL = 500
+# LEAN 8-dataset mixture for 16GB stability: balanced across all 4 domains (each
+# ~0.25) with LIGHT streams only. 19 concurrent HF streams' Arrow buffers were a
+# multi-GB RAM hog that OOM'd the 7B+experts run; the heavy web crawls (c4/dolma,
+# fineweb) and large sets (the_stack/CodeFeedback, tulu, ultrachat-200k) are dropped.
+# Re-enable more once running on a bigger machine.
 DATASET_WEIGHTS_MAC = {
-    # ── own data ───────────────────────────────────────────────────────────
-    # 0.0 until data/custom_prompts.jsonl exists — the file is absent, so a non-zero
-    # weight just spams "[data] Error reading local_custom" every loop. Restore to
-    # ~0.10 once own-data is added (it was de-skewed from 0.46 to keep the gate's
-    # routing CE informative).
-    "local_custom": 0.0,
-    # ── action / tool-calling layer (highest-leverage new additions) ───────
-    "xlam_function_calling": 0.0,    # SKIP: gated on HF (no access) — request access then restore ~0.05
-    "hermes_function_calling": 0.05,  # NousResearch multi-turn tool use
-    "glaive_function_calling": 0.03,  # glaive breadth set
-    "agent_flan": 0.03,               # Agent-FLAN (includes negative samples)
-    "agentinstruct_zai": 0.02,        # ReAct-style gold trajectories
-    # ── existing datasets (scaled ~0.84× to make room) ────────────────────
-    "slimorca": 0.03,
-    "wizardlm_evol": 0.03,
-    "tulu_v2": 0.04,
-    "open_platypus": 0.02,
-    "ultrachat": 0.04,
-    "metamath": 0.03,
-    "math": 0.02,
-    "gsm8k": 0.02,
-    "the_stack": 0.03,
-    "github_code": 0.03,
-    "python_instructions": 0.01,
-    "camel_science": 0.01,
-    "ai2_arc": 0.01,
-    "redpajama": 0.02,
-    "dolma": 0.02,
-    "openhermes": 0.0,      # SKIP: timeout/hang
-    "wikipedia": 0.0,       # SKIP: timeout/hang
-    "openassistant": 0.0,   # SKIP: stream deadlock
+    # code (0.25)
+    "github_code": 0.15,            # CodeAlpaca_20K — light
+    "python_instructions": 0.10,    # python_code_instructions_18k — light
+    # reasoning (0.25)
+    "gsm8k": 0.15,
+    "metamath": 0.10,
+    # knowledge (0.25)
+    "ai2_arc": 0.15,
+    "camel_science": 0.10,          # sciq
+    # general (0.25)
+    "slimorca": 0.15,
+    "ultrachat": 0.10,
+    # ── disabled for the lean 16GB run (0.0) ──
+    "local_custom": 0.0, "xlam_function_calling": 0.0, "hermes_function_calling": 0.0,
+    "glaive_function_calling": 0.0, "agent_flan": 0.0, "agentinstruct_zai": 0.0,
+    "wizardlm_evol": 0.0, "tulu_v2": 0.0, "open_platypus": 0.0, "math": 0.0,
+    "the_stack": 0.0, "redpajama": 0.0, "dolma": 0.0,
+    "openhermes": 0.0, "wikipedia": 0.0, "openassistant": 0.0,
 }
 
 DATASET_WEIGHTS_TAB = {
