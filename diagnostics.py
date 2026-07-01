@@ -87,6 +87,19 @@ class Diagnostics:
             self._mem_shared_mb = 0.0
             self._mem_per_expert_mb = max(floor, o / max(x, 1.0))
 
+    def set_usable(self, usable_mb: float) -> None:
+        """Refresh the usable-RAM ceiling from a LIVE measurement so it tracks RAM
+        that other consumers (e.g. HF data-stream buffers) take AFTER boot — the
+        boot-time value was too optimistic and let peak grow into a Metal OOM."""
+        if usable_mb > 0.0:
+            self._mem_usable_mb = usable_mb
+
+    def can_fit_expert(self) -> bool:
+        """True if there is measured room for at least one expert's marginal cost.
+        When False the caller should run Central-only for that batch (no OOM)."""
+        room = self._mem_usable_mb - self._mem_base_mb - self._mem_shared_mb
+        return room >= self._mem_per_expert_mb
+
     def memory_ceiling(self) -> int:
         """Max experts that fit under the measured usable-RAM ceiling, given the
         fitted shared spike + per-expert cost."""

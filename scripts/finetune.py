@@ -22,7 +22,7 @@ from apex_nadir_convolution import ApexNadirConvolution
 from central import CentralModel
 from data import authenticate_huggingface, iter_mixture_samples, get_tokenizer
 from experts import ExpertPool
-from gating import GateModel, TripleKSelector, MaskingSchedule, SelectedExpert
+from gating import GateModel, TripleKSelector, MaskingSchedule, SelectedExpert, DOMAINS
 from memory import RoutingMemory, SessionTracker
 from meta import MAMLOptimiser
 from splitter import (
@@ -369,6 +369,31 @@ def run_marathon(
             sample = next(data_iter, None)
             continue
 
+        # Live RAM guard (refresh usable from CURRENT free RAM — catches stream
+        # buffers that grew after boot). If there isn't measured room for even one
+        # expert, train Central+gate only this batch (L_dom) — prevents the Metal
+        # OOM; experts resume automatically once RAM frees.
+        diagnostics.set_usable(get_active_memory_mb() + get_available_ram_mb())
+        if not diagnostics.can_fit_expert():
+            central.forward(text, [], send_to_user=False)
+            tgt = [0.0, 0.0, 0.0, 0.0]
+            tgt[DOMAINS.index(domain) if domain in DOMAINS else 3] = 1.0
+            apply_gate_gradients(
+                gate_net=gate.net, gate_optimizer=gate_optimizer, tokens=tokens,
+                lambdas=maml.get_lambdas(), routing_density=mx.array(tgt),
+                active_expert_ids=[], l_eff_targets={}, staleness={},
+                check_finite=(state.total_batches % FINITE_CHECK_EVERY == 0),
+            )
+            state.total_tokens += n_tokens
+            state.total_batches += 1
+            diagnostics.update(state.total_tokens, time.time() - t0, 0, 0)
+            x_cap = diagnostics.recommended_x(0)
+            if state.total_batches % print_every == 0:
+                print(f"[ram-only] batch={state.total_batches} | tok={state.total_tokens:,} | "
+                      f"free<1 expert → Central+gate only | x_next={x_cap}", flush=True)
+            sample = next(data_iter, None)
+            continue
+
         requested_ids = [s.expert_id for s in selected]
 
         ids_to_load = [eid for eid in requested_ids if eid not in expert_pool.loaded_experts]
@@ -568,6 +593,7 @@ def run_marathon(
         # thermal + processing-time, and set next batch's expert count. Cautious
         # ramp (+1 when healthy, cut under pressure) so it never overshoots into OOM.
         n_active = len(active_ids)
+        diagnostics.set_usable(get_active_memory_mb() + get_available_ram_mb())   # live RAM ceiling
         diagnostics.update(state.total_tokens, elapsed, n_active, n_active)
         diagnostics.observe_memory(n_active)
         x_cap = diagnostics.recommended_x(n_active)
