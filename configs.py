@@ -50,15 +50,18 @@ K_DEFAULT = 4
 # tokens each expert actually processes/generates is governed per-expert by the
 # Apex-Nadir Convolution (R_out), bootstrapped from EXPERT_BOOTSTRAP_TOKENS until
 # the curves have data. Keep generous; apex-nadir decides the real working size.
-MAX_SEQ_LEN = 256   # lowered from 512 for 16GB: halves the 7B-forward activation spike
+MAX_SEQ_LEN = 128   # 16GB: the 7B-forward activation spike scales with seq len, and
+                    # peak util hit 100% at 256 running even 1 expert — 128 buys margin
 # Cold-start expert fragment/generation size, used ONLY before the convolution has
 # enough latency/quality data to produce an R_out for an expert (compute_r_out
 # returns None until then). Once R_out exists it governs and this is ignored —
 # the "first run gathers context, apex-nadir takes over" handshake.
-EXPERT_BOOTSTRAP_TOKENS = 128
+EXPERT_BOOTSTRAP_TOKENS = 64
 # Hard safety valve for expert generation length when R_out is unknown or the
-# convolution call fails. Not the operating point — apex-nadir's R_out is.
-EXPERT_GEN_MAX_TOKENS = 48
+# convolution call fails. Not the operating point — apex-nadir's R_out is. Kept
+# small on 16GB: autoregressive expert generation holds a KV cache, a real chunk of
+# the per-batch memory spike.
+EXPERT_GEN_MAX_TOKENS = 16
 TKL_FLOOR = 32
 TKL_HISTORY_LEN = 10
 MONOPOLY_THRESHOLD = 0.85
@@ -94,6 +97,16 @@ THERMAL_THROTTLE_TEMP = 85.0
 # when throughput drops below THROUGHPUT_COLLAPSE_FRAC of the best seen this run.
 THERMAL_BACKOFF_FRAC = 0.9
 THROUGHPUT_COLLAPSE_FRAC = 0.5
+# Expert-concurrency control on OBSERVED peak-memory utilization (peak / usable RAM).
+# Grow x only when the last measured peak left >= (1 - GROW) headroom; back off when
+# it exceeds BACKOFF. Empirical (no cost extrapolation) so it cannot overshoot into a
+# Metal OOM. Relative to measured usable RAM, so still Zero-Constants-compliant.
+MEM_GROW_HEADROOM_FRAC = 0.60   # grow x only if last peak used < this fraction
+MEM_BACKOFF_FRAC = 0.80         # shrink x (toward 1) if last peak exceeded this
+# Central-only fallback fires only when even ONE expert would risk a real OOM. Set
+# ABOVE MEM_BACKOFF_FRAC: at 1 expert we still RUN (safe) up to here, we just don't
+# grow — only skip experts entirely when peak is genuinely near the ceiling.
+MEM_FALLBACK_FRAC = 0.92
 DIAGNOSTICS_SAVE_PATH = "state/diagnostics.pkl"
 X_MIN = 1
 X_MAX = 6        # soft ceiling: most experts that may run concurrently. The live

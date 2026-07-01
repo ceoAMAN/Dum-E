@@ -3,12 +3,10 @@ from __future__ import annotations
 import os
 import re
 import subprocess
-from collections import deque
 from dataclasses import dataclass
 from typing import List, Optional
 
 import mlx.core as mx
-import numpy as np
 
 import configs
 
@@ -32,82 +30,53 @@ class Diagnostics:
         self._batch_index: int = 0
         self._thermal_estimate: float = 58.0
         self._thermal_is_exact: bool = False
-        # ── live memory governor (set via set_memory_baseline) ──
-        self._mem_base_mb: float = 0.0          # resident central+gate, measured
-        self._mem_usable_mb: float = 0.0        # ceiling the MLX peak may reach, measured
-        self._mem_samples: deque = deque(maxlen=64)   # (x_used, peak_overhead_mb) for the OLS fit
-        self._mem_shared_mb: float = 0.0        # fitted shared spike (7B forward), intercept a
-        self._mem_per_expert_mb: float = float(configs.EXPERT_RAM_MB)  # fitted per-expert cost, slope b
+        # ── live memory governor: OBSERVED peak-utilization based ──
+        # Extrapolated cost models underestimate the generation spike and overshoot
+        # into OOM, so control is on the actual measured peak vs usable RAM instead.
+        self._mem_base_mb: float = 0.0       # resident central+gate, measured
+        self._mem_usable_mb: float = 0.0     # ceiling the MLX peak may reach (base+free), live
+        self._last_peak_mb: float = 0.0      # last batch's observed MLX high-water mark
 
     def set_memory_baseline(self, base_mb: float, usable_mb: float) -> None:
-        """Record measured resident base (central+gate) and the usable peak ceiling
-        (base + currently-available RAM). The per-expert / shared-spike split is then
-        learned live by OLS from (x_used, peak) samples."""
+        """Record measured resident base (central+gate) and the usable ceiling
+        (base + currently-available RAM). Peak utilization is measured live after."""
         self._mem_base_mb = base_mb
         self._mem_usable_mb = usable_mb
-        self._mem_samples.clear()
-        self._mem_shared_mb = 0.0
-        self._mem_per_expert_mb = float(configs.EXPERT_RAM_MB)
-
-    def observe_memory(self, x_used: int) -> None:
-        """Record this batch's real peak overhead (peak - base) against the expert
-        count, then reset the high-water mark. Feeds the OLS cost model below."""
-        from splitter import get_peak_memory_mb, reset_peak_memory
-        peak = get_peak_memory_mb()
-        reset_peak_memory()
-        if x_used > 0 and peak > self._mem_base_mb:
-            self._mem_samples.append((float(x_used), peak - self._mem_base_mb))
-        self._fit_cost_model()
-
-    def _fit_cost_model(self) -> None:
-        """OLS fit of peak_overhead ≈ shared + per_expert · x. The intercept is the
-        7B-forward spike shared across experts; the slope is the TRUE marginal cost
-        of one more expert. With <2 distinct x values, fall back to a conservative
-        single-point estimate (all overhead charged per-expert)."""
-        if not self._mem_samples:
-            return
-        xs = [s[0] for s in self._mem_samples]
-        # An expert can never cost less than its resident weights, so the slope is
-        # floored at the measured weight RAM — this kills the degenerate near-zero/
-        # negative slopes that noisy real samples produce (which would blow the
-        # ceiling up to nonsense).
-        floor = float(configs.EXPERT_RAM_MB)
-        if len(self._mem_samples) >= 3 and len(set(xs)) >= 2:
-            X = np.array([[1.0, x] for x, _ in self._mem_samples], dtype=np.float64)
-            y = np.array([o for _, o in self._mem_samples], dtype=np.float64)
-            (a, b), *_ = np.linalg.lstsq(X, y, rcond=None)
-            self._mem_per_expert_mb = max(floor, float(b))
-            # Keep the implied shared spike consistent with the floored slope so the
-            # ceiling stays grounded in the actual observed peaks.
-            mean_x = float(np.mean(xs))
-            mean_o = float(np.mean([o for _, o in self._mem_samples]))
-            self._mem_shared_mb = max(0.0, mean_o - self._mem_per_expert_mb * mean_x)
-        else:
-            x, o = self._mem_samples[-1]
-            self._mem_shared_mb = 0.0
-            self._mem_per_expert_mb = max(floor, o / max(x, 1.0))
+        self._last_peak_mb = 0.0
 
     def set_usable(self, usable_mb: float) -> None:
-        """Refresh the usable-RAM ceiling from a LIVE measurement so it tracks RAM
-        that other consumers (e.g. HF data-stream buffers) take AFTER boot — the
-        boot-time value was too optimistic and let peak grow into a Metal OOM."""
+        """Refresh the usable-RAM ceiling from a LIVE reading so it tracks RAM other
+        consumers (e.g. HF data-stream buffers) take after boot."""
         if usable_mb > 0.0:
             self._mem_usable_mb = usable_mb
 
+    def observe_memory(self, x_used: int) -> None:
+        """Record the batch's real MLX peak (the OOM-relevant high-water mark) and
+        reset it. Control is on this observed peak vs usable — no extrapolation."""
+        from splitter import get_peak_memory_mb, reset_peak_memory
+        peak = get_peak_memory_mb()
+        reset_peak_memory()
+        if peak > 0.0:
+            self._last_peak_mb = peak
+
+    def peak_util(self) -> float:
+        """Last batch's peak memory as a fraction of usable RAM (0.0 if unmeasured)."""
+        if self._mem_usable_mb <= 0.0 or self._last_peak_mb <= 0.0:
+            return 0.0
+        return self._last_peak_mb / self._mem_usable_mb
+
     def can_fit_expert(self) -> bool:
-        """True if there is measured room for at least one expert's marginal cost.
-        When False the caller should run Central-only for that batch (no OOM)."""
-        room = self._mem_usable_mb - self._mem_base_mb - self._mem_shared_mb
-        return room >= self._mem_per_expert_mb
+        """Whether to run at least one expert this batch. Only False when the last
+        peak was genuinely near the ceiling (MEM_FALLBACK_FRAC) — running 1 expert in
+        the 80–92% band is safe (it already ran there), so don't needlessly drop to
+        Central-only; recommended_x just won't GROW past 1 there."""
+        u = self.peak_util()
+        return u == 0.0 or u < configs.MEM_FALLBACK_FRAC
 
     def memory_ceiling(self) -> int:
-        """Max experts that fit under the measured usable-RAM ceiling, given the
-        fitted shared spike + per-expert cost."""
-        if self._mem_usable_mb <= 0.0:
-            return configs.X_MAX
-        room = max(0.0, self._mem_usable_mb - self._mem_base_mb - self._mem_shared_mb)
-        fits = int(room / max(self._mem_per_expert_mb, 1.0))
-        return max(configs.X_MIN, min(configs.X_MAX, fits))   # soft ceiling X_MAX
+        """Soft display/cache ceiling (X_MAX). Actual concurrency control is in
+        recommended_x via observed peak utilization."""
+        return configs.X_MAX
 
     def _time_pressure(self, recent_time: float) -> bool:
         """True if recent batch time is well above the run's fastest (unthrottled)
@@ -130,16 +99,14 @@ class Diagnostics:
         return delta / last.time_in_bound if last.time_in_bound > 0 and delta > 0 else None
 
     def recommended_x(self, x_used_last: int) -> int:
-        """Experts to run next batch — derived live, no hard cap. Three governors:
-          - MEMORY: never exceed the OLS-fitted ceiling (OOM safety, primary).
-          - TEMPERATURE: back off as the SoC nears its throttle point.
-          - PROCESSING: back off if throughput COLLAPSES relative to the best seen
-            (a self-calibrating signal — real degradation, not a hardcoded latency).
-        Healthy → cautious +1 ramp, re-measuring cost at each step so it can't
-        overshoot into an OOM."""
-        mem_cap = self.memory_ceiling()
-        if mem_cap < x_used_last:                       # memory tightened — drop to fit now
-            return max(configs.X_MIN, mem_cap)
+        """Experts to run next batch — controlled by OBSERVED peak-memory utilization
+        (last measured peak / usable RAM), NOT an extrapolated cost model (which
+        underestimated the generation spike and overshot into OOM). Also backs off on
+        SoC throttle onset or a throughput collapse. Grow +1 only when the last peak
+        left real headroom; hold in the mid-band; drop when it nears the ceiling.
+        Empirical → cannot overshoot: one extra expert can't exceed the headroom the
+        grow-threshold guarantees."""
+        util = self.peak_util()
         thermal_hot = bool(self.history) and self.history[-1].thermal_state > configs.THERMAL_THROTTLE_TEMP * configs.THERMAL_BACKOFF_FRAC
         tps = self._recent_tps()
         if tps is not None:
@@ -148,9 +115,13 @@ class Diagnostics:
             tps is not None and getattr(self, "_best_tps", 0.0) > 0.0
             and tps < configs.THROUGHPUT_COLLAPSE_FRAC * self._best_tps
         )
-        if thermal_hot or throughput_collapse:
-            return max(configs.X_MIN, min(mem_cap, x_used_last - 1))   # back off under real pressure
-        return max(configs.X_MIN, min(mem_cap, x_used_last + 1))       # cautious ramp up (mem_cap <= X_MAX)
+        if util == 0.0:                                  # no measurement yet — ramp cautiously
+            return max(configs.X_MIN, min(configs.X_MAX, x_used_last + 1))
+        if thermal_hot or throughput_collapse or util > configs.MEM_BACKOFF_FRAC:
+            return max(configs.X_MIN, x_used_last - 1)   # back off under real pressure
+        if util < configs.MEM_GROW_HEADROOM_FRAC:
+            return min(configs.X_MAX, x_used_last + 1)   # comfortable headroom → grow
+        return x_used_last                               # mid-band → hold steady
 
     def update(self, tokens_processed: int, time_in_bound: float, x_used: int, k_used: int) -> int:
         ram_headroom_mb = self._read_ram()
