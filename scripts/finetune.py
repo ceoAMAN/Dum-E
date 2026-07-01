@@ -371,11 +371,10 @@ def run_marathon(
 
         # Live RAM guard (refresh usable from CURRENT free RAM — catches stream
         # buffers that grew after boot). If there isn't measured room for even one
-        # expert, train Central+gate only this batch (L_dom) — prevents the Metal
-        # OOM; experts resume automatically once RAM frees.
+        # expert, train the GATE ONLY this batch (L_dom) — no expert, no 7B Central —
+        # the cheapest possible step; experts resume once RAM frees.
         diagnostics.set_usable(get_active_memory_mb() + get_available_ram_mb())
         if not diagnostics.can_fit_expert():
-            central.forward(text, [], send_to_user=False)
             tgt = [0.0, 0.0, 0.0, 0.0]
             tgt[DOMAINS.index(domain) if domain in DOMAINS else 3] = 1.0
             apply_gate_gradients(
@@ -389,8 +388,8 @@ def run_marathon(
             diagnostics.update(state.total_tokens, time.time() - t0, 0, 0)
             x_cap = diagnostics.recommended_x(0)
             if state.total_batches % print_every == 0:
-                print(f"[ram-only] batch={state.total_batches} | tok={state.total_tokens:,} | "
-                      f"free<1 expert → Central+gate only | x_next={x_cap}", flush=True)
+                print(f"[gate-only] batch={state.total_batches} | tok={state.total_tokens:,} | "
+                      f"free<1 expert → gate L_dom only | x_next={x_cap}", flush=True)
             sample = next(data_iter, None)
             continue
 
@@ -438,8 +437,10 @@ def run_marathon(
                     continue
                 if frag.tokens.shape[0] < configs.FRAGMENT_MIN:
                     continue
+                # Only generate the text channel when Central will synthesise it
+                # (k>1). At k=1 the expert stands alone, so skip generation too.
                 eo = expert_pool.expert_forward(
-                    frag.expert_id, frag.tokens, generate_text=True,
+                    frag.expert_id, frag.tokens, generate_text=(x_cap > 1),
                     max_tokens=convolution.generation_length(frag.expert_id),
                 )
                 expert_outputs.append(eo)
@@ -451,12 +452,25 @@ def run_marathon(
             sample = next(data_iter, None)
             continue
 
-        expert_data = [{"expert_id": eo.expert_id, "output_text": eo.output_text, "hidden_states": eo.hidden_states, "wall_time": eo.wall_time} for eo in expert_outputs]
-        central_out = central.forward(text, expert_data, send_to_user=False)
+        active_ids = [eo.expert_id for eo in expert_outputs]
+        # Central is the SYNTHESISER — run it only when there are ≥2 experts to
+        # combine. At k=1 there is nothing to synthesise, so skip the 7B forward (its
+        # activation spike is the main OOM trigger) and self-supervise the lone expert
+        # against the gate's prompt representation (ref) instead of Central's synthesis.
+        if len(active_ids) > 1:
+            expert_data = [{"expert_id": eo.expert_id, "output_text": eo.output_text, "hidden_states": eo.hidden_states, "wall_time": eo.wall_time} for eo in expert_outputs]
+            central_out = central.forward(text, expert_data, send_to_user=False)
+            ref_contribution = central_out.contribution_hidden
+            ref_synthesis = central_out.synthesis_hidden
+            recon_entropy = central_out.reconstruction_entropy
+        else:
+            ref = gate_out.hidden_states          # gate's mean prompt representation (cheap, already computed)
+            ref_contribution = ref
+            ref_synthesis = ref
+            recon_entropy = central.compute_reconstruction_entropy(ref)
 
         lambdas = maml.get_lambdas()
         check_finite = (state.total_batches % FINITE_CHECK_EVERY == 0)
-        active_ids = [eo.expert_id for eo in expert_outputs]
 
         batch_r_i_scores = []
         tkl_scores = {}        # expert_id -> tkl, ranks cluster.top_experts
@@ -465,16 +479,17 @@ def run_marathon(
         staleness = {}         # expert_id -> [0,1], 1 = coasting on stale reputation (L_rel)
 
         for eo in expert_outputs:
-            # Dual R_i: direction (vs contribution) + compatibility (vs synthesis).
+            # R_i vs the reference: Central's contribution/synthesis at k>1, else the
+            # gate's prompt representation at k=1.
             r_i = central.compute_r_i(
-                eo.hidden_states, central_out.contribution_hidden, eo.wall_time,
-                synthesis_hidden=central_out.synthesis_hidden,
+                eo.hidden_states, ref_contribution, eo.wall_time,
+                synthesis_hidden=ref_synthesis,
             )
             r_out = convolution.compute_r_out(eo.expert_id)
             anchor = expert_pool.get_historical_anchor(eo.expert_id)
             tkl = central.compute_tkl(r_i, r_out, anchor, eo.wall_time)
             l_eff_targets[eo.expert_id] = central.compute_l_eff(
-                eo.hidden_states, central_out.synthesis_hidden, eo.token_count, eo.wall_time
+                eo.hidden_states, ref_synthesis, eo.token_count, eo.wall_time
             )
             # Staleness = how far this batch's r_i fell below the expert's running
             # reputation (EMA read BEFORE this batch updates it).
@@ -533,7 +548,7 @@ def run_marathon(
                     expert_model=expert_model,
                     expert_optimizer=expert_optimizers[eo.expert_id],
                     tokens=f_tokens,
-                    central_synthesis=central_out.synthesis_hidden,
+                    central_synthesis=ref_synthesis,
                     peer_weights=peers,
                     l_div_weight=l_div_weight,
                     check_finite=check_finite,
@@ -555,9 +570,9 @@ def run_marathon(
             "expert_mse": float(np.mean(expert_mse_scores)) if expert_mse_scores else 0.0,
             "l_div_sim": float(np.mean(expert_div_sims)) if expert_div_sims else 0.0,
             "r_i": mean_r_i,
-            "contribution_norm": float(mx.linalg.norm(central_out.contribution_hidden).item()),
+            "contribution_norm": float(mx.linalg.norm(ref_contribution).item()),
             "k": float(len(active_ids)),
-            "recon_entropy": float(central_out.reconstruction_entropy),
+            "recon_entropy": float(recon_entropy),
         })
 
         # Routing memory: when this batch routed BETTER than the domain's running
@@ -688,7 +703,7 @@ def run_marathon(
                 maml.run_outer_step_from_metrics(
                     domain=domain,
                     k_value=len(expert_ids),
-                    reconstruction_entropy=central_out.reconstruction_entropy,
+                    reconstruction_entropy=recon_entropy,
                     timeline_a_rate=session_tracker.get_timeline_a_rate(),
                     cluster_count=len(routing_memory.clusters),
                 )
