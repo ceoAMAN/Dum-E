@@ -613,7 +613,7 @@ def run_marathon(
                 f"r_i={avg_r_i:.4f} | "
                 f"λ=[eff{lam[0]:.2f} dom{lam[1]:.2f} rel{lam[2]:.2f} div{lam[3]:.2f}] | "
                 f"tok/s={n_tokens/max(elapsed,1e-6):.0f} | "
-                f"x={x_cap}(ceil{diagnostics.memory_ceiling()},{diagnostics._mem_per_expert_mb:.0f}MB/e,{diagnostics._thermal_estimate:.0f}°C) | "
+                f"x={x_cap}(util{diagnostics.peak_util()*100:.0f}%,{diagnostics._thermal_estimate:.0f}°C) | "
                 f"experts={expert_ids} | "
                 f"{state.elapsed()}",
                 flush=True,
