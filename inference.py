@@ -476,14 +476,14 @@ if __name__ == "__main__":
     import argparse
     from main import boot_system, DeadTimeState
     
-    parser = argparse.ArgumentParser(description="Run Sturnus inference test.")
+    parser = argparse.ArgumentParser(description="Run Dum-E inference test.")
     parser.add_argument("--deployment", action="store_true", help="Run in deployment mode.")
     args = parser.parse_args()
     
     if args.deployment:
         configs.DEPLOYMENT = True
         
-    print("Booting Sturnus system...")
+    print("Booting Dum-E system...")
     components = boot_system()
     dead_state = DeadTimeState()
     
