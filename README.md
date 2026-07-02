@@ -6,13 +6,6 @@
 **Stack:** MLX (Apple Silicon Native) · No PyTorch · No CUDA · No cloud  
 **Status:** Final · April 2026 · arXiv Preprint
 
-> **Dum-E** — `main` contains only the core architecture: 13 dependency-free modules you can pair with
-> any dataset, tokenizer stream, or training driver — like importing a fresh,
-> untrained transformer. The full training apparatus (marathon trainer, data
-> pipeline, benchmark harnesses, self-healing run supervisor) and all recorded run
-> artifacts (1M-token benchmark CSVs, trajectories, per-domain K histories) live on
-> the branch `archive/full-stack-1m-benchmarks-2026-07-02`.
-
 ---
 
 ## What Is Dum-E?
