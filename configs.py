@@ -15,12 +15,10 @@ def _load_local_env() -> None:
         value = value.strip().strip('"').strip("'")
         os.environ.setdefault(key, value)
 _load_local_env()
+# Optional: only needed if the model checkpoints you point Dum-E at are gated on
+# the HuggingFace Hub. The public mlx-community defaults below need no token.
 HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
-WOLFRAM_APP_ID = os.getenv("WOLFRAM_APP_ID", "").strip()
-NEWSAPI_KEY = os.getenv("NEWSAPI_KEY", "").strip()
-OPENWEATHERMAP_KEY = os.getenv("OPENWEATHERMAP_KEY", "").strip()
-TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "").strip()
-DEPLOYMENT = os.getenv("STURNUS_DEPLOYMENT", "False").lower() in ("true", "1", "yes")
+DEPLOYMENT = os.getenv("DUME_DEPLOYMENT", "False").lower() in ("true", "1", "yes")
 GATE_MODEL_ID = "mlx-community/Qwen2.5-0.5B-Instruct-4bit"
 EXPERT_MODEL_ID = "mlx-community/Qwen2.5-1.5B-Instruct-4bit"
 CENTRAL_MODEL_ID = "mlx-community/Mistral-7B-Instruct-v0.3-4bit"
@@ -29,7 +27,7 @@ NUM_EXPERTS = EXPERT_POOL_SIZE
 # Fallback RAM-per-expert estimate. Measured for real at boot via
 # splitter.measure_expert_ram_mb() (loads one expert, reads the delta) and the
 # measured value replaces this at runtime, so X/Y geometry uses the true cost on
-# whatever hardware Sturnus runs on rather than a hardcoded guess.
+# whatever hardware Dum-E runs on rather than a hardcoded guess.
 # Cold-start floor estimate of per-expert RAM, used only until the live memory
 # governor (diagnostics) measures the REAL marginal cost (weights + 7B-forward +
 # generation spike) and takes over. No hard expert cap exists — concurrency is
@@ -135,130 +133,12 @@ ALPHA_PROTECTION_THRESHOLD = 0.5
 EMA_DECAY = 0.99
 STARVATION_MIN_ACTIVATIONS = 5   # expert must have this many activations in domain before eviction
 OUTER_LOOP_TOKEN_INTERVAL = 500
-# LEAN 8-dataset mixture for 16GB stability: balanced across all 4 domains (each
-# ~0.25) with LIGHT streams only. 19 concurrent HF streams' Arrow buffers were a
-# multi-GB RAM hog that OOM'd the 7B+experts run; the heavy web crawls (c4/dolma,
-# fineweb) and large sets (the_stack/CodeFeedback, tulu, ultrachat-200k) are dropped.
-# Re-enable more once running on a bigger machine.
-DATASET_WEIGHTS_MAC = {
-    # code (0.25)
-    "github_code": 0.15,            # CodeAlpaca_20K — light
-    "python_instructions": 0.10,    # python_code_instructions_18k — light
-    # reasoning (0.25)
-    "gsm8k": 0.15,
-    "metamath": 0.10,
-    # knowledge (0.25)
-    "ai2_arc": 0.15,
-    "camel_science": 0.10,          # sciq
-    # general (0.25)
-    "slimorca": 0.15,
-    "ultrachat": 0.10,
-    # ── disabled for the lean 16GB run (0.0) ──
-    "local_custom": 0.0, "xlam_function_calling": 0.0, "hermes_function_calling": 0.0,
-    "glaive_function_calling": 0.0, "agent_flan": 0.0, "agentinstruct_zai": 0.0,
-    "wizardlm_evol": 0.0, "tulu_v2": 0.0, "open_platypus": 0.0, "math": 0.0,
-    "the_stack": 0.0, "redpajama": 0.0, "dolma": 0.0,
-    "openhermes": 0.0, "wikipedia": 0.0, "openassistant": 0.0,
-}
-
-DATASET_WEIGHTS_TAB = {
-    "local_custom": 0.0,             # SKIP: no data/custom_prompts.jsonl yet
-    "xlam_function_calling": 0.0,    # SKIP: gated on HF (no access)
-    "hermes_function_calling": 0.05,
-    "glaive_function_calling": 0.03,
-    "agent_flan": 0.03,
-    "agentinstruct_zai": 0.02,
-    "slimorca": 0.03,
-    "wizardlm_evol": 0.03,
-    "tulu_v2": 0.04,
-    "open_platypus": 0.02,
-    "ultrachat": 0.04,
-    "metamath": 0.03,
-    "math": 0.02,
-    "gsm8k": 0.02,
-    "the_stack": 0.03,
-    "github_code": 0.03,
-    "python_instructions": 0.01,
-    "camel_science": 0.01,
-    "ai2_arc": 0.01,
-    "redpajama": 0.02,
-    "dolma": 0.02,
-    "openhermes": 0.0,      # SKIP: timeout/hang
-    "wikipedia": 0.0,       # SKIP: timeout/hang
-    "openassistant": 0.0,   # SKIP: stream deadlock
-}
-
-DATASET_WEIGHTS = DATASET_WEIGHTS_MAC
-
-# Renormalise the positive weights to sum to 1.0. Lets us edit any single weight
-# (e.g. drop local_custom to de-skew) without hand-balancing the other ~18 by
-# arithmetic — relative proportions of the rest are preserved, the disabled
-# (0.0) streams stay disabled, and validate_config's sum==1.0 check still holds.
-_w_total = sum(w for w in DATASET_WEIGHTS.values() if w > 0.0)
-if _w_total > 0:
-    DATASET_WEIGHTS = {
-        k: (w / _w_total if w > 0.0 else 0.0) for k, w in DATASET_WEIGHTS.items()
-    }
-
-# Local-only override: when STURNUS_LOCAL_ONLY=1, train purely on the local
-# custom_prompts.jsonl (no network streams). Used for fast, deterministic
-# engine-validation runs (clean convergence curves) when HF streaming is slow.
-if os.getenv("STURNUS_LOCAL_ONLY", "").lower() in ("1", "true", "yes"):
-    DATASET_WEIGHTS = {"local_custom": 1.0}
-
-DATASET_IDS = {
-    "local_custom": ("json", {"train": "data/custom_prompts.jsonl"}, "train"),
-    # ── action / tool-calling layer ────────────────────────────────────────
-    "xlam_function_calling": ("Salesforce/xlam-function-calling-60k", None, "train"),
-    "hermes_function_calling": ("NousResearch/hermes-function-calling-v1", None, "train"),
-    "glaive_function_calling": ("glaiveai/glaive-function-calling-v2", None, "train"),
-    "agent_flan": ("internlm/Agent-FLAN", None, "agent_instruct_react"),
-    "agentinstruct_zai": ("zai-org/AgentInstruct", None, "os"),
-    # ── existing datasets ─────────────────────────────────────────────────
-    "slimorca": ("Open-Orca/SlimOrca", None, "train"),
-    "wizardlm_evol": ("WizardLM/WizardLM_evol_instruct_V2_196k", None, "train"),
-    "tulu_v2": ("allenai/tulu-v2-sft-mixture", None, "train"),
-    "open_platypus": ("garage-bAInd/Open-Platypus", None, "train"),
-    "ultrachat": ("HuggingFaceH4/ultrachat_200k", None, "train_sft"),
-    "metamath": ("meta-math/MetaMathQA", None, "train"),
-    "math": ("HuggingFaceH4/MATH-500", "default", "test"),
-    "gsm8k": ("openai/gsm8k", "main", "train"),
-    "the_stack": ("m-a-p/CodeFeedback-Filtered-Instruction", None, "train"),
-    "github_code": ("HuggingFaceH4/CodeAlpaca_20K", None, "train"),
-    "python_instructions": ("iamtarun/python_code_instructions_18k_alpaca", None, "train"),
-    "camel_science": ("sciq", None, "train"),
-    "ai2_arc": ("allenai/ai2_arc", "ARC-Challenge", "train"),
-    "redpajama": ("HuggingFaceFW/fineweb-edu", "sample-10BT", "train"),
-    "dolma": ("allenai/c4", "en", "train"),
-    "openhermes": ("teknium/OpenHermes-2.5", None, "train"),
-    "wikipedia": ("wikimedia/wikipedia", "20231101.en", "train"),
-    "openassistant": ("OpenAssistant/oasst2", None, "train"),
-}
-# Ground-truth domain per dataset — the dataset's provenance IS its domain (gsm8k is
-# reasoning, CodeFeedback is code), so the gate's L_dom target comes from here rather
-# than keyword-sniffing the text. Anything unmapped falls back to general.
-DATASET_DOMAINS = {
-    "the_stack": "code", "github_code": "code", "python_instructions": "code",
-    "gsm8k": "reasoning", "metamath": "reasoning", "math": "reasoning",
-    "camel_science": "knowledge", "ai2_arc": "knowledge", "redpajama": "knowledge",
-    "dolma": "knowledge", "wikipedia": "knowledge",
-    "ultrachat": "general", "slimorca": "general", "wizardlm_evol": "general",
-    "tulu_v2": "general", "open_platypus": "general", "openhermes": "general",
-    "openassistant": "general", "local_custom": "general",
-    "xlam_function_calling": "general", "hermes_function_calling": "general",
-    "glaive_function_calling": "general", "agent_flan": "general", "agentinstruct_zai": "general",
-}
-DATASET_BOOT_TIMEOUT = 60.0
-DATASET_SAMPLE_TIMEOUT = 5.0
 ROUTING_MEMORY_PATH = "state/routing_memory.pkl"
 LAMBDA_SAVE_PATH = "state/lambdas.npz"
 CHECKPOINT_DIR = Path("state/checkpoints/")
 LOG_DIR = Path("logs/")
 DEVICE = None
 
-CENTRAL_TRAIN_MODEL_ID = CENTRAL_MODEL_ID
-GATE_TRAIN_MODEL_ID = GATE_MODEL_ID
-EXPERT_TRAIN_MODEL_ID = EXPERT_MODEL_ID
 LORA_R = 8
 LORA_ALPHA = 16
 LORA_DROPOUT = 0.05
@@ -287,8 +167,6 @@ def validate_config() -> None:
         raise ValueError("K bounds must be within [0, 20] and ordered.")
     if not (0.0 < FAST_PATH_THRESHOLD < 1.0):
         raise ValueError("FAST_PATH_THRESHOLD must be between 0 and 1.")
-    if abs(sum(DATASET_WEIGHTS.values()) - 1.0) > 1e-6:
-        raise ValueError("DATASET_WEIGHTS must sum to 1.0.")
     if abs(BETA_LR - ALPHA_LR / 10) > 1e-12:
         raise ValueError(
             f"BETA_LR ({BETA_LR}) must equal ALPHA_LR / 10 ({ALPHA_LR / 10}). "
@@ -298,10 +176,6 @@ def validate_config() -> None:
         raise ValueError("TKL_FLOOR must equal FRAGMENT_MIN (both = 32).")
     if FRAGMENT_MIN < 32:
         raise ValueError("FRAGMENT_MIN must be >= 32.")
-    if not HF_TOKEN:
-        raise ValueError(
-            "HF_TOKEN is required. Set the HF_TOKEN environment variable before running."
-        )
 if __name__ == "__main__":
     validate_config()
     print("Config OK")

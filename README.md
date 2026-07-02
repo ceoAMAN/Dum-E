@@ -1,4 +1,4 @@
-# Sturnus
+# Dum-E
 
 ### A Self-Supervising Horizontal Mixture-of-Experts Architecture for Consumer Hardware
 
@@ -6,11 +6,19 @@
 **Stack:** MLX (Apple Silicon Native) · No PyTorch · No CUDA · No cloud  
 **Status:** Final · April 2026 · arXiv Preprint
 
+> **Dum-E** (formerly *Sturnus* — the repository keeps the historical name). `main`
+> contains only the core architecture: 13 dependency-free modules you can pair with
+> any dataset, tokenizer stream, or training driver — like importing a fresh,
+> untrained transformer. The full training apparatus (marathon trainer, data
+> pipeline, benchmark harnesses, self-healing run supervisor) and all recorded run
+> artifacts (1M-token benchmark CSVs, trajectories, per-domain K histories) live on
+> the branch `archive/full-stack-1m-benchmarks-2026-07-02`.
+
 ---
 
-## What Is Sturnus?
+## What Is Dum-E?
 
-Sturnus is a **Self-Supervising Horizontal Mixture-of-Experts (HMoE)** system that runs **157.5 billion parameters** on a consumer MacBook Air by dynamically paging experts from SSD to unified memory. It coordinates three tiers of language models into a single coherent system that gets **cheaper the more it runs**.
+Dum-E is a **Self-Supervising Horizontal Mixture-of-Experts (HMoE)** system that runs **157.5 billion parameters** on a consumer MacBook Air by dynamically paging experts from SSD to unified memory. It coordinates three tiers of language models into a single coherent system that gets **cheaper the more it runs**.
 
 The core claim is formally stated as the **Core Invariant** — and after 10M tokens of training, it is no longer a claim. It is a measured result:
 
@@ -89,7 +97,7 @@ K is the number of experts activated per token. K is an **observable**, not a hy
 
 Before the mathematics, here is the intuition.
 
-**Sturnus is three tiers coordinated by one rule: every expert must earn its compute.**
+**Dum-E is three tiers coordinated by one rule: every expert must earn its compute.**
 
 ```
 INPUT
@@ -160,7 +168,7 @@ K_velocity ≥ 0  →  meta-loop broken
 
 ### 3.2 Apex-Nadir Convolution
 
-The Apex-Nadir Convolution is the **master governor** of Sturnus. Every expert has an optimal operating point — a Goldilocks token count `R_out(i)` — that maximises synthesis quality per unit of compute.
+The Apex-Nadir Convolution is the **master governor** of Dum-E. Every expert has an optimal operating point — a Goldilocks token count `R_out(i)` — that maximises synthesis quality per unit of compute.
 
 **Three curves are fitted per expert during static calibration:**
 
@@ -210,7 +218,7 @@ r_out = convolution.compute_r_out(
 
 ### 3.3 X/Y Geometry — OOM Impossibility Proof
 
-Standard MoE multiplies compute by K. Sturnus keeps compute constant and makes OOM errors **physically impossible**.
+Standard MoE multiplies compute by K. Dum-E keeps compute constant and makes OOM errors **physically impossible**.
 
 All values are runtime-computed. None are stored in configs.
 
@@ -501,7 +509,7 @@ mx.eval(lambdas)
 
 ### 6.1 Staged Training Protocol
 
-Training in Sturnus follows a deliberate dependency chain. Each stage has a precondition the previous stage satisfies. Running all stages simultaneously corrupts the self-supervision loop.
+Training in Dum-E follows a deliberate dependency chain. Each stage has a precondition the previous stage satisfies. Running all stages simultaneously corrupts the self-supervision loop.
 
 ```
 Stage 1: Central warm-up (50,000 tokens)
@@ -548,7 +556,7 @@ This did not happen because of a config change. It happened because the routing 
 
 | Version | Date | Stack | What Changed |
 |---------|------|-------|-------------|
-| v1 — Sturnus_native | March 22 2026 | PyTorch inference + PyTorch MPS training | First implementation. 240 experts (0.5B each), Qwen2.5-3B Central. Architecture was original. Vibe-coded. Ran. Felt wrong — split inference/training stack, math not tight enough. |
+| v1 — Dum-E_native | March 22 2026 | PyTorch inference + PyTorch MPS training | First implementation. 240 experts (0.5B each), Qwen2.5-3B Central. Architecture was original. Vibe-coded. Ran. Felt wrong — split inference/training stack, math not tight enough. |
 | v5.1 | April 25 2026 | Full MLX | Complete rewrite. Eliminated all PyTorch from inference path. 100 experts (1.5B), Mistral-7B Central. Built InferenceEngine, CentralModel, TripleKSelector from scratch. Native MLX training loops. |
 | v5.2 | April 26 2026 | Full MLX + Apex-Nadir | Apex-Nadir Convolution replaces Triple-Mean. Geography-First Gating added. Distance to Convolution Peak becomes primary Triple-K ranking signal. 4 critical bugs fixed. Architecture locked. |
 
@@ -911,7 +919,7 @@ Two full protocol runs completed. 8 datasets. 3-loop structure: Timeline B full 
 
 **Timeline A at 50%** is the headline result. Half of all tokens processed with K=0 — no experts, Central only. The system earned this through 10M tokens of Timeline B training, not through any manual configuration.
 
-**The fresh 10M interrupted run** is equally significant: at only 364,251 tokens — 3.6% of the target — Timeline A was already at 49.9%. The routing memory from previous runs persisted. The system did not start cold. This validates that Sturnus compounds across sessions exactly as designed.
+**The fresh 10M interrupted run** is equally significant: at only 364,251 tokens — 3.6% of the target — Timeline A was already at 49.9%. The routing memory from previous runs persisted. The system did not start cold. This validates that Dum-E compounds across sessions exactly as designed.
 
 ### Fresh 10M Run — Interrupted at 364k Tokens
 
@@ -1035,7 +1043,7 @@ Reading the code before benchmarking revealed:
 
 - **Central is frozen.** Training updates the gate and experts; Central is never trained or saved.
 - **`expert_forward().output_text` is argmax over INPUT fragment positions** — a scrambled echo of the question, not a generated answer.
-- Therefore **"Sturnus pipeline vs Central-alone" is identical by construction at inference.** The deployed user-facing reply is always `Central.generate(prompt)`.
+- Therefore **"Dum-E pipeline vs Central-alone" is identical by construction at inference.** The deployed user-facing reply is always `Central.generate(prompt)`.
 
 The harness (`scripts/blind_eval.py`) tests a different question: does injecting expert text into the prompt help? Result on n=3 code queries: expert text changed the output (A≠B) but added only noise — both produced valid answers because Central already knew them.
 
@@ -1350,7 +1358,7 @@ System recovered   →  X climbs back
 
 This is not throttling. Throttling is reactive — measure heat, hit threshold, slow down. This is prediction — fit the trajectory, act before the ceiling, never hit the ceiling.
 
-**This is the single most important architectural change.** No existing MoE system does this. X is always a config value in every prior system — static, set before the run. In Sturnus it is a runtime output of a model that learns the hardware the same way the system learns language. Different on batch 1 and batch 10,000,000. Different on two identical MacBook Airs running different workloads.
+**This is the single most important architectural change.** No existing MoE system does this. X is always a config value in every prior system — static, set before the run. In Dum-E it is a runtime output of a model that learns the hardware the same way the system learns language. Different on batch 1 and batch 10,000,000. Different on two identical MacBook Airs running different workloads.
 
 **Code change:** New file `diagnostics.py`. One public method: `update()`. Takes tokens_processed, time_in_bound, x_used. Returns x_next. `splitter.py` — `compute_xy()` gets optional `x_override` param. `configs.py` — four new constants: `THERMAL_THROTTLE_TEMP = 85.0`, `DIAGNOSTICS_SAVE_PATH`, `X_MIN = 1`, `X_MAX = 7`.
 
@@ -1379,8 +1387,8 @@ These are not three separate optimisations. As the system learns language better
 
 ```bash
 git clone https://github.com/ceoAMAN/Sturnus.git
-cd Sturnus
-python -m venv sturnus-env && source sturnus-env/bin/activate
+cd Dum-E
+python -m venv dume-env && source dume-env/bin/activate
 pip install mlx mlx-lm huggingface_hub numpy faiss-cpu reportlab matplotlib
 
 export HF_TOKEN="hf_your_token_here"
@@ -1431,7 +1439,7 @@ python scripts/blind_eval.py --n 8         # A/B quality harness
 ## 9. Codebase Structure
 
 ```
-Sturnus/
+Dum-E/
 ├── configs.py                 All constants and paths. No logic. X/Y/R_out never stored here.
 ├── apex_nadir_convolution.py  R_alpha/R_omega/R_t curves, R_out, Distance to Peak
 ├── vectors.py                 All vector math. mx_to_numpy bridge.
@@ -1521,7 +1529,7 @@ All six must pass simultaneously before capacity scaling:
 
 | Limitation | Detail |
 |---|---|
-| **MoE pipeline is training-only** | The deployed reply is always `Central.generate(prompt)`. Experts and the gate train routing and r_i scores, but expert outputs never reach the user-facing text. This is the #1 architectural gap. Future: inject a real expert summary into Central's context, or train Central on the MoE mixture via `scripts/lora_finetune.py --data mixture`. |
+| **Expert text quality drives synthesis quality** | Experts now generate real text (not argmax-over-input echoes), which is appended to the prompt and fed into Central's synthesis backbone. Central trains on this augmented input, learning to weight expert context. However, expert text quality is bounded by the experts' own capabilities — if experts are undertrained, Central has poor material to work with. Improving this boundary requires deeper expert specialisation (via longer training runs or domain-specific pretraining) or injecting external reasoning/search results into the expert stream. |
 | **Gate routing accuracy near chance** | On a balanced 40-prompt held-out set the gate routes at 30% (chance = 25%). The domain mixture was skewed, masking this with a near-zero routing CE loss. The de-skewed mixture (local_custom 0.10) + `logs/eval.csv` tracking sets up the next run to actually measure improvement. |
 | **Voronoi cache: consistency, not speed** | Hit rate warms to 93% on repeated queries but latency speedup is 1.0×. The gate forward (~23 ms) dominates; expert selection is near-free. Cache value is routing consistency across paraphrases, not raw speed. |
 | **Single hardware validation** | All numbers measured on one MacBook Air M4 16 GB. Multi-device and cross-hardware validation outstanding. |
@@ -1531,9 +1539,9 @@ All six must pass simultaneously before capacity scaling:
 
 ## 13. Related Work
 
-**Mixture-of-Experts:** Shazeer et al. (2017) introduced sparsely-gated MoE layers. Switch Transformer (Fedus et al., 2021) scaled to trillion parameters with one-expert-per-token routing. GLaM (Du et al., 2021) demonstrated MoE quality matching at a fraction of dense activated parameters. Critical distinction from all prior work: every existing MoE system treats K as fixed at design time. Sturnus treats K as the primary observable of system health and drives it toward zero across sessions.
+**Mixture-of-Experts:** Shazeer et al. (2017) introduced sparsely-gated MoE layers. Switch Transformer (Fedus et al., 2021) scaled to trillion parameters with one-expert-per-token routing. GLaM (Du et al., 2021) demonstrated MoE quality matching at a fraction of dense activated parameters. Critical distinction from all prior work: every existing MoE system treats K as fixed at design time. Dum-E treats K as the primary observable of system health and drives it toward zero across sessions.
 
-**On-Device Inference:** llama.cpp (Gerganov, 2023) enables quantised LLM inference on consumer hardware. Apple MLX (2023) provides native array operations on Apple Silicon unified memory. GPTQ (Frantar et al., 2022), GGUF, and AWQ reduce individual model footprints. None address the challenge of coordinating multiple models dynamically. Sturnus operates at this level — SSD as infinite expert reservoir, unified memory as bounded execution window.
+**On-Device Inference:** llama.cpp (Gerganov, 2023) enables quantised LLM inference on consumer hardware. Apple MLX (2023) provides native array operations on Apple Silicon unified memory. GPTQ (Frantar et al., 2022), GGUF, and AWQ reduce individual model footprints. None address the challenge of coordinating multiple models dynamically. Dum-E operates at this level — SSD as infinite expert reservoir, unified memory as bounded execution window.
 
 **Meta-Learning:** MAML (Finn et al., 2017) provides the foundation for the lambda outer loop. The structural constraint β = α × 0.1 diverges from standard MAML — equal learning rates cause lambda to oscillate under lagged feedback. FOMAML by default; full second-order via `mx.vjp` reserved for K-Velocity benchmark failure.
 
@@ -1569,5 +1577,5 @@ All six must pass simultaneously before capacity scaling:
 
 ---
 
-*Sturnus · April 2026*  
+*Dum-E · April 2026*  
 **

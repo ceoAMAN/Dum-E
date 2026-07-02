@@ -6,7 +6,6 @@ from typing import Any, Dict, List
 import configs
 from apex_nadir_convolution import ApexNadirConvolution
 from central import CentralModel
-from data import authenticate_huggingface, DomainLabelledStream
 from experts import ExpertPool
 from gating import GateModel, TripleKSelector, MaskingSchedule
 from inference import InferenceEngine
@@ -40,7 +39,6 @@ class DeadTimeState:
     last_reconstruction_entropy: float = 0.0
 def boot_system() -> SystemComponents:
     configs.validate_config()
-    authenticate_huggingface()
     convolution = ApexNadirConvolution(
         calibration_path=configs.CALIBRATION_PATH,
         latency_store_path=configs.LATENCY_STORE_PATH,
@@ -84,12 +82,12 @@ def boot_system() -> SystemComponents:
         masking_schedule=masking_schedule,
         r_out_mean_seed=r_out_mean_seed,
     )
-def run_universal_buffet(components: SystemComponents):
-    stream = DomainLabelledStream(dataset_ids=configs.DATASET_IDS)
-    for expert_id in range(configs.EXPERT_POOL_SIZE):
-        calibration_data: Dict[str, Any] = {}
-        for domain_batch in stream.iter_calibration_batches(expert_id):
-            calibration_data.update(domain_batch)
+def run_calibration(components: SystemComponents, calibration_batches):
+    """Fit each expert's apex/nadir/latency curves from caller-supplied calibration
+    data — an iterable of (expert_id, dict) with token_counts / quality_scores /
+    gradient_coherence / wall_times keys. Data-source agnostic: pair Dum-E with any
+    corpus and feed measurements here (or let a training loop fit curves live)."""
+    for expert_id, calibration_data in calibration_batches:
         components.convolution.fit_curves_from_calibration(expert_id, calibration_data)
     components.convolution.save()
 def session_reset(components: SystemComponents, dead_state: DeadTimeState):
@@ -192,7 +190,7 @@ async def run_interactive(components: SystemComponents, dead_state: DeadTimeStat
 
             try:
                 loop = asyncio.get_event_loop()
-                user_in = await loop.run_in_executor(None, lambda: input("Sturnus> ").strip())
+                user_in = await loop.run_in_executor(None, lambda: input("Dum-E> ").strip())
             except (EOFError, KeyboardInterrupt):
                 break
             if not user_in:
@@ -205,21 +203,17 @@ async def run_interactive(components: SystemComponents, dead_state: DeadTimeStat
         orchestrator_task.cancel()
         session_reset(components, dead_state)
 def run_cli():
-    parser = argparse.ArgumentParser(description="Sturnus inference engine.")
+    parser = argparse.ArgumentParser(description="Dum-E core engine.")
     parser.add_argument("--prompt", type=str, help="Run a single prompt and exit.")
     parser.add_argument("--interactive", action="store_true", help="Start interactive chat loop.")
     parser.add_argument("--max-turns", type=int, default=0, help="Stop after N turns.")
     parser.add_argument("--json", action="store_true", help="Print full result dict.")
-    parser.add_argument("--buffet", action="store_true", help="Run Universal Buffet calibration.")
     parser.add_argument("--deployment", action="store_true", help="Run in deployment mode.")
     args = parser.parse_args()
     if args.deployment:
         configs.DEPLOYMENT = True
     components = boot_system()
     dead_state = DeadTimeState()
-    if args.buffet:
-        run_universal_buffet(components)
-        return
     if args.prompt:
         result = process_input(args.prompt, components, dead_state)
         run_pending_timeline_a_shadows(components, dead_state)
@@ -232,7 +226,7 @@ def run_cli():
     if args.interactive:
         asyncio.run(run_interactive(components, dead_state, max_turns=args.max_turns))
         return
-    result = process_input("Test input for Sturnus.", components, dead_state)
+    result = process_input("Test input for Dum-E.", components, dead_state)
     run_pending_timeline_a_shadows(components, dead_state)
     print(result["output_text"])
     session_reset(components, dead_state)
