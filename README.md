@@ -6,8 +6,7 @@
 **Stack:** MLX (Apple Silicon Native) · No PyTorch · No CUDA · No cloud  
 **Status:** Final · April 2026 · arXiv Preprint
 
-> **Dum-E** (formerly *Sturnus* — the repository keeps the historical name). `main`
-> contains only the core architecture: 13 dependency-free modules you can pair with
+> **Dum-E** — `main` contains only the core architecture: 13 dependency-free modules you can pair with
 > any dataset, tokenizer stream, or training driver — like importing a fresh,
 > untrained transformer. The full training apparatus (marathon trainer, data
 > pipeline, benchmark harnesses, self-healing run supervisor) and all recorded run
@@ -500,7 +499,7 @@ mx.eval(lambdas)
 | Deployment phase gradient leakage | No way to run pure inference — finetune.py always computed gradients and forced Timeline B exploration, tainting deployment benchmarks. | Added `--deployment` flag. Strips backward passes, disables optimisers, forces Timeline A fast-path. Pristine inference metrics now possible. |
 | Expert 88 missing parameters crash | Inference stalled on `Expert 88 not loaded` — metadata expected `model.norm.weight` parameter absent from safetensors. | Overhauled ExpertPool loading to dynamically reconcile expected parameter schema with actual MLX files. |
 | Fast-path K=0 embedding gather error | Passing tokens to Central without experts caused matrix shape mismatch on hidden state gather. | Fixed token-to-hidden-state transformations to interface correctly with native MLX model classes. |
-| GitHub 100MB file block (GH001) | `sturnus_env` virtual environment files exceeded GitHub's hard 100MB limit. Push rejected. | Configured `.gitignore` to exclude environment binaries from git index. |
+| GitHub 100MB file block (GH001) | virtual-environment binaries exceeded GitHub's hard 100MB limit. Push rejected. | Configured `.gitignore` to exclude environment binaries from git index. |
 | macOS MallocStackLogging spam | MLX's rapid 4-bit weight swapping triggered macOS `MallocStackLogging` errors flooding terminal, masking live metrics. | Injected line-buffered `grep` filter in subprocess bash pipeline to suppress framework warnings silently. |
 
 ---
@@ -1386,7 +1385,7 @@ These are not three separate optimisations. As the system learns language better
 **Requirements:** macOS (M-series Apple Silicon), Python 3.11+, HuggingFace token.
 
 ```bash
-git clone https://github.com/ceoAMAN/Sturnus.git
+git clone https://github.com/ceoAMAN/Dum-E.git
 cd Dum-E
 python -m venv dume-env && source dume-env/bin/activate
 pip install mlx mlx-lm huggingface_hub numpy faiss-cpu reportlab matplotlib
