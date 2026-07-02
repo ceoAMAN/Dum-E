@@ -1,0 +1,20 @@
+{
+  "batch": 9350,
+  "tokens": 994231,
+  "gate_total": 0.002102620415389538,
+  "l_eff": 0.0,
+  "l_dom": 0.0,
+  "l_rel": 0.014232785705244168,
+  "expert_mse": 4.181015625,
+  "l_div_sim": 0.0,
+  "r_i": 0.7901025390625,
+  "contribution_norm": Infinity,
+  "k": 1.0,
+  "recon_entropy": 0.06973815377411763,
+  "expert_weight_std": 0.00021006363385822624,
+  "cluster_hit_rate": 0.37971952535059333,
+  "cluster_count": 20,
+  "timeline_a_rate": 0.0,
+  "gate_acc": 0.55,
+  "k_velocity_mean": 0.0
+}

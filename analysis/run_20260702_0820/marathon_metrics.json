@@ -1,0 +1,16 @@
+{
+  "total_tokens": 994231,
+  "total_batches": 9350,
+  "timeline_a_count": 0,
+  "timeline_b_count": 9350,
+  "timeline_a_rate": 0.0,
+  "tokens_per_sec": 135.92603624206996,
+  "avg_loss": 0.0030416950024664403,
+  "lambdas": {
+    "l_eff": 0.27019408345222473,
+    "l_dom": 0.29203295707702637,
+    "l_rel": 0.14786399900913239,
+    "l_div": 0.2899090349674225
+  },
+  "avg_r_i": 0.785009765625
+}
