@@ -1,5 +1,26 @@
 # Dum-E
 
+> **Status — September 2026: rewritten.** The system described in the paper
+> below was audited and found hollow (see [errors_to_fix.md](errors_to_fix.md)):
+> its reward could not express "worse", its routing never learned, and its
+> allocation emitted a constant. The code the paper describes has been
+> **deleted**. The live system is the `dume/` package, built against
+> [docs/design-rules.md](docs/design-rules.md) with the grounded reward in
+> [docs/grounded-reward.md](docs/grounded-reward.md); every problem and where it
+> is prevented is in [docs/rewrite-map.md](docs/rewrite-map.md).
+>
+> ```
+> python -m dume.main form     --samples 200     # offline geometry (once)
+> python -m dume.main pretrain --tokens 20000    # Central alone, plain CE
+> python -m dume.main train    --batches 50      # the grounded joint loop
+> python -m dume.main run      --prompt "..."    # deployment; writes no reward
+> python scripts/dume_check.py                   # model-free checks, seconds
+> ```
+>
+> The paper is kept as the record of the original design and its measured
+> results; its mechanisms (apex-nadir, Triple-K, the Voronoi memory, Timeline
+> A/B) no longer exist in the code.
+
 ### A Self-Supervising Horizontal Mixture-of-Experts Architecture for Consumer Hardware
 
 **Hardware:** MacBook Air M4 · 16 GB Unified Memory  

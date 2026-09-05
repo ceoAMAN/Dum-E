@@ -1,5 +1,14 @@
 # Build order
 
+> **2026-09-06 — BUILT.** Steps −1 through 9 are implemented in the `dume/`
+> package (~1,900 lines replacing ~8,000) and verified on the real models:
+> `form` (9 clusters, tau calibrated last), `train` (22 batches: signed deltas,
+> trial seat every batch, migration with displacement at b20, tau breathing
+> 0.84→0.67 on starved clusters), `run` (correct answer, 1 of 2 notes used at
+> trust 0.55). See [rewrite-map.md](rewrite-map.md) for problem→fix and
+> [../errors_to_fix.md](../errors_to_fix.md) for what remains open.
+
+
 The spine. Everything else hangs off a step here.
 
 Dependency-ordered: each step unblocks the next. Doing them out of order means

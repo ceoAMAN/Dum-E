@@ -365,20 +365,51 @@ dead because a competing ungrounded writer is wired, which is architectural).
 
 ---
 
-## PART 4 — STILL OPEN
+## PART 4 — STATUS AFTER THE REWRITE (2026-09-06)
 
-- **Two critics never ran** — blind-spot hunt and an attack on the *intended* design in
-  `docs/`. Both died on the spend limit twice. This is the largest remaining gap: nothing
-  has yet attacked the new design.
-- **The spec workflow never ran** — 0 of 13 agents. Ownership table, module
-  decomposition, persistence contract.
-- **Token type** for the reliability vector: vocabulary class vs direction in cluster
-  space. Both replacement designs independently recommended **vocabulary class**, against
-  what `docs/central-reliability.md` leans toward, on AK grounds: a static `TYPE[V]` array
-  is inspectable with `sort | uniq -c`, cannot drift, and cannot fail silently.
-- **Solo delta vs leave-one-out.** Identical at k=1, which is 765/765 of the measured run.
-  At k>1, LOO scores a correct-but-redundant expert at ~0. Recommendation: solo.
-- **Nothing is committed.** ~3,000 lines untracked.
+The old code is deleted. `dume/` (14 modules, ~1,900 lines) replaces ~8,000.
+Every item in Part 1 is mapped to the construction that prevents it in
+[docs/rewrite-map.md](docs/rewrite-map.md). Verified on the real models
+(Qwen2.5-0.5B gate / Qwen2.5-1.5B experts / Qwen3-4B Central, MLX, 16 GB):
+
+| run | result |
+|---|---|
+| `form --samples 40` | 9 clusters, tau calibrated last per cluster, stamped with gate hash |
+| `train`, 30 batches total | **signed deltas** (−2.95 … +1.42); trial seat every batch; migration with displacement at b20 (6 moves); tau breathed 0.84→0.67 on starved clusters; reliability rho 1.00→0.44→0.63 as real CE arrived; gate_loss 32→0.4 after z-scoring; clone rate recorded |
+| `run --prompt` | correct answer; 1 of 2 expert notes used at trust 0.55; nothing written to standing |
+| `scripts/dume_check.py` | all model-free properties pass in seconds |
+
+Found and fixed **during** verification (each was a silent no-op of the exact
+family this list documents): tau had no consumer; load measured on composition
+instead of allocation (would have run tau to its ceiling); surplus experts
+landing in GENERAL; `--batches` absolute so a resumed run did nothing and exited
+0; a process that never exited after finishing; streams replaying the same rows
+on every restart.
+
+### Genuinely still open
+
+- **Nothing has attacked the new design.** Two critic agents died on the spend
+  limit three times. The design has been built and verified to *run*; it has not
+  been verified to be *right* under adversarial review.
+- **Experts are clones at cold start** (`clone_frac` 0.2 at b25). All 100 are
+  LoRA over one base; they diverge only through the self-imitation update, one
+  expert per batch. Watch `clone_frac` fall over hundreds of batches; if it does
+  not, the expert update is not doing anything.
+- **Reliability vector is still pooled.** No cluster has 100 held-out
+  observations yet, so every `R[c]` is the global estimate (0.435). It
+  differentiates at ~900+ held-out target tokens.
+- **`pretrain` has not been run in this session.** Central inherited the
+  grounded-CE checkpoint from the old system; the Ť/2 phase is implemented and
+  untested at scale.
+- **The z-discount is variance-only**: two identical lucky batches have zero
+  variance and are not discounted. A small-n prior would fix this.
+- **Short targets** (sciq/arc answers are 2–4 tokens) make Δ noisy per batch;
+  the variance lands in standing's `sd2` but a minimum-M admission rule may be
+  wanted.
+- **Sign of the reliability weight** is A (trust the instrument); B is a
+  one-line change in `reward.weights`. Aman's call.
+- **Formation used 40 samples.** Re-run `form --samples 200+` before a real
+  training run; several taus hit the 0.97 ceiling from 1–2-member clusters.
 
 ---
 
