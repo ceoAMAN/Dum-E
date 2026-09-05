@@ -17,8 +17,9 @@ class ExpertOutput:
     output_text: str
     hidden_states: mx.array
     wall_time: float
-    token_count: int
+    token_count: int          # tokens CHARGED to apex-nadir (the allocated share)
     from_cache: bool
+    tokens_read: int = 0      # tokens actually processed, incl. word-boundary padding
 class ExpertPool:
     def __init__(self, convolution: ApexNadirConvolution, session_tracker: SessionTracker, max_loaded: int = 6):
         self.convolution = convolution
@@ -36,6 +37,30 @@ class ExpertPool:
         self.current_domain: Dict[int, str] = {
             i: "general" for i in range(configs.EXPERT_POOL_SIZE)
         }
+        # Per-expert optimizers, created lazily. The engine applies spiderweb
+        # pressure on every batch, so the optimizer state has to live with the
+        # pool rather than inside a training script.
+        self.optimizers: Dict[int, Any] = {}
+        # The prefetch thread calls load_experts() while the main loop is
+        # evicting; both mutate loaded_experts/_load_order. The GIL makes each
+        # dict op atomic but not the cap/RAM check-then-act sequences around
+        # them, so a prefetch could evict an expert the main loop was about to
+        # invoke. One reentrant lock over both mutators removes the window.
+        import threading
+        self._lock = threading.RLock()
+
+    def get_optimizer(self, expert_id: int):
+        import mlx.optimizers as optim
+        if expert_id not in self.optimizers:
+            self.optimizers[expert_id] = optim.Adam(learning_rate=configs.LEARNING_RATE)
+        return self.optimizers[expert_id]
+
+    def is_dormant(self, expert_id: int) -> bool:
+        """True when this expert has never been trained — no checkpoint on disk,
+        so it loaded with lora_b = 0 and its adapter is a mathematically exact
+        no-op. These sit permanently in the bottom half of any ranking, which is
+        precisely who spiderweb exists to revive."""
+        return not (Path(configs.CHECKPOINT_DIR) / f"expert_{expert_id:03d}" / "weights.safetensors").exists()
     def get_available_ram_mb(self) -> float:
         return get_available_ram_mb()
     def _model_is_finite(self, model: Any) -> bool:
@@ -84,6 +109,10 @@ class ExpertPool:
         self._load_order.append(eid)
 
     def load_experts(self, expert_ids: List[int]):
+        with self._lock:
+            self._load_experts_locked(expert_ids)
+
+    def _load_experts_locked(self, expert_ids: List[int]):
         from mlx_lm import load as mlx_load
         needed_set = set(expert_ids)
         for eid in expert_ids:
@@ -104,7 +133,7 @@ class ExpertPool:
                 model, tokenizer = mlx_load(configs.EXPERT_MODEL_ID)
                 from mlx_lm.tuner.utils import linear_to_lora_layers
                 model.freeze()
-                lora_config = {"rank": configs.LORA_R, "scale": configs.LORA_ALPHA, "dropout": configs.LORA_DROPOUT}
+                lora_config = {"rank": configs.LORA_R, "scale": configs.LORA_ALPHA / configs.LORA_R, "dropout": configs.LORA_DROPOUT}
                 num_layers = len(model.layers) if hasattr(model, "layers") else len(model.model.layers)
                 linear_to_lora_layers(model, num_layers, lora_config)
                 weights_path = Path(configs.CHECKPOINT_DIR) / f"expert_{eid:03d}" / "weights.safetensors"
@@ -128,6 +157,7 @@ class ExpertPool:
             self.loaded_tokenizers[eid] = tokenizer
             self._touch_lru(eid)
     def unload_experts(self, expert_ids: List[int], keep_buffer: Optional[Set[int]] = None):
+      with self._lock:
         keep = keep_buffer or set()
         for eid in expert_ids:
             if eid in keep:
@@ -149,16 +179,49 @@ class ExpertPool:
             checkpoint_dir = Path(configs.CHECKPOINT_DIR) / f"expert_{eid:03d}"
             checkpoint_dir.mkdir(parents=True, exist_ok=True)
             mx.save_safetensors(str(checkpoint_dir / "weights.safetensors"), flat_params)
-    def _generate_expert_text(self, model: Any, tokenizer: Any, fragment_tokens: mx.array, max_tokens: int) -> str:
+    def _build_expert_prompt(self, tokenizer: Any, fragment_text: str,
+                             question: Optional[str] = None, domain: Optional[str] = None) -> str:
+        """Wrap the fragment in the tokenizer's OWN chat template plus a role.
+
+        The fragment used to be handed to mlx_generate as a bare string. Qwen
+        Instruct models are ChatML-tuned, and given no role markers they fall
+        back to base behaviour: they CONTINUE the text instead of analysing it.
+        Measured, an expert handed ' and how does it relate' invented a question
+        that was never asked, hallucinated an 'Assistant:' turn, and answered
+        itself — and all of that was then injected into Central's prompt under
+        'Expert analyses to consider'. With the template it analyses, and abstains
+        when the excerpt is meaningless.
+
+        The full question rides along when the caller has it, so a fragment is
+        the expert's ASSIGNMENT rather than its entire world."""
+        system = (f"You are a specialist in {domain}. " if domain else "You are a domain specialist. ")
+        system += ("Analyse the excerpt and give the single key insight another model should "
+                   "use to answer. Be concise. Do not answer as if you were the user, and do "
+                   "not invent facts that are not present.")
+        user = f"Excerpt assigned to you:\n{fragment_text}"
+        if question:
+            user = f"Full question under consideration:\n{question}\n\n{user}"
+        messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+        apply_template = getattr(tokenizer, "apply_chat_template", None)
+        if apply_template is not None and getattr(tokenizer, "chat_template", None):
+            try:
+                return apply_template(messages, tokenize=False, add_generation_prompt=True)
+            except Exception:
+                pass
+        return f"{system}\n\n{user}\n"   # no template available: at least keep the instruction
+
+    def _generate_expert_text(self, model: Any, tokenizer: Any, fragment_tokens: mx.array, max_tokens: int,
+                              question: Optional[str] = None, domain: Optional[str] = None) -> str:
         """Generate the expert's REAL analysis of its fragment — a genuine
         continuation Central reads as context, never a scrambled echo. Greedy (no
         sampler) for determinism, dropout disabled. Length is governed by the
         caller (apex-nadir R_out), not a fixed constant."""
         try:
             from mlx_lm import generate as mlx_generate
-            prompt_text = tokenizer.decode(fragment_tokens.reshape(-1).tolist())
-            if not prompt_text.strip():
+            fragment_text = tokenizer.decode(fragment_tokens.reshape(-1).tolist())
+            if not fragment_text.strip():
                 return ""
+            prompt_text = self._build_expert_prompt(tokenizer, fragment_text, question, domain)
             was_training = bool(getattr(model, "training", False))
             if was_training:
                 model.eval()
@@ -181,6 +244,9 @@ class ExpertPool:
         fragment_tokens: mx.array,
         generate_text: bool = True,
         max_tokens: Optional[int] = None,
+        allocated_tokens: Optional[int] = None,
+        question: Optional[str] = None,
+        domain: Optional[str] = None,
     ) -> ExpertOutput:
         """Run an expert over its fragment and return BOTH channels it hands to
         Central: the hidden-state knowledge vector (always) and its real generated
@@ -206,8 +272,15 @@ class ExpertPool:
             hidden_mean = hidden_out
         mx.eval(hidden_mean)
         gen_len = max_tokens if max_tokens is not None else configs.EXPERT_GEN_MAX_TOKENS
-        output_text = self._generate_expert_text(model, tokenizer, fragment_tokens, gen_len) if generate_text else ""
-        tc = fragment_tokens.shape[0]
+        output_text = self._generate_expert_text(model, tokenizer, fragment_tokens, gen_len,
+                                                 question=question, domain=domain) if generate_text else ""
+        tokens_read = int(fragment_tokens.shape[0])
+        # Charge only the allocated share. `tokens_read` may be larger because the
+        # fragment was extended to whole-word boundaries; that padding is free and
+        # must not enter the token-allocation history the apex-nadir curves and
+        # the historical anchor are built from.
+        tc = int(allocated_tokens) if allocated_tokens else tokens_read
+        tc = max(1, min(tc, tokens_read))
         self.record_token_allocation(expert_id, tc)
         return ExpertOutput(
             expert_id=expert_id,
@@ -216,7 +289,37 @@ class ExpertPool:
             wall_time=wall_time,
             token_count=tc,
             from_cache=False,
+            tokens_read=tokens_read,
         )
+    def peer_disagreement(self, outputs: List["ExpertOutput"]) -> Dict[int, float]:
+        """Per-expert distance from the batch consensus, in [0, 1].
+
+        All experts work fragments of the SAME input, so their hidden states are
+        comparable. An expert far from the consensus is either genuinely
+        specialised or confabulating — and since the classic hallucination
+        signature is exactly one model confidently alone in left field, this is
+        the cheapest usable proxy for it. It is already paid for: the hidden
+        states exist, nothing extra is generated.
+
+        Feeds composite_tkl's `no_halluc` term. Fewer than 2 outputs means no
+        consensus exists, so nothing is reported rather than a fabricated 0."""
+        if len(outputs) < 2:
+            return {}
+        dim = min(int(o.hidden_states.reshape(-1).shape[0]) for o in outputs)
+        vecs = []
+        for o in outputs:
+            v = o.hidden_states.reshape(-1)[:dim]
+            vecs.append(v / (mx.linalg.norm(v) + 1e-8))
+        stacked = mx.stack(vecs, axis=0)
+        consensus = mx.mean(stacked, axis=0)
+        consensus = consensus / (mx.linalg.norm(consensus) + 1e-8)
+        sims = mx.matmul(stacked, consensus)
+        mx.eval(sims)
+        vals = sims.tolist()
+        # cosine in [-1,1] -> disagreement in [0,1]
+        return {o.expert_id: float(max(0.0, min(1.0, (1.0 - v) / 2.0)))
+                for o, v in zip(outputs, vals)}
+
     def expert_weight_std(self, expert_ids: List[int]) -> float:
         """Monitoring signal for the L_div / specialisation acceptance criterion:
         the mean per-dimension std across the loaded experts' (normalised) weight
@@ -239,8 +342,18 @@ class ExpertPool:
         mx.eval(std)
         return float(std.item())
     def get_masking_rate(self, expert_id: int, domain: str) -> float:
+        """How far below its peers this expert is scoring, in [0, 1].
+
+        UNITS BUG, fixed: expert_score is an r_i EMA in [0,1] while
+        get_domain_mean_score returns the mean TKL, which is floored at 32 and
+        typically far larger. rate = 1 - small/large was ~0.99 for essentially
+        every expert, so all of them read as 'stuck' past MASKING_STUCK_THRESHOLD
+        (0.9) and the dead-time orchestrator migrated whichever had the most
+        exposure — churning precisely the experts that were working hardest.
+        Compare r_i to the mean r_i of the same domain: like against like."""
         expert_score = self.domain_scores[expert_id].get(domain, 0.0)
-        domain_mean = self.session_tracker.get_domain_mean_score(domain)
+        peers = [d.get(domain) for d in self.domain_scores.values() if d.get(domain) is not None]
+        domain_mean = float(sum(peers) / len(peers)) if peers else 0.0
         if domain_mean < 1e-9:
             return 1.0
         rate = 1.0 - (expert_score / domain_mean)
@@ -282,11 +395,18 @@ class ExpertPool:
         # Prevents the death spiral: migrate → bad first batch → migrate again → r_i stays 0.
         if self.session_tracker.get_expert_activations(expert_id) < configs.STARVATION_MIN_ACTIVATIONS:
             return False
+        # UNITS: expert_tkl now holds the COMPOSITE (0..1), so it must be compared
+        # against the composite mean — not get_domain_mean_tkl, which is the legacy
+        # r_out*(r_i/c_e)*anchor floored at 32. Against that, 0.7 < 16 is always
+        # true and every expert past STARVATION_MIN_ACTIVATIONS reads as starved.
         tkl = self.session_tracker.get_expert_tkl(expert_id)
-        domain_mean_tkl = self.session_tracker.get_domain_mean_tkl(domain)
-        if domain_mean_tkl < 1e-9:
+        peers = [e for e, d in self.session_tracker.expert_domains.items() if d == domain]
+        if len(peers) < 2:
             return False
-        return tkl < domain_mean_tkl * 0.5
+        domain_mean = self.session_tracker.composite_domain_mean(peers, domain)
+        if domain_mean < 1e-9:
+            return False
+        return tkl < domain_mean * 0.5
     def check_monopoly_overflow(self, expert_id: int) -> bool:
         current_alloc = self.session_tracker.get_current_allocation(expert_id)
         return self.convolution.check_monopoly_ceiling(expert_id, current_alloc)

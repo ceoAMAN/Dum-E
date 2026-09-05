@@ -47,6 +47,7 @@ def boot_system() -> SystemComponents:
     routing_memory = RoutingMemory()
     routing_memory.load(configs.ROUTING_MEMORY_PATH)
     session_tracker = SessionTracker()
+    session_tracker.load(configs.SESSION_TRACKER_PATH)
     gate = GateModel()
     gate.load()
     central = CentralModel()
@@ -66,7 +67,31 @@ def boot_system() -> SystemComponents:
         session_tracker=session_tracker,
         triple_k=triple_k,
         masking_schedule=masking_schedule,
+        maml=maml,
     )
+
+    # If the previous process died mid-batch, its in-flight marker is still on
+    # disk. Claim it now, before any work: a Metal OOM aborts uncatchably, so
+    # this is the only moment the crash can be turned into evidence.
+    inference_engine.diagnostics.claim_crashed_run()
+
+    # FEED THE MEMORY GOVERNOR. set_memory_baseline / set_usable / observe_memory
+    # / can_fit_expert were all unreachable, so _mem_usable_mb stayed 0.0,
+    # peak_util() returned 0.0 by its own guard, and can_fit_expert() answered
+    # True unconditionally — a ceiling computed against nothing.
+    #
+    # Honest about what this measures: CentralModel() only sets model = None, so
+    # the 4B is NOT resident here and this base is gate-plus-runtime, not the
+    # full footprint. `_mem_base_mb` has no reader anywhere in the system; the
+    # value that does work is the usable ceiling, and inference refreshes that
+    # from a live reading every batch. The seed matters only for the window
+    # before the first observed peak.
+    from splitter import get_active_memory_mb, get_available_ram_mb
+    base_mb = get_active_memory_mb()
+    usable_mb = base_mb + get_available_ram_mb()
+    inference_engine.diagnostics.set_memory_baseline(base_mb, usable_mb)
+    print(f"[boot] memory governor: resident {base_mb:.0f} MB (gate only — central "
+          f"loads lazily), usable ceiling {usable_mb:.0f} MB")
 
     r_out_mean_seed = configs.MAX_SEQ_LEN / configs.K_DEFAULT
     return SystemComponents(
@@ -82,6 +107,46 @@ def boot_system() -> SystemComponents:
         masking_schedule=masking_schedule,
         r_out_mean_seed=r_out_mean_seed,
     )
+def pretrain_central(components: SystemComponents, samples, total_token_budget: int,
+                     print_every: int = 50) -> Dict[str, Any]:
+    """PHASE 1 — Central trains alone on half the total token budget.
+
+    Of Ť total tokens, Ť/2 go to Central on its own; the remaining Ť run the
+    joint phase where the experts work and Central synthesises. Central is
+    trained FIRST and then stops taking gradients, which is what makes r_i
+    comparable across a run: r_i is measured against Central's loss, so a Central
+    that keeps moving is a yardstick that keeps moving, and expert scores from
+    early and late batches stop meaning the same thing.
+
+    `samples` is any iterable of (text, target_ids) — data-source agnostic, like
+    run_calibration. Pair Dum-E with any corpus; the engine never names one.
+    Stops when the budget is spent or the samples run out, then persists Central
+    (which is the step that never existed: load() guards on a checkpoint that was
+    never written, so every boot silently reloaded the stock model)."""
+    import mlx.optimizers as optim
+    from training import apply_central_pretrain
+
+    budget = max(1, int(total_token_budget) // 2)
+    optimizer = optim.Adam(learning_rate=configs.LEARNING_RATE)
+    spent, steps, losses = 0, 0, []
+    for text, target_ids in samples:
+        if spent >= budget:
+            break
+        if not target_ids:
+            continue
+        out = apply_central_pretrain(components.central, optimizer, text, list(target_ids))
+        spent += len(target_ids)
+        steps += 1
+        if out["ce"] > 0.0:
+            losses.append(out["ce"])
+        if print_every and steps % print_every == 0:
+            recent = sum(losses[-print_every:]) / max(1, len(losses[-print_every:]))
+            print(f"[central] step {steps} | {spent}/{budget} tokens | ce {recent:.4f}")
+    components.central.save()
+    first = sum(losses[:10]) / max(1, len(losses[:10])) if losses else 0.0
+    last = sum(losses[-10:]) / max(1, len(losses[-10:])) if losses else 0.0
+    print(f"[central] phase 1 done: {steps} steps, {spent} tokens, ce {first:.4f} -> {last:.4f}, saved")
+    return {"steps": steps, "tokens": spent, "ce_first": first, "ce_last": last}
 def run_calibration(components: SystemComponents, calibration_batches):
     """Fit each expert's apex/nadir/latency curves from caller-supplied calibration
     data — an iterable of (expert_id, dict) with token_counts / quality_scores /
@@ -91,10 +156,28 @@ def run_calibration(components: SystemComponents, calibration_batches):
         components.convolution.fit_curves_from_calibration(expert_id, calibration_data)
     components.convolution.save()
 def session_reset(components: SystemComponents, dead_state: DeadTimeState):
+    # Persist BEFORE reset. reset() now only clears the session counters, but
+    # saving first makes the ordering explicit rather than incidental.
+    try:
+        components.session_tracker.save(configs.SESSION_TRACKER_PATH)
+    except Exception as e:
+        print(f"[warn] session tracker save failed: {e}")
     components.session_tracker.reset()
     components.routing_memory.save(configs.ROUTING_MEMORY_PATH)
+    # Persist the gate. save_route_head existed but nothing called it, so even
+    # once the gate started learning every update would have been discarded at
+    # session end — the head would reload from its old checkpoint next boot.
+    try:
+        components.gate.save_route_head()
+    except Exception as e:
+        print(f"[warn] route_head save failed: {e}")
     components.maml.save()
     components.convolution.save_latency_store()
+    # save() as well as save_latency_store(): the latency store holds only the
+    # per-expert cost coefficients. ALLOC(T), the goldilocks points it was fitted
+    # from, and central_min_cap live in the calibration file, and nothing on the
+    # live path was writing it — so every curve the session fitted was lost.
+    components.convolution.save()
     components.maml.log_k_velocity_all_domains()
     dead_state.pending_timeline_a_inputs.clear()
     dead_state.last_outer_loop_token = 0

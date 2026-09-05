@@ -4,14 +4,20 @@ import random
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Set
+import numpy as np
 import mlx.core as mx
 import mlx.nn as nn
+import mlx.optimizers as optim
 import configs
 from apex_nadir_convolution import ApexNadirConvolution
 
-# Domain slots, in the order the gate's first 4 domain-logit dims map to and the
-# L_dom one-hot target uses. Single source of truth shared by routing + topography.
-DOMAINS = ["code", "reasoning", "knowledge", "general"]
+# Domain slots, in the order the gate's leading domain-logit dims map to and the
+# L_dom one-hot target uses. Single source of truth shared by routing +
+# topography. D = len(DOMAINS) is a VARIABLE: everything that consumes it slices
+# by len(DOMAINS), never by a literal, so a domain can be added or removed here
+# alone. configs.DOMAINS overrides it when set.
+DOMAINS: List[str] = list(getattr(configs, "DOMAINS", None) or
+                          ["code", "reasoning", "knowledge", "general"])
 @dataclass
 class DomainTopography:
     domain_map: Dict[int, str]
@@ -51,6 +57,18 @@ class GateModel:
         self.tokenizer = None
         self.net = None          # GateNet: backbone + route_head, the trainable unit
         self._loaded = False
+        # The gate had no optimiser anywhere in the system, so apply_gate_gradients
+        # had nothing to be called with and route_head stayed at its random init
+        # for the life of the process — while route_pref was the entire expert
+        # ranking (spread 3.2e-2 against a 1e-6 jitter). Built lazily: it must be
+        # created after load() so it sees the real parameter tree.
+        self._optimizer = None
+
+    @property
+    def optimizer(self):
+        if self._optimizer is None:
+            self._optimizer = optim.Adam(learning_rate=configs.LEARNING_RATE)
+        return self._optimizer
     @property
     def route_head(self):
         return self.net.route_head if self.net is not None else None
@@ -63,7 +81,7 @@ class GateModel:
         from mlx_lm.tuner.utils import linear_to_lora_layers
         self.model, self.tokenizer = mlx_load(configs.GATE_MODEL_ID)
         self.model.freeze()
-        lora_config = {"rank": configs.LORA_R, "scale": configs.LORA_ALPHA, "dropout": configs.LORA_DROPOUT}
+        lora_config = {"rank": configs.LORA_R, "scale": configs.LORA_ALPHA / configs.LORA_R, "dropout": configs.LORA_DROPOUT}
         num_layers = len(self.model.layers) if hasattr(self.model, "layers") else len(self.model.model.layers)
         linear_to_lora_layers(self.model, num_layers, lora_config)
         weights_path = Path(configs.CHECKPOINT_DIR) / "gate" / "weights.safetensors"
@@ -74,10 +92,48 @@ class GateModel:
         self.net = GateNet(self.model, configs.GATE_D_MODEL, configs.EXPERT_POOL_SIZE)
         rh_path = self._route_head_path()
         if rh_path.exists():
-            self.net.route_head.load_weights(str(rh_path), strict=False)
+            self._load_route_head(rh_path)
         mx.eval(self.net.route_head.parameters())
         self.model.train()
         self._loaded = True
+    def _load_route_head(self, path: Path):
+        """Restore the routing head, GROWING or SHRINKING it to the current pool.
+
+        route_head is the only parameter whose shape depends on E, so it is the
+        one thing that breaks when the pool changes size. `load_weights(...,
+        strict=False)` does not merely skip a mismatched tensor — it REPLACES it,
+        silently resizing a 120-row head back to the saved 100 rows. The new
+        experts then never receive a routing preference (a bounds guard in
+        select_experts hides it), and the next save_route_head persists the
+        shrunken head for good.
+
+        Instead: copy the overlapping rows and leave the rest at init. Adding
+        experts preserves everything the gate learned about the existing ones and
+        gives the new arrivals a fresh, unbiased start; removing experts keeps the
+        rows that still correspond to live experts."""
+        from safetensors.numpy import load_file
+        try:
+            saved = load_file(str(path))
+        except Exception as e:
+            print(f"[warn] route_head load failed ({e}); keeping fresh init")
+            return
+        head = self.net.route_head
+        for name, cur in (("weight", head.weight), ("bias", getattr(head, "bias", None))):
+            if cur is None or name not in saved:
+                continue
+            old = mx.array(saved[name])
+            if old.shape == cur.shape:
+                setattr(head, name, old)
+                continue
+            n = min(int(old.shape[0]), int(cur.shape[0]))
+            if old.ndim == 2 and cur.ndim == 2 and int(old.shape[1]) != int(cur.shape[1]):
+                print(f"[warn] route_head.{name} d_model {old.shape[1]} != {cur.shape[1]}; keeping fresh init")
+                continue
+            merged = mx.concatenate([old[:n], cur[n:]], axis=0) if n < int(cur.shape[0]) else old[:int(cur.shape[0])]
+            setattr(head, name, merged)
+            print(f"[boot] route_head.{name} resized {tuple(old.shape)} -> {tuple(cur.shape)}: "
+                  f"kept {n} learned rows, {max(0, int(cur.shape[0]) - n)} new experts at init")
+
     def save_route_head(self):
         from mlx.utils import tree_flatten
         p = self._route_head_path()
@@ -126,7 +182,7 @@ class GateModel:
         return gate_out, topo
     def _domain_from_mean_hidden(self, mean_hidden: mx.array) -> str:
         """Domain of a (chunk) mean hidden state from the gate's LEARNED domain head:
-        the same z-score → domain_logits[:4] argmax that forward() uses for routing.
+        the same z-score → domain_logits[:D] argmax that forward() uses for routing.
         No hardcoded variance/magnitude thresholds — the trained gate decides."""
         h = mx.clip(mean_hidden, -1e4, 1e4)
         mu = mx.mean(h)
@@ -147,7 +203,7 @@ class GateModel:
         import math as _math
         spot_vals = mean_hidden[:8].tolist()
         if any(not _math.isfinite(v) for v in spot_vals):
-            domain_logits = mx.zeros(4)
+            domain_logits = mx.zeros(len(DOMAINS))
             k = configs.K_DEFAULT
             return GateOutput(
                 hidden_states=mean_hidden,
@@ -164,14 +220,14 @@ class GateModel:
         mu = mx.mean(mean_hidden)
         sigma = mx.sqrt(mx.mean((mean_hidden - mu) ** 2) + 1e-8)
         normed = (mean_hidden - mu) / (sigma + 1e-8)
-        domain_logits = normed[:4]   # 4 slots: code / reasoning / knowledge / general
+        domain_logits = normed[:len(DOMAINS)]   # D slots, one per DOMAINS entry
         # Learned per-expert routing preference from the same pooled hidden state.
         route_logits = self.net.route_head(mean_hidden)
         mx.eval(domain_logits, route_logits)
         probs = mx.softmax(domain_logits)
         mx.eval(probs)
         entropy = -float(mx.sum(probs * mx.log(probs + 1e-10)).item())
-        max_entropy = math.log(4)    # 4 domain classes
+        max_entropy = math.log(max(2, len(DOMAINS)))   # D domain classes
         confidence = max(0.0, min(1.0, 1.0 - (entropy / max_entropy)))
         if confidence > configs.FAST_PATH_THRESHOLD:
             timeline = "A"
@@ -196,6 +252,411 @@ class MaskingSchedule:
         masked = set(candidates[:mask_count])
         self._last_masked = masked
         return masked
+class DomainRegistry:
+    """Which experts belong to which domain — earned, not declared.
+
+    Every expert starts UNASSIGNED. Membership is granted by measured
+    performance during the curriculum (general rounds -> per-domain rounds ->
+    assign where it specialises), and can be revoked by migration. Until an
+    expert is assigned it stays available to every domain, which is the correct
+    cold start: with no evidence, any expert may serve any domain.
+
+    Sizing, all derived from the pool and the domain count:
+
+        min_pool(D)     = ceil(sqrt(E / D))     the floor every domain keeps
+        new_domain_seed = sqrt(E) / 2           experts seeded into a new domain
+        target(domain)  = max(min_pool, share of E by that domain's frequency)
+
+    so frequent domains grow larger pools and rare ones cannot be starved below
+    the floor."""
+
+    def __init__(self, pool_size: Optional[int] = None):
+        self.pool_size = int(pool_size or configs.EXPERT_POOL_SIZE)
+        self.assignment: Dict[int, Optional[str]] = {i: None for i in range(self.pool_size)}
+        self.domain_tokens: Dict[str, int] = {}
+
+    # ── membership ─────────────────────────────────────────────────────────
+    def unassigned(self) -> List[int]:
+        return [e for e, d in self.assignment.items() if d is None]
+
+    def members(self, domain: str) -> List[int]:
+        return [e for e, d in self.assignment.items() if d == domain]
+
+    def domains(self) -> List[str]:
+        return sorted({d for d in self.assignment.values() if d})
+
+    def assign(self, expert_id: int, domain: str) -> None:
+        self.assignment[int(expert_id)] = domain
+
+    def release(self, expert_id: int) -> None:
+        """Back to unassigned — an expert that failed in its domain is available
+        to every domain again rather than being stranded."""
+        self.assignment[int(expert_id)] = None
+
+    # ── sizing ─────────────────────────────────────────────────────────────
+    def min_pool(self, n_domains: Optional[int] = None) -> int:
+        """ceil(sqrt(E / D)) — the UPPER bracket here, unlike the NL selection
+        rule, because this is a floor on how small a domain's pool may get."""
+        d = max(1, int(n_domains if n_domains is not None else len(self.domains()) or 1))
+        return max(1, math.ceil(math.sqrt(self.pool_size / d)))
+
+    def new_domain_seed(self) -> int:
+        """sqrt(E) / 2 experts seeded when a domain first appears."""
+        return max(1, int(math.sqrt(self.pool_size) // 2))
+
+    def record_domain_tokens(self, domain: str, tokens: int) -> None:
+        self.domain_tokens[domain] = self.domain_tokens.get(domain, 0) + int(tokens)
+
+    def target_size(self, domain: str) -> int:
+        """Frequent domains earn bigger pools; the min_pool floor protects rare
+        ones. Share is measured from observed tokens, not declared."""
+        total = sum(self.domain_tokens.values())
+        floor = self.min_pool()
+        if total <= 0:
+            return floor
+        share = self.domain_tokens.get(domain, 0) / total
+        return max(floor, int(round(self.pool_size * share)))
+
+    def seed_domain(self, domain: str, candidates: List[int]) -> List[int]:
+        """Seed a NEW domain with sqrt(E)/2 experts drawn from `candidates` —
+        the caller supplies the middle tier (strong but underused) plus any
+        migrants, so seeding never costs a domain its top performers."""
+        need = self.new_domain_seed()
+        picked = [e for e in candidates if self.assignment.get(e) != domain][:need]
+        for e in picked:
+            self.assign(e, domain)
+        return picked
+
+
+class Curriculum:
+    """Per-expert training schedule that produces domain assignment.
+
+    Every count is algebra over E (pool size) and D (domain count), read LIVE
+    from configs/DOMAINS, so growing the pool or adding a domain reshapes the
+    schedule with no code change:
+
+        phase 1  general      E              rounds on the general domain
+        phase 2  sampling     floor(sqrt(E)) rounds on EACH non-general domain
+        phase 3  specialise   2E             rounds on the domain it scored best
+
+        total per expert = 3E + sqrt(E)*(D-1)      (330 at E=100, D=4)
+
+    A round is one training batch. Phase 2 is deliberately short: it is a probe
+    to find where an expert belongs, not training — the real investment is the 2E
+    rounds afterwards, spent only on the domain that earned them.
+
+    Scores recorded here decide assignment, so they are only as meaningful as the
+    quality signal feeding them; with an ungrounded r_i the machinery is correct
+    and the verdict is not."""
+
+    GENERAL = "general"
+
+    def __init__(self, pool_size: Optional[int] = None, registry: Optional["DomainRegistry"] = None):
+        self._pool_size = pool_size
+        self.registry = registry
+        self.rounds: Dict[int, Dict[str, int]] = {}          # expert -> domain -> rounds done
+        self._failed: Dict[int, set] = {}                    # domains an expert could not hold
+        self._in_transit: set = set()                        # passing THROUGH general, mid-migration
+        self.migrations: List[Dict] = []                     # lifecycle: every move, before/after
+        self._rng = random.Random(0)
+        self.scores: Dict[int, Dict[str, List[float]]] = {}  # expert -> domain -> scores
+
+    # ── derived counts (never stored, so configs stays the source of truth) ──
+    @property
+    def E(self) -> int:
+        return int(self._pool_size or configs.EXPERT_POOL_SIZE)
+
+    def general_rounds(self) -> int:
+        return self.E
+
+    def domain_rounds(self) -> int:
+        return max(1, math.floor(math.sqrt(self.E)))
+
+    def specialise_rounds(self) -> int:
+        return 2 * self.E
+
+    def sampling_domains(self) -> List[str]:
+        return [d for d in DOMAINS if d != self.GENERAL]
+
+    def total_rounds(self) -> int:
+        return 3 * self.E + self.domain_rounds() * len(self.sampling_domains())
+
+    # ── progress ────────────────────────────────────────────────────────────
+    def done(self, expert_id: int, domain: str) -> int:
+        return self.rounds.get(int(expert_id), {}).get(domain, 0)
+
+    def record(self, expert_id: int, domain: str, score: Optional[float] = None) -> None:
+        e = int(expert_id)
+        self.rounds.setdefault(e, {})[domain] = self.done(e, domain) + 1
+        if score is not None and math.isfinite(float(score)):
+            self.scores.setdefault(e, {}).setdefault(domain, []).append(float(score))
+
+    def phase(self, expert_id: int) -> str:
+        """'general' -> 'sampling' -> 'specialise' -> 'done'."""
+        e = int(expert_id)
+        if self.done(e, self.GENERAL) < self.general_rounds():
+            return "general"
+        need = self.domain_rounds()
+        if any(self.done(e, d) < need for d in self.sampling_domains()):
+            return "sampling"
+        assigned = self.registry.assignment.get(e) if self.registry else None
+        if assigned is None:
+            return "specialise"          # ready to be assigned
+        extra = self.done(e, assigned) - (need if assigned in self.sampling_domains() else self.general_rounds())
+        return "done" if extra >= self.specialise_rounds() else "specialise"
+
+    def next_domain(self, expert_id: int) -> str:
+        """Which domain this expert should train on right now."""
+        e = int(expert_id)
+        ph = self.phase(e)
+        if ph == "general":
+            return self.GENERAL
+        if ph == "sampling":
+            need = self.domain_rounds()
+            pending = [d for d in self.sampling_domains() if self.done(e, d) < need]
+            # Least-covered first, so sampling stays balanced if it is interrupted.
+            return min(pending, key=lambda d: self.done(e, d))
+        assigned = self.registry.assignment.get(e) if self.registry else None
+        return assigned or self.best_domain(e) or self.GENERAL
+
+    def domain_mean(self, expert_id: int, domain: str) -> Optional[float]:
+        vals = self.scores.get(int(expert_id), {}).get(domain, [])
+        return float(np.mean(vals)) if vals else None
+
+    def best_domain(self, expert_id: int) -> Optional[str]:
+        """Where this expert measured best. General is a legitimate destination —
+        it was measured too, over E rounds — so an expert that is genuinely a
+        generalist is not forced into a specialism it never earned."""
+        means = {d: self.domain_mean(expert_id, d) for d in DOMAINS}
+        means = {d: v for d, v in means.items() if v is not None}
+        return max(means, key=means.get) if means else None
+
+    # ── migration lifecycle statistics ─────────────────────────────────────
+    def open_migration(self, expert_id: int, from_domain: str, to_domain: str) -> None:
+        """Log a migration as it starts, with the score the expert held where it
+        is leaving. Pairs with close_migration once the trial in the new place is
+        served."""
+        e = int(expert_id)
+        before = self.domain_mean(e, from_domain)
+        self.migrations.append({
+            "expert_id": e, "from": from_domain, "to": to_domain,
+            "before": before, "after": None,
+        })
+
+    def close_migration(self, expert_id: int, domain: str) -> Optional[float]:
+        """Complete the most recent open migration for this expert, recording what
+        it scored after settling. Returns the delta."""
+        e = int(expert_id)
+        after = self.domain_mean(e, domain)
+        for rec in reversed(self.migrations):
+            if rec["expert_id"] == e and rec["to"] == domain and rec["after"] is None:
+                rec["after"] = after
+                if rec["before"] is None or after is None:
+                    return None
+                return float(after - rec["before"])
+        return None
+
+    def migration_delta(self, from_domain: str, to_domain: str) -> Optional[float]:
+        """The pool's AVERAGE change in score for experts that made this exact
+        transition. This is the lifecycle signal: an expert's own sampling score
+        says where it might fit, but the accumulated history of everyone who
+        actually made the move says whether that kind of move pays. Returns None
+        until at least one completed migration exists for the pair."""
+        deltas = [r["after"] - r["before"] for r in self.migrations
+                  if r["from"] == from_domain and r["to"] == to_domain
+                  and r["before"] is not None and r["after"] is not None]
+        return float(np.mean(deltas)) if deltas else None
+
+    def lifecycle(self, expert_id: int) -> List[Dict]:
+        """This expert's full migration history — where it has been, what it
+        scored on arrival and departure, in order."""
+        return [r for r in self.migrations if r["expert_id"] == int(expert_id)]
+
+    # ── tenure & migration ─────────────────────────────────────────────────
+    def trial_length(self) -> int:
+        """NU(E) = ceil(sqrt(E)) — the successor approximation. An expert holds a
+        domain place for this many rounds before its tenure is judged. Upper
+        bracket here (unlike the NL selection rule) because it is a grace period:
+        round it down and you evict on thinner evidence."""
+        return max(1, math.ceil(math.sqrt(self.E)))
+
+    def tenure_verdict(self, expert_id: int, domain: str, peers: List[int]) -> bool:
+        """True = keep the place. An expert earns its domain by outranking AT
+        LEAST ONE expert already ranked there. Beating nobody after a full trial
+        means it has no claim — not that it is bad, just that this is not its
+        domain. Judged only once the trial is served."""
+        e = int(expert_id)
+        if self.done(e, domain) < self.trial_length():
+            return True                      # trial not served yet
+        mine = self.domain_mean(e, domain)
+        if mine is None:
+            return True
+        others = [self.domain_mean(p, domain) for p in peers if p != e]
+        others = [s for s in others if s is not None]
+        if not others:
+            # SOLE OCCUPANT: no peer to displace, so judge against the pool's mean
+            # on this domain — the same bar assign_pool uses. Returning True here
+            # instead means an expert alone in a domain holds it forever however
+            # badly it scores, and a domain seeded with one weak expert can never
+            # correct itself.
+            thr = self.domain_thresholds(list(self.scores)).get(domain)
+            return thr is None or mine >= thr
+        return any(mine > s for s in others)
+
+    def next_migration_step(self, expert_id: int, current_domain: str) -> str:
+        """One hop of the migration cycle: domain1 -> general -> domain2.
+
+        Never a direct domain-to-domain jump. An expert that failed its tenure
+        re-generalises first, then re-specialises — so it arrives at the next
+        domain having been reset by general work rather than carrying the shape
+        of the domain it just failed.
+
+        The next specialism is chosen by CORRELATION with the first-phase
+        sampling scores: the sampling round already measured this expert on every
+        domain, so that record says where else it might fit. Ties break randomly.
+        Domains it has already failed are excluded, so it cannot cycle back into
+        a place it could not hold."""
+        e = int(expert_id)
+        failed = self._failed.setdefault(e, set())
+        if current_domain != self.GENERAL:
+            failed.add(current_domain)
+            self._in_transit.add(e)          # mark: general is a waypoint, not a home
+            return self.GENERAL              # step 1: always via general
+        # step 2: general -> the best-correlated domain it has not failed
+        cands = {d: self.domain_mean(e, d) for d in DOMAINS
+                 if d != self.GENERAL and d not in failed}
+        cands = {d: v for d, v in cands.items() if v is not None}
+        self._in_transit.discard(e)          # arriving at domain2 ends the transit
+        if not cands:
+            failed.clear()                   # exhausted every domain: start over
+            return self.GENERAL
+        # Blend the expert's OWN sampling score for the candidate with the pool's
+        # average outcome for this transition. The first says where this expert
+        # might fit; the second says whether that kind of move has ever paid for
+        # anyone. A domain the expert looks suited to, but which everyone who
+        # moved there got worse in, is worth less than it appears.
+        scored = {}
+        for d, own in cands.items():
+            hist = self.migration_delta(current_domain, d)
+            scored[d] = own + (hist if hist is not None else 0.0)
+        best = max(scored.values())
+        top = [d for d, v in scored.items() if v >= best - 1e-9]
+        return self._rng.choice(sorted(top))
+
+    def review_tenure(self, registry: "DomainRegistry", expert_ids: Optional[List[int]] = None) -> Dict[int, str]:
+        """Judge every assigned expert's tenure and move those that failed one hop
+        along the cycle. Returns {expert_id: new_domain} for those that moved."""
+        moved: Dict[int, str] = {}
+        ids = expert_ids if expert_ids is not None else list(registry.assignment)
+        for e in ids:
+            dom = registry.assignment.get(e)
+            if dom is None:
+                continue
+            # An expert passing THROUGH general is judged only on time served, not
+            # on rank: alone in general it would outrank nobody, tenure_verdict
+            # would return KEEP, and the migration would stall there forever
+            # instead of continuing to domain2.
+            in_transit = e in self._in_transit and dom == self.GENERAL
+            if in_transit:
+                if self.done(e, dom) < self.trial_length():
+                    continue                 # still serving its general stint
+            elif self.tenure_verdict(e, dom, registry.members(dom)):
+                continue
+            nxt = self.next_migration_step(e, dom)
+            self.close_migration(e, dom)     # settle the record for the place being left
+            self.open_migration(e, dom, nxt)
+            registry.assign(e, nxt)
+            self.rounds.setdefault(e, {})[nxt] = 0     # fresh trial in the new place
+            moved[e] = nxt
+        return moved
+
+    def domain_thresholds(self, expert_ids: List[int]) -> Dict[str, float]:
+        """Threshold per domain = the mean of every expert's score in THAT domain.
+
+        The bar is pool-relative, which normalises for domain difficulty: if one
+        domain yields systematically higher raw scores simply because its data is
+        easier, its bar rises with it. Comparing an expert's own scores across
+        domains (per-expert argmax) has no such correction and would pile the
+        whole pool into whichever domain happens to score highest."""
+        out: Dict[str, float] = {}
+        for d in DOMAINS:
+            vals = [self.domain_mean(e, d) for e in expert_ids]
+            vals = [v for v in vals if v is not None]
+            if vals:
+                out[d] = float(np.mean(vals))
+        return out
+
+    def assign_pool(self, expert_ids: List[int],
+                    target_sizes: Optional[Dict[str, int]] = None) -> Dict[str, List[int]]:
+        """Assign every expert to one domain, pool-relative.
+
+          1. threshold_d = mean score of all experts on domain d
+          2. margin_d(e) = score_d(e) - threshold_d      (comparable ACROSS
+             domains precisely because each threshold absorbs its own difficulty)
+          3. each expert provisionally goes to its largest-margin domain
+          4. domain over target -> drop the experts NEAREST the threshold
+             (smallest margin); they return to the unassigned pool
+          5. domain under target -> fill from the unassigned, taking those that
+             fell BELOW the bar but nearest to it (highest score first)
+
+        Steps 4-5 are why the threshold is a bar and not a hard filter: it ranks,
+        and the pool's target size decides how far down the ranking to cut."""
+        thresholds = self.domain_thresholds(expert_ids)
+        if not thresholds:
+            return {}
+        targets = target_sizes or {}
+        picked: Dict[str, List[int]] = {d: [] for d in thresholds}
+        margin: Dict[int, Dict[str, float]] = {}
+        for e in expert_ids:
+            m = {}
+            for d, thr in thresholds.items():
+                s = self.domain_mean(e, d)
+                if s is not None:
+                    m[d] = s - thr
+            if m:
+                margin[e] = m
+                picked[max(m, key=m.get)].append(e)
+        unassigned: List[int] = [e for e in expert_ids if e not in margin]
+        # 4. trim the over-full, releasing the marginal ones
+        for d, members in picked.items():
+            cap = targets.get(d)
+            if cap is None or len(members) <= cap:
+                continue
+            members.sort(key=lambda e: margin[e][d], reverse=True)
+            unassigned.extend(members[cap:])
+            picked[d] = members[:cap]
+        # 5. fill the under-full from those just below the bar
+        for d in picked:
+            cap = targets.get(d)
+            if cap is None or len(picked[d]) >= cap:
+                continue
+            pool = [e for e in unassigned if self.domain_mean(e, d) is not None]
+            pool.sort(key=lambda e: self.domain_mean(e, d), reverse=True)  # nearest the bar first
+            take = pool[: cap - len(picked[d])]
+            picked[d].extend(take)
+            unassigned = [e for e in unassigned if e not in take]
+        if self.registry is not None:
+            for d, members in picked.items():
+                for e in members:
+                    self.registry.assign(e, d)
+            for e in unassigned:
+                self.registry.release(e)
+        return picked
+
+    def assign_if_ready(self, expert_id: int) -> Optional[str]:
+        """Assign after sampling completes. Returns the domain, or None if the
+        expert is still sampling / already assigned."""
+        e = int(expert_id)
+        if self.registry is None or self.registry.assignment.get(e) is not None:
+            return None
+        if self.phase(e) != "specialise":
+            return None
+        best = self.best_domain(e)
+        if best:
+            self.registry.assign(e, best)
+        return best
+
+
 class TripleKSelector:
     def __init__(self, convolution: ApexNadirConvolution):
         self.convolution = convolution
