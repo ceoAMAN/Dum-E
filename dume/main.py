@@ -23,14 +23,14 @@ def main(argv=None) -> int:
     f = sub.add_parser("form");     f.add_argument("--samples", type=int, default=200)
     p = sub.add_parser("pretrain"); p.add_argument("--tokens", type=int, default=20000)
     t = sub.add_parser("train");    t.add_argument("--batches", type=int, default=50)
-    r = sub.add_parser("run");      r.add_argument("--prompt", required=True); r.add_argument("--max-tokens", type=int, default=256)
+    r = sub.add_parser("run");      r.add_argument("--prompt", required=True); r.add_argument("--max-tokens", type=int, default=256); r.add_argument("--no-dead-time", action="store_true")
     sub.add_parser("status")
     a = ap.parse_args(argv)
 
     if a.cmd == "status":
         from . import state
         blob = state.load()
-        if not blob:
+        if not blob or not blob.get("geometry"):
             print("cold"); return 0
         g = blob["geometry"]; st = blob["standing"]
         print(json.dumps({"clusters": int(g["B"].shape[0]), "tau": [round(float(x), 3) for x in g["tau"]],
@@ -49,14 +49,19 @@ def main(argv=None) -> int:
     elif a.cmd == "train":
         out = sysm.train(a.batches)
         print(json.dumps(out))
-        if out["measured_this_run"] <= 0:
-            print("[train] FAILED: this run recorded no grounded measurement — y never arrived", file=sys.stderr)
+        if out["graded_this_run"] <= 0:
+            print("[train] FAILED: this run graded no expert — every batch was refused or y never arrived "
+                  f"(reliability observations this run: {out['reliability_this_run']:.0f})", file=sys.stderr)
             return 1
     elif a.cmd == "run":
         out = sysm.answer(a.prompt, a.max_tokens)
         print(json.dumps({k: v for k, v in out.items() if k != "text"}, indent=1))
         print("\n" + out["text"])
-        sysm.save()
+        if out["timeline"] == "A" and not a.no_dead_time:
+            # the user has their answer; the dead time after it is Timeline B's.
+            sys.stdout.flush()
+            sysm.dead_time(a.prompt, out["text"])
+            sysm.save()
     return 0
 
 

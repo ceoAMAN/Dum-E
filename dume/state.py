@@ -18,7 +18,7 @@ from typing import Any, Dict, Optional
 
 from . import config as C
 
-VERSION = 2
+VERSION = 7   # v7: training sweeps the pool (curriculum); the router is deployment-only
 
 
 def path() -> Path:

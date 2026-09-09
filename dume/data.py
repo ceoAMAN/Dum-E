@@ -18,6 +18,7 @@ class Sample:
     prompt: str
     answer: str
     verifiable: str = ""          # a STRING: the checkable final value, or "" — never a bool
+    self_referent: bool = False   # y is Central's OWN output (dead-time B): never feeds reliability
     raw: Dict[str, Any] = field(default_factory=dict)
 
     @property

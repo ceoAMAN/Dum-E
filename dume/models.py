@@ -44,14 +44,30 @@ def backbone(model, ids: mx.array) -> mx.array:
     return h[0] if h.ndim == 3 else h
 
 
+def _head(model, h: mx.array) -> mx.array:
+    """Project hidden states through the LM head, tied or not."""
+    lm = getattr(model, "lm_head", None)
+    return lm(h) if lm is not None else model.model.embed_tokens.as_linear(h)
+
+
 def ce_per_token(model, ids: mx.array, n_ctx: int) -> mx.array:
-    """Teacher-forced CE over positions [n_ctx, T) only. On-graph."""
-    logits = model(ids.reshape(1, -1))
-    logits = logits[0] if logits.ndim == 3 else logits
-    T, s = int(logits.shape[0]), max(1, int(n_ctx))
+    """Teacher-forced CE over positions [n_ctx, T) only. On-graph.
+
+    The head is applied to the SCORED TAIL ONLY, never the whole sequence.
+    model(ids) materialises T x 151,936 floats: on a 2,400-token ultrachat row
+    that is 1.5 GB per call, and score() makes k+1 of them per batch with
+    Central and four experts already resident — 7.3 GB of a 12.1 GB Metal
+    working set. That is what OOM-killed the trainer (SIGKILL, rc 137).
+    Only M <= TARGET_MAX_TOKENS positions are ever read, so slicing the hidden
+    states before the projection costs nothing and bounds the transient by M
+    instead of T. Verified bit-equal against the full projection."""
+    h = model.model(ids.reshape(1, -1))
+    h = h[0] if h.ndim == 3 else h
+    T, s = int(h.shape[0]), max(1, int(n_ctx))
     if s >= T:
         return mx.zeros((0,), dtype=mx.float32)
-    return nn.losses.cross_entropy(logits[s - 1:T - 1, :], ids[s:T], reduction="none")
+    logits = _head(model, h[s - 1:T - 1, :])
+    return nn.losses.cross_entropy(logits, ids[s:T], reduction="none")
 
 
 def finite(x) -> bool:
@@ -68,9 +84,33 @@ def tree_finite(tree) -> bool:
     return True
 
 
-def save_lora(model, path: Path) -> None:
+def save_lora(model, path: Path, version: str = "") -> None:
+    """Write to .tmp then rename: a kill mid-save must not leave a truncated
+    safetensors that crashes every later boot. The version travels WITH the
+    weights so a stale checkpoint is refused, not silently inherited."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    mx.save_safetensors(str(path), dict(tree_flatten(model.trainable_parameters())))
+    # mx.save_safetensors silently APPENDS .safetensors to any other extension,
+    # so the tmp name must already end in it or the rename below finds nothing.
+    tmp = path.with_suffix(".tmp.safetensors")
+    mx.save_safetensors(str(tmp), dict(tree_flatten(model.trainable_parameters())),
+                        metadata={"dume_version": str(version)})
+    tmp.replace(path)
+
+
+def load_lora(model, path: Path, version: str = "") -> bool:
+    """Load only if the stamp matches. Returns False (leaving the model at base)
+    on a mismatch or an unreadable file — never a silent half-load."""
+    try:
+        _, meta = mx.load(str(path), return_metadata=True)
+        stamp = str(meta.get("dume_version", ""))
+        if version and stamp != str(version):
+            print(f"[ckpt] {path} was written by {stamp or 'an unstamped run'} != {version} — refusing it")
+            return False
+        model.load_weights(str(path), strict=False)
+        return True
+    except Exception as e:      # noqa: BLE001
+        print(f"[ckpt] could not read {path}: {e} — starting from base")
+        return False
 
 
 # ── memory (measured facts, not constants) ──────────────────────────────────
@@ -89,6 +129,15 @@ def reset_peak() -> None:
 def total_ram_mb() -> float:
     out = subprocess.check_output(["sysctl", "-n", "hw.memsize"], text=True).strip()
     return float(int(out)) / 2**20
+
+
+def working_set_mb() -> float:
+    """What the GPU will actually let us hold — Metal refuses past this, so it,
+    not total RAM, is the ceiling k is fitted under. Measured from the device."""
+    try:
+        return float(mx.device_info()["max_recommended_working_set_size"]) / 2**20
+    except Exception:       # noqa: BLE001
+        return 0.75 * total_ram_mb()
 
 
 def _sampler(temp: float):
@@ -113,8 +162,8 @@ class Gate:
         self.model.eval()
         self.route_head = nn.Linear(C.GATE_D, C.E)
         p = self._head_path()
-        if p.exists():
-            self.route_head.load_weights(str(p))
+        if p.exists() and not load_lora(self.route_head, p, self.weight_hash()):
+            self.route_head = nn.Linear(C.GATE_D, C.E)      # mismatch: start from init
         mx.eval(self.route_head.parameters())
         return self
 
@@ -179,9 +228,7 @@ class Gate:
         return float(loss.item())
 
     def save(self) -> None:
-        p = self._head_path()
-        p.parent.mkdir(parents=True, exist_ok=True)
-        mx.save_safetensors(str(p), dict(tree_flatten(self.route_head.parameters())))
+        save_lora(self.route_head, self._head_path(), self.weight_hash())
 
 
 # ── Central ─────────────────────────────────────────────────────────────────
@@ -191,6 +238,7 @@ class Central:
         self.tok = None
         self._limit: Optional[int] = None
         self._opt = None
+        self.version: str = ""       # set by System at boot
 
     def load(self) -> "Central":
         if self.model is not None:
@@ -201,7 +249,7 @@ class Central:
         p = self._ckpt()
         legacy = Path(C.LEGACY_CENTRAL_CKPT)
         if p.exists():
-            self.model.load_weights(str(p), strict=False)
+            load_lora(self.model, p, self.version)
         elif legacy.exists():
             self.model.load_weights(str(legacy), strict=False)
             print(f"[central] inherited grounded-CE checkpoint {legacy}")
@@ -236,12 +284,12 @@ class Central:
         still fits. Identical construction for the baseline and every expert
         pass, so the passes differ ONLY by the expert text."""
         cap = max(1, self.limit() - n_target)
-        ids = self.encode(question)
         nl = self.encode("\n")
+        ids = self.encode(question)[:C.WORKING_PROBE_TOKENS] + nl
         for t in expert_texts:
             if not t:
                 continue
-            ids = ids + nl + self.encode(t)
+            ids = ids + self.encode(t) + nl
         return ids[:cap]
 
     def ce_vector(self, ctx: List[int], y: List[int]) -> np.ndarray:
@@ -257,15 +305,31 @@ class Central:
             self._opt = optim.Adam(learning_rate=C.LR)
         return self._opt
 
-    def pretrain_step(self, question: str, answer: str) -> Tuple[float, int]:
-        """Plain next-token CE on the real answer. The ONLY time Central trains."""
+    def pretrain_step(self, question: str, answer: str, weight: float = 1.0) -> Tuple[float, int]:
+        """Plain next-token CE on the real answer.
+
+        `weight` is the SYMBIOSIS (Aman, 2026-09-10): "when central has better it
+        gives more gradients, experts accept it; central receives less. When the
+        composition is one central is bad at, it is the opposite." One measured
+        number governs both directions — rho, the composition-weighted mean of
+        Central's own HELD-OUT reliability, already computed on every input:
+
+            expert advantage  x  rho          trust the teacher where it is right
+            central weight    x  (1 - rho)    learn from the data where it is not
+
+        so the pair sums to one and neither side needs a schedule. Central never
+        takes this step on a held-out sample: reliability is fitted there, and
+        training on it would make the very number that gates this optimistic."""
         y = self.target_ids(answer)
         ctx = self.context_ids(question, [], len(y))
         ids = mx.array(ctx + y)
+        w = float(max(0.0, weight))
+        if w <= 0.0:
+            return 0.0, 0
         self.model.train()
 
         def loss_fn(m):
-            return mx.mean(ce_per_token(m, ids, len(ctx)))
+            return w * mx.mean(ce_per_token(m, ids, len(ctx)))
 
         loss, grads = nn.value_and_grad(self.model, loss_fn)(self.model)
         self.model.eval()
@@ -289,36 +353,115 @@ class Central:
         return generate(self.model, self.tok, prompt=prompt, max_tokens=max_tokens)
 
     def save(self) -> None:
-        save_lora(self.model, self._ckpt())
+        save_lora(self.model, self._ckpt(), self.version)
 
 
 # ── Experts ─────────────────────────────────────────────────────────────────
 class ExpertPool:
+    """One base, many adapters.
+
+    Every expert is the SAME frozen 1.5B base plus a 35 MB LoRA. Loading them as
+    100 independent models meant `mlx_lm.load()` per expert — 0.56-0.76 s and a
+    full 1.2 GB base copy each — so k_max=4 held four identical bases (4.8 GB) to
+    serve 140 MB of actual difference, and that redundancy is what set span_max
+    to 173 tokens. Swapping the adapter in place instead is 0.0035 s (170x) and
+    costs 35 MB.
+
+    Experts run SEQUENTIALLY on this machine, so exactly one adapter is live in
+    the base at a time (`self.active`). `resident` is the set whose weights are
+    held in RAM and can be made live for free; `_activate` moves one in, stashing
+    whatever was live first — an expert's gradient step is in the base's tensors
+    until it is stashed, so stashing before overwriting is not an optimisation,
+    it is the difference between training and losing the step.
+    """
+
     def __init__(self):
-        self.resident: Dict[int, object] = {}
+        self.base = None                       # the one shared, LoRA-wrapped model
+        self.pristine: Dict[str, mx.array] = {}   # a fresh adapter, for experts with no checkpoint
+        self.resident: Dict[int, Dict[str, mx.array]] = {}   # eid -> its adapter tensors
+        self.active: Optional[int] = None      # the eid whose weights are in `base` right now
         self.tok = None
         self._opts: Dict[int, object] = {}
         self.last_used: Dict[int, float] = {}
+        self.dirty: set = set()      # updated since last save; unload() must flush these
+
+    version: str = ""            # set by System at boot; stamped into every checkpoint
 
     def _ckpt(self, eid: int) -> Path:
         return Path(C.CHECKPOINT_DIR) / f"expert_{eid:03d}" / "weights.safetensors"
 
-    def load(self, eid: int) -> None:
-        if eid in self.resident:
-            self.last_used[eid] = time.time()
+    # ── the shared base ─────────────────────────────────────────────────────
+    def _boot(self) -> None:
+        if self.base is not None:
             return
         from mlx_lm import load
         model, tok = load(C.EXPERT_MODEL_ID)
         _lora(model)
+        mx.eval(model.parameters())
+        self.base, self.tok = model, self.tok or tok
+        self.pristine = {k: mx.array(v) for k, v in tree_flatten(model.trainable_parameters())}
+
+    def _fresh(self) -> Dict[str, mx.array]:
+        """A new adapter, initialised the way mlx does it: lora_b zero, lora_a
+        uniform(-1/sqrt(fan_in)). Re-drawn per expert — one shared draw would
+        give every expert the same starting direction."""
+        out = {}
+        for k, v in self.pristine.items():
+            if k.endswith("lora_a"):
+                sc = 1.0 / math.sqrt(v.shape[0])
+                out[k] = mx.random.uniform(low=-sc, high=sc, shape=v.shape, dtype=v.dtype)
+            else:
+                out[k] = mx.zeros(v.shape, dtype=v.dtype)
+        return out
+
+    def _stash(self) -> None:
+        """Pull the live adapter out of the base and back into `resident`."""
+        if self.active is None or self.active not in self.resident:
+            return
+        self.resident[self.active] = {k: v for k, v in tree_flatten(self.base.trainable_parameters())}
+
+    def _activate(self, eid: int):
+        """Make this expert's weights the live ones and return the model."""
+        self.load(eid)
+        if self.active != eid:
+            self._stash()
+            self.base.load_weights(list(self.resident[eid].items()), strict=False)
+            mx.eval(self.base.parameters())
+            self.active = eid
+        self.last_used[eid] = time.time()
+        return self.base
+
+    # ── residency ───────────────────────────────────────────────────────────
+    def load(self, eid: int) -> None:
+        self._boot()
+        if eid in self.resident:
+            self.last_used[eid] = time.time()
+            return
+        adapter = self._fresh()
         p = self._ckpt(eid)
         if p.exists():
-            model.load_weights(str(p), strict=False)
-        model.eval()
-        self.resident[eid] = model
-        self.tok = self.tok or tok
+            try:
+                w, meta = mx.load(str(p), return_metadata=True)
+                stamp = str(meta.get("dume_version", ""))
+                if self.version and stamp != str(self.version):
+                    print(f"[ckpt] {p} was written by {stamp or 'an unstamped run'} != {self.version} — refusing it")
+                else:
+                    adapter.update({k: v for k, v in w.items() if k in adapter})
+            except Exception as e:      # noqa: BLE001
+                print(f"[ckpt] could not read {p}: {e} — starting from base")
+        self.resident[eid] = adapter
         self.last_used[eid] = time.time()
 
     def unload(self, eid: int) -> None:
+        """Eviction must never lose training. An expert updated since its last
+        save is flushed BEFORE it is dropped — otherwise, with k_max seats and a
+        fresh trial every batch, most updates die within a few batches while
+        expert_loss still prints."""
+        if eid in self.dirty:
+            self.save(eid)
+        if self.active == eid:
+            self._stash()
+            self.active = None
         self.resident.pop(eid, None)
         self._opts.pop(eid, None)
         self.last_used.pop(eid, None)
@@ -333,37 +476,54 @@ class ExpertPool:
         system = ("You are a domain specialist. Analyse the excerpt and give the single key "
                   "insight another model should use to answer. Be concise. Do not answer as if "
                   "you were the user, and do not invent facts that are not present.")
-        user = f"Full question under consideration:\n{question}\n\nExcerpt assigned to you:\n{span_text}"
+        # ORIENTATION ONLY, bounded. Previously the whole question rode along with
+        # every span, which (a) made apex-nadir's allocation meaningless — the expert
+        # saw the entire input regardless of its span — and (b) left the sequence the
+        # backward pass runs over unbounded, at ~12 MB per prompt token.
+        q = self.tok.encode(question)
+        head = self.tok.decode(q[:C.TARGET_MAX_TOKENS]) + (" ..." if len(q) > C.TARGET_MAX_TOKENS else "")
+        user = f"Question under consideration:\n{head}\n\nExcerpt assigned to you:\n{span_text}"
         msgs = [{"role": "system", "content": system}, {"role": "user", "content": user}]
         tmpl = getattr(self.tok, "apply_chat_template", None)
         if tmpl and getattr(self.tok, "chat_template", None):
             return tmpl(msgs, tokenize=False, add_generation_prompt=True)
         return f"{system}\n\n{user}\n"
 
-    def _gen(self, eid: int, prompt: str, temp: float) -> str:
+    def _gen(self, eid: int, prompt: str, temp: float, budget: Optional[int] = None) -> str:
         from mlx_lm import generate
         kw = {"sampler": _sampler(temp)} if temp > 0 else {}
-        return generate(self.resident[eid], self.tok, prompt=prompt, max_tokens=C.EXPERT_GEN_TOKENS, **kw).strip()
+        # EXPERT_GEN_TOKENS is the FLOOR, not the count: apex-nadir allocates the
+        # budget and an expert never writes less than the floor. This is also what
+        # makes the cost curve c(t) = a + bt real — with a fixed 32 the wall time
+        # would be constant in t, b would fit to ~0 and cost would stop mattering.
+        n = max(C.EXPERT_GEN_TOKENS, int(budget)) if budget else C.EXPERT_GEN_TOKENS
+        return generate(self._activate(eid), self.tok, prompt=prompt, max_tokens=n, **kw).strip()
 
-    def run(self, eid: int, span_text: str, question: str) -> Tuple[str, float]:
+    def run(self, eid: int, span_text: str, question: str,
+            budget: Optional[int] = None) -> Tuple[str, float]:
         """Greedy analysis of the span. Returns (text, wall_seconds)."""
         t0 = time.perf_counter()
-        text = self._gen(eid, self.prompt(span_text, question), 0.0)
+        text = self._gen(eid, self.prompt(span_text, question), 0.0, budget)
         return text, time.perf_counter() - t0
 
-    def sample(self, eid: int, span_text: str, question: str) -> str:
-        return self._gen(eid, self.prompt(span_text, question), C.SAMPLE_TEMP)
+    def sample(self, eid: int, span_text: str, question: str,
+               budget: Optional[int] = None, rho: float = 0.0) -> str:
+        """The exploring candidate. Temperature is SAMPLE_TEMP * (1 - rho): where
+        Central is reliable the expert should accept it rather than wander, and
+        where Central is weak exploration is the only thing that can help."""
+        t = C.SAMPLE_TEMP * (1.0 - float(min(max(rho, 0.0), 1.0)))
+        return self._gen(eid, self.prompt(span_text, question), t, budget)
 
-    def update(self, eid: int, prompt: str, texts: List[str], advantages: List[float]) -> float:
+    def update(self, eid: int, prompt: str, texts: List[str], advantages: List[float]) -> Optional[float]:
         """Reward-weighted self-imitation: loss = sum_g A_g * CE(e_g | prompt).
         A>0 pulls toward the text, A<0 pushes away. No ratios, no KL, no reference."""
-        model = self.resident[eid]
+        model = self._activate(eid)
         p_ids = self.tok.encode(prompt)
         seqs = []
         for t in texts:
             t_ids = self.tok.encode(t) if t else []
             if not t_ids:
-                return 0.0
+                return None
             seqs.append(mx.array(list(p_ids) + list(t_ids)))
         n_ctx = len(p_ids)
         model.train()
@@ -381,11 +541,64 @@ class ExpertPool:
         grads, _ = optim.clip_grad_norm(grads, C.GRAD_CLIP)
         self.opt(eid).update(model, grads)
         mx.eval(model.parameters(), self.opt(eid).state)
+        self.dirty.add(eid)
         return float(loss.item())
 
     def save(self, eid: int) -> None:
-        if eid in self.resident:
-            save_lora(self.resident[eid], self._ckpt(eid))
+        if eid not in self.resident:
+            return
+        if self.active == eid:
+            self._stash()
+        p = self._ckpt(eid)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        mx.save_safetensors(str(p), dict(self.resident[eid]), metadata={"dume_version": str(self.version)})
+        self.dirty.discard(eid)
+
+    def save_all(self) -> None:
+        for e in list(self.dirty):
+            self.save(e)
+
+
+def measure_update_slope_mb(pool, eid: int) -> float:
+    """MB of peak memory per PROMPT TOKEN in an expert's backward pass.
+
+    Measured, not configured. The gradient step stores activations for every
+    layer over the whole sequence, so its cost is linear in prompt length and
+    it is by far the largest transient in the system: ~12 MB/token on the M4,
+    i.e. 13 GB at 1,024 tokens against a 12.1 GB Metal working set. That is
+    what SIGKILLed the trainer. Two SMALL probes (96 and 192 tokens, ~1.9 and
+    ~3.0 GB) bracket the line; no weights are written — value_and_grad alone,
+    no optimiser step."""
+    import mlx.nn as nn
+    model = pool._activate(eid)
+    ids = pool.tok.encode("token " * 200)
+    out = []
+    for n in (96, 192):
+        # TWO sequences, because that is what update() actually backprops: the
+        # greedy and the sampled candidate are summed in one loss.
+        seqs = [mx.array(list(ids[:n]) + list(pool.tok.encode(t)))
+                for t in (" a short note.", " a different short note.")]
+        mx.clear_cache()
+        reset_peak()
+        model.train()
+        loss, grads = nn.value_and_grad(
+            model, lambda m: sum(mx.mean(ce_per_token(m, q, n)) for q in seqs))(model)
+        mx.eval(loss, grads)          # MLX is lazy: without this nothing is computed and the
+        model.eval()                  # two probes read the same peak, giving slope 0
+        out.append(peak_mb())
+        mx.clear_cache()
+    slope = (out[1] - out[0]) / 96.0
+    return float(max(slope, 0.5))          # a floor: a non-positive slope is a bad measurement
+
+
+def measure_slot_mb(pool) -> float:
+    """MB an ADDITIONAL resident expert costs, now that the base is shared: its
+    adapter plus Adam's two moments over the same tensors. The base itself is
+    paid once, not once per seat — charging every seat a full 1.2 GB copy is
+    what pinned k_fit at 8 and span_max at 173."""
+    pool._boot()
+    mb = sum(v.size * v.dtype.size for v in pool.pristine.values()) / 2**20
+    return float(mb * 3.0)          # weights + Adam m + Adam v
 
 
 def measure_expert_peak_mb() -> float:
@@ -395,13 +608,18 @@ def measure_expert_peak_mb() -> float:
     from mlx_lm import load
     mx.clear_cache()
     reset_peak()
-    before = peak_mb()
-    model, _ = load(C.EXPERT_MODEL_ID)
-    mx.eval(model.parameters())
-    probe = mx.zeros((1, 256), dtype=mx.int32)
+    before = active_mb()          # NOT peak_mb(): reset_peak() just set the peak to 0, so
+    model, _ = load(C.EXPERT_MODEL_ID)   # peak-minus-peak would charge the expert for the
+    mx.eval(model.parameters())          # gate and Central that are already resident
+    # 256 tokens. Do NOT raise this: the probe runs with Central already resident,
+    # and a longer prefill through a 1.5B expert spikes past the Metal working set
+    # and takes the machine down. Measured on the M4 at 16 GB.
+    probe = mx.zeros((1, C.EXPERT_PROBE_TOKENS), dtype=mx.int32)
     out = model.model(probe) if hasattr(model, "model") else model(probe)
     mx.eval(out)
     m = peak_mb() - before
     del out, probe, model
     mx.clear_cache()
-    return max(1.0, m)
+    if m < 100.0:                 # a 1.5B 4-bit expert is ~1 GB of weights alone (rule 20)
+        raise RuntimeError(f"expert peak measured at {m:.0f} MB — the measurement is wrong, refusing to size k on it")
+    return m

@@ -1,13 +1,25 @@
 """THE owner of concurrency and residency. Nothing else clamps, defaults or
 re-derives a bound (rule 6).
 
-    k_fit  = floor( (R - sqrt(R) - central - gate - working) / expert_peak )
-    k_tier = floor( sqrt(R_GB) )                       Aman's RAM tiers: 16->4, 64->8
-    k_max  = min(k_fit, k_tier, MAX_CLUSTERS)
+    usable   = R - sqrt(R) - central - gate            Aman's law; sqrt(R) in GB
+    k_fit    = floor( usable / expert_peak )
+    k_tier   = floor( sqrt(R_GB) )                     Aman's RAM tiers: 16->4, 64->8
+    k_max    = min(k_fit, k_tier, MAX_CLUSTERS)
+    span_max = ( usable - k_max*expert_peak ) / slope  the SAME law, for the transient
 
-Every term is MEASURED at boot (expert peak, Central's CE-forward peak as the
-working reserve) — "measure it, don't set it" — and the result is printed with
-its inputs so a wrong number is visible, not silent. If k_fit < 1 the boot halts.
+span_max is the third bound and it comes off the same `usable`. Once k_max experts
+are resident, whatever `usable` still has is what a gradient step may spend, and a
+gradient step costs a MEASURED ~12 MB per prompt token (models.measure_update_slope_mb)
+because it stores activations for every layer over the whole sequence. Unbounded, a
+1,024-token prompt asks for 13 GB and the OS SIGKILLs the trainer. This is a physical
+clamp on apex-nadir's t_hi exactly as k_max is a physical clamp on its k.
+
+sqrt(R) is the headroom reserve — 4 GB of the 16 on this M4 — and it is the same
+sqrt bracket k_tier uses. k_tier binds in practice here (k_max 4), so the pool
+commits 6-8 GB against Metal's 11.8 GB ceiling; the ceiling is printed alongside
+and a warning fires if a commitment ever crosses it.
+
+expert_peak is MEASURED at boot. If k_fit < 1 the boot halts.
 
 k = min(k_wanted, k_max). When k_wanted > k_max the scheduler clamps k and the
 router keeps the MOST IMPORTANT experts (Aman: "when k is minimum gating
@@ -20,26 +32,50 @@ import math
 from typing import Iterable, List
 
 from . import config as C
-from .models import ExpertPool, active_mb, total_ram_mb
+from .models import ExpertPool, active_mb, total_ram_mb, working_set_mb
 
 
 class Scheduler:
-    def __init__(self, pool: ExpertPool, expert_peak_mb, central_mb: float,
-                 gate_mb: float, working_mb: float):
+    def __init__(self, pool: ExpertPool, expert_peak_mb, central_mb: float, gate_mb: float,
+                 update_slope_mb: float = 0.0, slot_mb: float = 0.0):
         self.pool = pool
         R = total_ram_mb()
-        usable = R - math.sqrt(R) - central_mb - gate_mb - working_mb
+        ws = working_set_mb()
+        # Aman's law:  space for k  =  R - sqrt(R) - central - gate
+        # sqrt(R) is in GB (16 GB -> a 4 GB reserve), the same bracket k_tier uses.
+        reserve = math.sqrt(R / 1024.0) * 1024.0
+        usable = R - reserve - central_mb - gate_mb
         self.k_tier = max(1, int(math.floor(math.sqrt(R / 1024.0))))
         if expert_peak_mb is None:                      # no experts this run: nothing to fit
-            self.k_fit, self.k_max = 0, 0
-            print(f"[scheduler] RAM {R:.0f} MB | central {central_mb:.0f} | gate {gate_mb:.0f} | "
-                  f"working {working_mb:.0f} | experts not measured (none needed)")
+            self.k_fit, self.k_max, self.span_max = 0, 0, C.EXPERT_GEN_TOKENS
+            print(f"[scheduler] RAM {R:.0f} MB | reserve sqrt {reserve:.0f} | central {central_mb:.0f} | "
+                  f"gate {gate_mb:.0f} | usable {usable:.0f} | (Metal ws {ws:.0f}) | "
+                  f"experts not measured (none needed)")
             return
-        self.k_fit = int(usable // max(1.0, expert_peak_mb))
+        # The base is SHARED: it is paid once, and a seat costs only its adapter
+        # plus Adam's moments (~105 MB), not another 1.2 GB copy of the same
+        # frozen weights. That redundancy was the whole of k_fit.
+        self.slot_mb = float(slot_mb) if slot_mb > 0 else float(expert_peak_mb)
+        self.k_fit = int(max(0.0, usable - expert_peak_mb) // max(1.0, self.slot_mb))
         self.k_max = max(0, min(self.k_fit, self.k_tier, C.MAX_CLUSTERS))
-        print(f"[scheduler] RAM {R:.0f} MB | central {central_mb:.0f} | gate {gate_mb:.0f} | "
-              f"working {working_mb:.0f} | expert peak {expert_peak_mb:.0f} -> k_fit {self.k_fit}, "
-              f"k_tier {self.k_tier} => k_max {self.k_max}")
+        # the same `usable`, for the transient: what is left once k_max are resident,
+        # divided by the measured cost of one prompt token in the backward pass.
+        # The sequence that gets backpropped is span + orientation header + the
+        # expert's own generated text, so two TARGET_MAX_TOKENS come off the top
+        # before what remains is the span.
+        free = usable - expert_peak_mb - self.k_max * self.slot_mb
+        self.span_max = (int(max(C.EXPERT_GEN_TOKENS, free / update_slope_mb - 2 * C.TARGET_MAX_TOKENS))
+                         if update_slope_mb > 0 else 1 << 30)
+        committed = central_mb + gate_mb + expert_peak_mb + self.k_max * self.slot_mb
+        print(f"[scheduler] RAM {R:.0f} MB | reserve sqrt {reserve:.0f} | central {central_mb:.0f} | "
+              f"gate {gate_mb:.0f} | usable {usable:.0f} | base {expert_peak_mb:.0f} + "
+              f"{self.slot_mb:.0f}/seat -> "
+              f"k_fit {self.k_fit}, k_tier {self.k_tier} => k_max {self.k_max} "
+              f"| commits {committed:.0f} of Metal ws {ws:.0f} "
+              f"| free {free:.0f} / {update_slope_mb:.1f} MB per tok => span_max {self.span_max}")
+        if committed > ws:
+            print(f"[scheduler] WARNING commits {committed:.0f} MB > Metal working set {ws:.0f} MB "
+                  f"— the GPU refuses allocations past that ceiling")
         if self.k_max < 1:
             raise RuntimeError("scheduler: not one expert fits alongside central+gate — refusing to run")
 

@@ -4,6 +4,7 @@
   pretrain  Central alone, plain CE on real answers, over a token budget
   train     joint: route -> experts -> grounded score -> standing -> updates
   answer    deployment: same routing, Central synthesises, NOTHING is written
+            (no reward, no standing, no tau, no chains, no clock)
 
 Training is dataset-based; deployment is input-based (Aman p.1). The live path
 has no reward and no second scorer, so there is nothing to silently fall back to.
@@ -18,14 +19,38 @@ import numpy as np
 
 from . import config as C
 from . import data, state
+from .alloc import AllocLaw
 from .chain import MigrationChains, SizeChains
+from .curriculum import Curriculum
 from .geometry import Geometry
 from .health import Health
-from .models import Central, ExpertPool, Gate, active_mb, measure_expert_peak_mb, peak_mb, reset_peak
-from .reward import Reliability, is_heldout, score, score_one, weights
-from .router import Plan, Router
+from .models import (Central, ExpertPool, Gate, active_mb, measure_expert_peak_mb,
+                     measure_update_slope_mb, measure_slot_mb, reset_peak)
+from .reward import CentralBand, Reliability, is_heldout, score, score_one
+from .router import Router
 from .scheduler import Scheduler
 from .standing import Standing
+
+
+def _restored(obj, cls, *args):
+    """Unpickle only if the stored object still matches the CURRENT class.
+
+    state.VERSION guards the blob's SHAPE, but these values are pickled live
+    objects: unpickling restores an old instance's __dict__ into the new class,
+    so a field added since the checkpoint is simply absent and the first read of
+    it raises. That is what happened to CentralBand when the quantile band was
+    replaced by the gain gate — the store looked fine and boot would have failed
+    on the next attribute access. A mismatched object is rebuilt cold rather
+    than half-restored; only that mechanism's history is lost, never the
+    geometry or the standing.
+    """
+    if obj is None or not isinstance(obj, cls):
+        return cls(*args)
+    missing = [k for k in vars(cls(*args)) if not hasattr(obj, k)]
+    if missing:
+        print(f"[state] {cls.__name__} predates {', '.join(missing)} — rebuilding it cold")
+        return cls(*args)
+    return obj
 
 
 class System:
@@ -38,6 +63,9 @@ class System:
         self.rel: Optional[Reliability] = None
         self.mig: Optional[MigrationChains] = None
         self.size: Optional[SizeChains] = None
+        self.alloc: Optional[AllocLaw] = None
+        self.band: Optional[CentralBand] = None
+        self.curric: Optional[Curriculum] = None
         self.sched: Optional[Scheduler] = None
         self.router: Optional[Router] = None
         self.health = Health()
@@ -55,19 +83,28 @@ class System:
         gate_mb = active_mb() - base
         self.central.load()
         central_mb = active_mb() - base - gate_mb
-        # working reserve = Central's CE-forward peak (the logits spike), measured
-        reset_peak()
-        probe_y = self.central.encode("The quick brown fox jumps over the lazy dog. " * 12)[:C.TARGET_MAX_TOKENS]
-        self.central.ce_vector(self.central.context_ids("probe", [], len(probe_y)), probe_y)
-        working_mb = max(0.0, peak_mb() - active_mb())
+        # no working-memory probe: the reserve is sqrt(R), not a measured spike, so
+        # a full 1024-token Central forward at every boot would cost a real memory
+        # spike to produce a number nothing reads.
         expert_mb = measure_expert_peak_mb() if need_experts else None
-        self.sched = Scheduler(self.pool, expert_mb, central_mb, gate_mb, working_mb)
+        slope = slot = 0.0
+        if need_experts:
+            self.pool.load(0)                       # a real expert, wrapped exactly as it runs
+            slope = measure_update_slope_mb(self.pool, 0)
+            slot = measure_slot_mb(self.pool)
+            self.pool.unload(0)
+        self.sched = Scheduler(self.pool, expert_mb, central_mb, gate_mb, slope, slot)
+        self.central.version = self.pool.version = self.gate.weight_hash()
         self._restore()
         return self
 
     def _restore(self) -> None:
         blob = state.load()
         gate_hash = self.gate.weight_hash()
+        if blob:            # the clock and the stream position are independent of the geometry
+            self.clock = int(blob.get("clock", 0))
+            self.batch = int(blob.get("batch", 0))
+            self.consumed = dict(blob.get("consumed", {}))
         if blob and blob.get("geometry"):
             geo = Geometry.from_dict(blob["geometry"])
             if geo.version.get("gate") != gate_hash:
@@ -77,12 +114,13 @@ class System:
             self.geo = geo
         if self.geo is not None and blob:
             self.standing = Standing.from_dict(blob["standing"]) if blob.get("standing") else Standing(self.geo.C)
-            self.rel = blob.get("reliability") or Reliability(self.geo.C)
-            self.mig = blob.get("migration") or MigrationChains(self.geo.C)
-            self.size = blob.get("size") or SizeChains(self.geo.C)
-            self.clock = int(blob.get("clock", 0))
-            self.batch = int(blob.get("batch", 0))
-            self.consumed = dict(blob.get("consumed", {}))
+            self.rel = _restored(blob.get("reliability"), Reliability, self.geo.C)
+            self.mig = _restored(blob.get("migration"), MigrationChains, self.geo.C)
+            self.size = _restored(blob.get("size"), SizeChains, self.geo.C)
+            self.alloc = _restored(blob.get("alloc"), AllocLaw)
+            self.band = _restored(blob.get("band"), CentralBand)
+            if blob.get("curriculum"):
+                self.curric = Curriculum.from_dict(blob["curriculum"])
             print(f"[state] restored: {self.geo.C} clusters, standing n={self.standing.total_n():.0f}, "
                   f"reliability obs={self.rel.total_obs():.0f}, clock={self.clock}, batch={self.batch}")
         self._wire()
@@ -93,17 +131,23 @@ class System:
         if self.standing is None:
             self.standing, self.rel = Standing(self.geo.C), Reliability(self.geo.C)
             self.mig, self.size = MigrationChains(self.geo.C), SizeChains(self.geo.C)
-        self.router = Router(self.gate, self.geo, self.standing, self.sched)
+        if self.alloc is None:
+            self.alloc = AllocLaw()
+        if self.band is None:
+            self.band = CentralBand()
+        if self.curric is None:
+            self.curric = Curriculum()
+        self.router = Router(self.gate, self.geo, self.standing, self.sched, self.alloc)
 
     def save(self) -> None:
         if self.geo is None:
             return
         state.save({"geometry": self.geo.to_dict(), "standing": self.standing.to_dict(),
                     "reliability": self.rel, "migration": self.mig, "size": self.size,
+                    "alloc": self.alloc, "band": self.band, "curriculum": self.curric.to_dict(),
                     "clock": self.clock, "batch": self.batch, "consumed": self.consumed})
         self.gate.save()
-        for e in list(self.pool.resident):
-            self.pool.save(e)
+        self.pool.save_all()
 
     def stream(self):
         if self._stream is None:
@@ -121,7 +165,10 @@ class System:
         X = np.stack(vecs)
         self.geo = Geometry.form(X, C.MAX_CLUSTERS, {"gate": self.gate.weight_hash(),
                                                      "extractor": "extract_pair.v1"})
-        self.standing = self.rel = self.mig = self.size = None
+        self.standing = self.rel = self.mig = self.size = self.alloc = self.band = None
+        self.curric = None                   # a new geometry retires the schedule too
+        self.batch, self.clock = 0, 0        # a new geometry has no history; `consumed` stays
+        self.health = Health()
         self._wire()
         self.save()
         return self.geo
@@ -134,11 +181,15 @@ class System:
             if math.isfinite(loss):
                 losses.append(loss)
             done += n
-            if len(losses) % 10 == 0 and losses:
+            if losses and len(losses) % 10 == 0:
                 print(f"[pretrain] {done}/{n_tokens} tokens, ce {np.mean(losses[-10:]):.3f}")
             if done >= n_tokens:
                 break
+            if losses and len(losses) % C.SAVE_EVERY == 0:
+                self.central.save()
+                self.save()                  # persist `consumed`: never re-feed train the pretrain rows
         self.central.save()
+        self.save()
         return {"tokens": done, "ce_first": float(np.mean(losses[:10])) if losses else float("nan"),
                 "ce_last": float(np.mean(losses[-10:])) if losses else float("nan"), "sec": time.time() - t0}
 
@@ -155,106 +206,278 @@ class System:
             if s is None:
                 break
             r = self._train_one(s)
-            admitted += int(r.get("admitted", 0))
-            skipped += int(not r.get("admitted", 0))
+            admitted += int(r.get("graded", 0))
+            skipped += int(not r.get("graded", 0))
             self.batch += 1
             if self.batch % C.MIGRATE_EVERY == 0:
-                moves = self.standing.migrate(self.mig)
+                if self.curric.ready(self.standing):
+                    gen = self.standing.settle_generals(self.geo.domain())
+                    print(f"[curriculum] testing done: general class locked {gen}")
+                moves = self.standing.migrate(self.mig, cap=self.geo.capacity(), domain=self.geo.domain())
                 if moves:
                     print(f"[migrate] b{self.batch}: {len(moves)} moves {moves[:6]}")
+                if self.curric.advance(self.standing):
+                    seated = sum(len(self.standing.members(c)) for c in range(self.geo.C))
+                    print(f"[curriculum] b{self.batch}: TEST -> SPECIALIZE after "
+                          f"{self.curric.sweeps} sweeps; {seated} experts seated")
             if self.batch % C.SAVE_EVERY == 0:
                 self.save()
         self.save()
-        return {"batches": self.batch, "ran": self.batch - (target - int(n_batches)), "admitted": admitted,
-                "skipped": skipped, "sec": time.time() - t0,
+        return {"batches": self.batch, "ran": self.batch - (target - int(n_batches)), "graded": admitted,
+                "not_graded": skipped, "sec": time.time() - t0,
                 "standing_n": self.standing.total_n(), "reliability_obs": self.rel.total_obs(),
-                "measured_this_run": (self.standing.total_n() - n0) + (self.rel.total_obs() - r0)}
+                "timeline_a_rate": self.band.rate(), "graded_this_run": self.standing.total_n() - n0,
+                "reliability_this_run": self.rel.total_obs() - r0}
 
     def _train_one(self, s: data.Sample) -> Dict[str, float]:
-        plan = self.router.plan(s.prompt)
+        # training PROBES: spans come from {t_lo, t_mid, t_hi} rather than the
+        # fitted allocation, so span size is explored at no extra cost. Only the
+        # 2*sqrt(E) extreme-ranked experts (§2) feed the curves.
+        plan = self.router.plan(s.prompt, probe=True, curriculum=self.curric)
         resident = self.sched.ensure([sel.eid for sel in plan.selections])
         sels = [sel for sel in plan.selections if sel.eid in resident]
         y = self.central.target_ids(s.answer)
-        assign_y = self.geo.assign_tokens(self.gate.hidden(self.gate.encode(s.answer)[:512]))
+        # token types are read off the TARGET IDS THEMSELVES, so assign_y[t] pairs with
+        # b[t] by construction — the reliability writer and the weight reader index the
+        # same t. (Resampling a differently-sized assignment silently mismatched them.)
+        assign_y = self.geo.assign_tokens(self.gate.hidden(y))
         texts: Dict[int, str] = {}
         spans: Dict[int, str] = {}
+        emitted: Dict[int, int] = {}
+        secs: Dict[int, float] = {}
+        share = self._context_share(len(sels), s.prompt, len(y))
         for sel in sels:
             span_text = self.gate.tok.decode(plan.ids[sel.start:sel.end])
             spans[sel.eid] = span_text
-            texts[sel.eid], _ = self.pool.run(sel.eid, span_text, s.prompt)
+            t_run = time.time()
+            budget = self.alloc.budget(sel.n_tokens, sel.n_tokens, share)
+            texts[sel.eid], _ = self.pool.run(sel.eid, span_text, s.prompt, budget=budget)
+            secs[sel.eid] = time.time() - t_run
+            emitted[sel.eid] = len(self.pool.tok.encode(texts[sel.eid])) if texts[sel.eid] else 0
         sc = score(self.central, s.prompt, y, assign_y, texts, self.rel)
-        heldout = is_heldout(s.key)
-        self.health.deltas_seen(sc.deltas, sc.zero_delta)
+        heldout = is_heldout(s.key) and not s.self_referent
+        self.health.deltas_seen(sc.deltas, sc.zero_delta, dropped=len(sc.dropped))
         self.health.texts_seen(texts)
+        trust = float(plan.w @ self.rel.vector())
+        place = AllocLaw.placement(self.standing.rank(self.geo.domain()))
+        u_best = max([place.get(sel.eid, 0.5) for sel in sels], default=0.5)
+        tl = self.band.decide(self.alloc, len(plan.ids), u_best)
         rec: Dict[str, float] = {"k": len(sels), "k_wanted": plan.k_wanted, "T": len(plan.ids), "M": len(y),
-                                 "rho": sc.rho, "heldout": float(heldout), "admitted": float(sc.admitted)}
+                                 "rho": sc.rho, "heldout": float(heldout), "admitted": float(sc.admitted),
+                                 "trust": trust, "timeline_a": self.band.rate()}
+        if self.band.last_gain is not None:
+            rec["pred_gain"] = float(self.band.last_gain)
+        wv = self.alloc.width_varies()
+        if wv is not None:
+            rec["alloc_width_var"] = wv
         if heldout:
             self.rel.observe(sc.b, assign_y)
         elif sc.admitted:
             for sel in sels:
-                self.standing.observe(sel.eid, sel.cid, sc.deltas[sel.eid], sel.n_tokens)
+                if sel.eid not in sc.deltas:        # its text never reached Central; nothing was measured
+                    continue
+                rec["graded"] = 1.0
+                # divisor = tokens the expert EMITTED, never the span the router handed it
+                self.standing.observe(sel.eid, sel.cid, sc.deltas[sel.eid], emitted[sel.eid],
+                                      sc.correct.get(sel.eid, 0.0), sc.halluc.get(sel.eid, 0.0),
+                                      secs.get(sel.eid, 0.0))
+            # only the 2*sqrt(E) extreme-ranked experts feed the curves (§2): every
+            # expert is ALLOCATED per-expert, but fitting off the extremes is what
+            # saves the compute and gives the envelope its spread.
+            probe_set = set(self.alloc.sample(self.standing.rank(self.geo.domain())))
+            for sel in sels:
+                if sel.eid in sc.deltas and sel.eid in probe_set:
+                    self.alloc.observe(sel.n_tokens, sc.deltas[sel.eid], secs.get(sel.eid))
             rec["gate_loss"] = self.router.gate_step(plan, sc.deltas)
-            rec["expert_loss"] = self._expert_update(sels[0], spans, texts, sc, s, y, assign_y) if sels else 0.0
-        self._breathe(sels, len(plan.ids))
+            loss = self._expert_update(self._update_target(plan, sels, sc), spans, texts, sc, s, y)
+            self.health.update_seen(loss)
+            if loss is not None:
+                rec["expert_loss"] = loss
+            imit = self._imitate(sels, spans, texts, sc, s)
+            if imit is not None:
+                rec["imitate_loss"] = imit
+            # SYMBIOSIS. rho is Central's held-out reliability on THIS composition.
+            # High rho: Central is the judge — it GIVES gradient (experts step
+            # further on its verdict, and stop exploring) and TAKES little. Low
+            # rho: the experts carry the input and Central is the one that has to
+            # learn from the answer. The two weights are rho and 1-rho, so they
+            # sum to one and neither side needs a schedule.
+            #
+            # LAST, not earlier: _expert_update re-runs Central through score_one
+            # to grade the sampled candidate against the SAME baseline b measured
+            # at the top of this batch. Stepping Central before that would grade
+            # d_s on a different instrument than b — the paired difference is only
+            # meaningful while Central is frozen, which is the whole premise of
+            # the reward. Never on a held-out sample either: reliability is fitted
+            # there, and training on it would flatter the number that gates this.
+            if not heldout and self.central.model is not None:
+                cw = 1.0 - float(min(max(sc.rho, 0.0), 1.0))
+                if cw > 0.0:
+                    cl, _ = self.central.pretrain_step(s.prompt, s.answer, cw)
+                    if math.isfinite(cl):
+                        rec["central_loss"] = cl
+        if self.alloc.input_seen(len(plan.ids)):          # every E inputs
+            self.alloc.fit()
+            print(f"[alloc] {self.alloc.state()}")
+        self._breathe(plan)
         self.clock += len(plan.ids)
         self.health.put(**rec, clock=self.clock, active_mb=active_mb())
         self.health.tick(self.standing.total_n(), self.rel, self.size, self.mig)
         d = " ".join(f"e{sel.eid}{'*' if sel.trial else ''}:{sc.deltas.get(sel.eid, float('nan')):+.3f}" for sel in sels)
-        losses = " ".join(f"{k}={rec[k]:.3f}" for k in ("gate_loss", "expert_loss") if k in rec)
-        print(f"[b{self.batch}] {s.source} k={len(sels)}/{plan.k_wanted} home={plan.home} present={plan.present} "
-              f"rho={sc.rho:.2f} {'HELDOUT' if heldout else ('ADMIT' if sc.admitted else 'REFUSE')} {d} {losses}")
+        rec["k_alloc"] = float(self.alloc.k(len(plan.ids)))
+        losses = " ".join(f"{k}={rec[k]:.3f}" for k in ("gate_loss", "expert_loss", "central_loss") if k in rec)
+        print(f"[b{self.batch}] {s.source} T{tl} k={len(sels)}/{plan.k_wanted} home={plan.home} present={plan.present} "
+              f"M={len(y)} rho={sc.rho:.2f} {'HELDOUT' if heldout else ('ADMIT' if sc.admitted else 'REFUSE')} {d} {losses}")
         return rec
 
-    def _breathe(self, sels, T: int) -> None:
-        """Territory: tau follows PREDICTED load; direction never moves. Load is
-        the share of tokens actually allocated to each cluster — the quantity tau
-        affects — so tightening reduces observed load and the loop self-corrects.
-        Measuring composition weight instead would ignore tau and run away."""
-        share = np.zeros(self.geo.C)
-        for sel in sels:
-            share[sel.cid] += sel.n_tokens
-        share /= max(1, T)
+    def _context_share(self, k: int, question: str, n_target: int) -> int:
+        """Each expert's slice of what is actually left in Central's window once
+        the question and the whole of y are accounted for. MEASURED off the real
+        limit — this is the constraint that genuinely binds on a 16 GB machine."""
+        free = self.central.limit() - n_target - min(len(self.central.encode(question)),
+                                                     C.WORKING_PROBE_TOKENS)
+        return max(C.EXPERT_GEN_TOKENS, int(free) // max(1, int(k)))
+
+    @staticmethod
+    def _update_target(plan, sels, sc):
+        """The HOME expert learns, not whichever span happened to come first in the
+        document. Falls back to the best-scoring non-trial seat, then to any seat."""
+        scored = [sel for sel in sels if sel.eid in sc.deltas]
+        if not scored:
+            return None
+        home = [sel for sel in scored if sel.cid == plan.home and not sel.trial]
+        body = [sel for sel in scored if not sel.trial]
+        return (home or body or scored)[0]
+
+    def _breathe(self, plan) -> None:
+        """Territory: tau follows PREDICTED presence; direction never moves.
+
+        Load is how often a cluster's territory CONTAINS the input — the exact
+        quantity tau gates, so tightening lowers it and the loop self-corrects —
+        measured over a rolling window and scored against the population average,
+        which is a reachable setpoint. The previous version measured each
+        cluster's share of allocated tokens against 1/C; with at most k_max seats
+        among C clusters no cluster could ever read HEALTHY, so every tau wound
+        to a rail and territory became vacuous."""
+        self.geo.grow(plan.inside)          # centroids EARN seats from the input they receive
+        rate = self.size.observe(plan.inside)
+        if rate is None:                    # window not full: no measurement, no move
+            return
         for c in range(self.geo.C):
-            self.size.observe_load(c, float(share[c]), self.geo.C)
             self.geo.set_tau(c, self.size.next_tau(c, float(self.geo.tau[c])))
 
-    def _expert_update(self, sel, spans, texts, sc, s, y, assign_y) -> float:
+    def _expert_update(self, sel, spans, texts, sc, s, y) -> Optional[float]:
         """Reward-weighted self-imitation on the home expert: a second sampled
-        candidate, standardised advantage, CE on its own text signed by which
-        one helped Central more. Silences itself when both score alike."""
+        candidate, advantage in the reward's own units, CE on its own text signed
+        by which one helped Central more. Returns None when nothing ran, so a
+        skipped step is never reported as a loss of 0.000."""
+        if sel is None:
+            return None
         eid = sel.eid
         greedy, d_g = texts[eid], sc.deltas[eid]
-        sampled = self.pool.sample(eid, spans[eid], s.prompt)
+        sampled = self.pool.sample(eid, spans[eid], s.prompt,
+                                   budget=len(self.pool.tok.encode(greedy)) or None,
+                                   rho=sc.rho)
         if not sampled or sampled == greedy:
-            return 0.0
-        w = weights(self.rel, assign_y, len(sc.b))
-        d_s = score_one(self.central, s.prompt, y, sc.b, w, sampled)
-        sd = abs(d_g - d_s)
-        if sd < 1e-6:
-            return 0.0
+            return None
+        d_s = score_one(self.central, s.prompt, y, sc.b, sc.w, sampled, sc.base_len)
+        if d_s is None:
+            return None
+        # Gate on the reward's OWN measured noise, not an invented 1e-6: standardising
+        # by the pair's spread turned every difference, however tiny, into a full-strength
+        # +-0.5 coin flip. Below the noise floor there is no direction to learn.
+        floor = float(self.health.rec.get("delta_std", 0.0)) * 0.25
+        if abs(d_g - d_s) <= floor:
+            return None
         m = (d_g + d_s) / 2.0
-        adv = [(d_g - m) / sd, (d_s - m) / sd]
-        return self.pool.update(eid, self.pool.prompt(spans[eid], s.prompt), [greedy, sampled], adv)
+        # the other half of the symbiosis: the advantage is Central's verdict, so
+        # it is worth exactly what Central is worth on this composition.
+        g = float(min(max(sc.rho, 0.0), 1.0))
+        return self.pool.update(eid, self.pool.prompt(spans[eid], s.prompt), [greedy, sampled],
+                                [g * (d_g - m), g * (d_s - m)])
 
-    # ── answer (deployment; writes nothing) ─────────────────────────────────
+    def _imitate(self, sels, spans, texts, sc, s) -> Optional[float]:
+        """Dormant distillation. The trial seat learns the TEXT of the best-scoring
+        seated expert on the same input: idle capacity improving on somebody
+        else's gradient, which is the only way a dormant expert climbs out of
+        general on scraps.
+
+        The spec's weighted sum over superior experts degenerates to the argmax
+        here — with k <= 4 there is at most one clearly-superior seat, and CE
+        against the winner's text reuses pool.update rather than needing a new
+        hidden-state path.
+        # ponytail: single teacher; weight the top few if k ever gets large.
+        """
+        trial = next((x for x in sels if x.trial and x.eid in spans), None)
+        if trial is None:
+            return None
+        peers = [x for x in sels if not x.trial and x.eid in sc.deltas and texts.get(x.eid)]
+        if not peers:
+            return None
+        best = max(peers, key=lambda x: sc.deltas[x.eid])
+        if sc.deltas[best.eid] <= sc.deltas.get(trial.eid, -1e9):
+            return None                       # nothing superior to imitate
+        return self.pool.update(trial.eid, self.pool.prompt(spans[trial.eid], s.prompt),
+                                [texts[best.eid]], [1.0])
+
+    def dead_time(self, prompt: str, delivered: str) -> Dict[str, float]:
+        """Timeline B, run in the dead time AFTER Timeline A has served the user.
+
+        A answered alone and that answer is already out the door — nothing an
+        expert says can move it. So it is a legitimate frozen referent: B re-runs
+        the same input WITH experts, scores each against the delivered text and
+        trains. This is the only thing that keeps experts improving on deployment
+        traffic, where no y ever arrives.
+
+        Marked self_referent, so it never feeds Central's RELIABILITY: y is
+        Central's own output and Central would grade itself perfectly by
+        construction."""
+        if self.geo is None or not delivered.strip():
+            return {}
+        r = self._train_one(data.Sample(source="deadtime", prompt=prompt,
+                                        answer=delivered, self_referent=True))
+        self.batch += 1
+        return r
+
+    # ── answer (deployment; writes nothing until dead_time) ─────────────────
     def answer(self, prompt: str, max_tokens: int = 256) -> Dict[str, object]:
         if self.geo is None:
-            return {"text": self.central.generate(prompt, [], max_tokens), "k": 0, "trust": 1.0, "notes": []}
-        plan = self.router.plan(prompt)
+            return {"text": self.central.generate(prompt, [], max_tokens), "k": 0, "timeline": "A",
+                    "trust": 1.0, "notes": []}
+        plan = self.router.plan(prompt, probe=False)     # fitted allocation, padded spans
+        trust = float(plan.w @ self.rel.vector())
+        place = AllocLaw.placement(self.standing.rank(self.geo.domain()))
+        u_best = max([place.get(sel.eid, 0.5) for sel in plan.selections], default=0.5)
+        if self.band.decide(self.alloc, len(plan.ids), u_best) == "A":
+            # Timeline A: apex-nadir predicts the allocation buys nothing here, so
+            # Central answers alone. K=0, no expert is loaded, and nothing is
+            # written — deployment has no y, so nothing here could be grounded.
+            return {"text": self.central.generate(prompt, [], max_tokens), "k": 0, "timeline": "A",
+                    "trust": trust, "notes": [], "home": plan.home, "w": plan.w.round(3).tolist()}
         resident = self.sched.ensure([sel.eid for sel in plan.selections])
+        share = self._context_share(len(plan.selections), prompt, max_tokens)
         notes: List[tuple] = []
         for sel in plan.selections:
             if sel.eid not in resident:
                 continue
             span_text = self.gate.tok.decode(plan.ids[sel.start:sel.end])
-            text, _ = self.pool.run(sel.eid, span_text, prompt)
+            text, _ = self.pool.run(sel.eid, span_text, prompt,
+                                    budget=self.alloc.budget(sel.n_tokens, sel.n_tokens, share))
             st = self.standing.score(sel.eid, sel.cid)
             notes.append((st if st is not None else -1e9, text))
-        self._breathe([sel for sel in plan.selections if sel.eid in resident], len(plan.ids))
-        self.clock += len(plan.ids)
-        trust = float(plan.w @ self.rel.vector())
+        # no _breathe, no clock: deployment inputs are a different population and must
+        # not move the territory the training loop is controlling (two writers, one tau)
+        #
+        # This is the SYNTHESIS half of the symbiosis, and it is DEPLOYMENT ONLY
+        # (Aman, 2026-09-10: "this in deployment; during training we just gather
+        # scores, train and specialize"). `trust` is the same quantity as training's
+        # rho, measured the only way it can be here — composition-weighted, since
+        # deployment has no y to weight per target token. High trust: Central holds
+        # the majority section and few notes get in. Low trust: the experts carry
+        # the answer. Training never biases synthesis this way; it grades every
+        # expert on an unbiased baseline and lets standing do the rest.
         m = max(1, int(math.ceil(len(notes) * (1.0 - trust)))) if notes else 0
         notes.sort(key=lambda x: -x[0])
         use = [t for _, t in notes[:m]]
-        return {"text": self.central.generate(prompt, use, max_tokens), "k": len(notes), "trust": trust,
-                "notes": use, "home": plan.home, "w": plan.w.round(3).tolist()}
+        return {"text": self.central.generate(prompt, use, max_tokens), "k": len(notes), "timeline": "B",
+                "trust": trust, "notes": use, "home": plan.home, "w": plan.w.round(3).tolist()}

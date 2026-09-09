@@ -18,6 +18,8 @@ GATE_MODEL_ID = "mlx-community/Qwen2.5-0.5B-Instruct-4bit"
 EXPERT_MODEL_ID = "mlx-community/Qwen2.5-1.5B-Instruct-4bit"
 CENTRAL_MODEL_ID = "mlx-community/Qwen3-4B-Instruct-2507-4bit"
 GATE_D, EXPERT_D, CENTRAL_D = 896, 1536, 2560
+# Gate and Central share one tokenizer (verified: 151,665 shared ids, identical
+# encodings, both embedding tables 151,936). Target ids go through the gate as-is.
 
 E = 100                      # expert pool size. A VARIABLE: everything below is algebra over it.
 
@@ -26,11 +28,25 @@ LR = 2e-5
 GRAD_CLIP = 1.0
 
 # ── tokens ──────────────────────────────────────────────────────────────────
-SPAN_MIN = 32                # smallest contiguous span an expert is handed
-EXPERT_GEN_TOKENS = 32       # tokens an expert writes about its span
+EXPERT_GEN_TOKENS = 32       # tokens an expert writes about its span; also the standing divisor floor
 TARGET_MAX_TOKENS = 128      # y is truncated ONCE to min(this, limit//4) before any pass
-SAMPLE_TEMP = 0.8            # temperature for the second candidate in self-imitation
-G_CANDIDATES = 2
+# The delta is a MEAN over M target tokens and was the one statistic in the system
+# with no minimum support (cf. MIN_MEMBERS, RELIABILITY_MIN_OBS). Measured over 400
+# rows of the live mixture: M<=1 is 3.0%, M<=2 is 10.5%, M<=4 is 18.0%, M<=8 is
+# 21.8% — almost all of it sciq and ai2_arc, whose answers are one word. Those rows
+# produced every outlier delta in the b0-b31 run (+6.75, +6.69, +2.63, +2.29).
+# VALUE NEEDS AMAN: 4 refuses 18% of the corpus, 8 refuses 22%, 16 refuses 29%.
+TARGET_MIN_TOKENS = 4
+SAMPLE_TEMP = 0.8            # CEILING on the second candidate's temperature, not the value.
+                             # The value is temp = SAMPLE_TEMP * (1 - rho): when Central is
+                             # reliable on this composition the experts should ACCEPT it and
+                             # stop exploring; when it is not, exploration is all they have.
+                             # A bound is safe here; a fixed 0.8 would have been a constant
+                             # closing an adaptive loop, which is the failure mode of record.
+WORKING_PROBE_TOKENS = 1024  # question length the working-memory reserve is measured at
+EXPERT_PROBE_TOKENS = 256    # expert peak is measured at this. RAISING THIS CRASHED THE
+                             # MACHINE: the probe runs with Central resident and a longer
+                             # prefill through a 1.5B expert exceeds the Metal working set.
 
 # ── sqrt brackets (DECIDED: c = experts) ────────────────────────────────────
 GENERAL_EXPERTS = math.ceil(math.sqrt(E))                                     # 10
@@ -39,24 +55,20 @@ CENTROID_EXPERTS = math.floor(math.sqrt(_NON_GENERAL)) if _NON_GENERAL > 0 else 
 MAX_CLUSTERS = (_NON_GENERAL // CENTROID_EXPERTS) if CENTROID_EXPERTS else 1        # 10
 
 
-def k_upper(n_clusters: int) -> int:
-    """The sqrt(C) admissibility band, upper edge. C a perfect square -> sqrt+1;
-    otherwise ceil(sqrt). At C=10 -> 4."""
-    r = math.sqrt(max(1, n_clusters))
-    return int(r) + 1 if float(int(r)) == r else int(math.ceil(r))
-
 
 # ── similarity bands (DECIDED with Aman: 0 errors on 190 pairs) ─────────────
 SIM_MEMBER, SIM_NEIGHBOUR, SIM_FAR = 0.90, 0.70, 0.40
-# Aman's 10/20/30/40 closeness tiers as allocation weights. Home dominates.
-TIER_WEIGHT = {"member": 1.0, "neighbour": 0.5, "close": 0.25, "far": 0.0}
+
+# ── geometry formation ──────────────────────────────────────────────────────
+TAU_PERCENTILE = 10                      # tau_c = this percentile of the members' similarity
+MIN_MEMBERS = 100 // TAU_PERCENTILE      # a percentile is an order statistic only with this many points
 
 # ── chains ──────────────────────────────────────────────────────────────────
 CHAIN_MEMORY = 500.0         # "remembers 500 transitions"
 CHAIN_PRIOR = 1.0
-CHAIN_SEED_STRENGTH = 8.0
 TAU_STEP = 0.005
 TAU_MAX = 0.97
+LOAD_WINDOW_PER_CLUSTER = 10 # presence is estimated over this many batches PER cluster (window = 10*C)
 
 # ── reliability (held out by construction) ──────────────────────────────────
 HELDOUT_MOD = 4              # hash(sample) % 4 == 0 feeds reliability; the rest feed standing
@@ -64,7 +76,7 @@ RELIABILITY_MIN_OBS = 100    # below this a cluster pools to the global estimate
 R_MIN = 0.05                 # admission: mean reliability over the target; exp(-3) = 3 nats mean CE
 
 # ── standing ────────────────────────────────────────────────────────────────
-STANDING_Z = 1.0             # one standard error discounted
+STANDING_A_WINDOW = 5 * HELDOUT_MOD   # canary A: P(no admitted batch in 20) = 0.25^20 if y arrives
 
 # ── cadence ─────────────────────────────────────────────────────────────────
 HEALTH_EVERY = 5

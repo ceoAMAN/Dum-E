@@ -4,10 +4,16 @@ Gating owns token allocation (rule 10). It emits (expert, start, end) and the
 run loop only cuts at those offsets. Spans are contiguous (rule 17): grouping
 by cluster happens in the ORDER of spans, never by gathering scattered indices.
 
-Selection within a cluster is by STANDING (grounded), with the route head's
-learned preference as a tiebreak. One slot per batch, when k >= 2, goes to the
-least-measured expert of the home cluster at SPAN_MIN tokens — the dormant
-trial. It is scored and updated like everyone else; nothing is retired.
+Selection within a cluster is by STANDING (grounded). The route head decides
+among candidates whose standing intervals OVERLAP — statistically tied, so the
+grounded number has nothing left to say — and among the unmeasured. That is its
+consumer; without one it would be a mechanism that learns and changes nothing.
+
+One seat per batch, when k >= 2, goes to the least-measured expert of the routed
+cluster — the dormant trial. Its span is apex-nadir's like everyone else's: a
+dormant expert measured only at a fixed small span has a standing that is not
+comparable to a seated one measured at its own allocation. It is scored and
+updated like everyone else; nothing is retired.
 """
 from __future__ import annotations
 
@@ -17,6 +23,7 @@ from typing import Dict, List, Optional
 import numpy as np
 
 from . import config as C
+from .alloc import AllocLaw, probe_sizes
 from .geometry import Geometry
 from .models import Gate
 from .scheduler import Scheduler
@@ -46,57 +53,86 @@ class Plan:
     assign: np.ndarray
     home: int
     present: List[int]
+    inside: List[int]
     k_wanted: int
     k: int
+    probe: bool = False
     selections: List[Selection] = field(default_factory=list)
 
 
 class Router:
-    def __init__(self, gate: Gate, geometry: Geometry, standing: Standing, scheduler: Scheduler):
+    def __init__(self, gate: Gate, geometry: Geometry, standing: Standing,
+                 scheduler: Scheduler, alloc: AllocLaw):
         self.gate, self.geo, self.standing, self.sched = gate, geometry, standing, scheduler
+        self.alloc = alloc
 
-    def plan(self, text: str) -> Plan:
+    def plan(self, text: str, probe: bool = False, curriculum=None) -> Plan:
+        """`curriculum` is the TRAINING path: it is asked for the k experts once
+        k and the routed cluster are known, and selection by standing is skipped
+        entirely. The
+        router still supplies everything else — composition, home, present, the
+        spans, apex-nadir's allocation. Selection by standing (below) is the
+        DEPLOYMENT path, where concentrating work on the best expert is the
+        whole point; during training it is what starved 66 experts of any
+        measurement at all."""
         ids = self.gate.encode(text)
         H = self.gate.hidden(ids)
         T = len(ids)
         pooled = H.mean(0)
         w, assign, _, mean_sims = self.geo.compose(H)
         home = self.geo.home(w)
-        present = self.geo.present(w, mean_sims)
-        # one seat per present cluster PLUS the trial seat (Aman: "one slot always
-        # reserved for an unmeasured expert"), bounded by the sqrt(C) band
-        k_wanted = max(1, min(len(present) + 1, C.k_upper(self.geo.C)))
-        k = self.sched.clamp(k_wanted)
-        route = self.gate.route_logits(pooled)
-        chosen: set = set()
+        inside = self.geo.inside(mean_sims)
+        # sqrt(C) admissibility band: at most band_hi centroids are live for one
+        # input, however many its territory happens to contain. On C=10 that is 4.
+        present = self.geo.present(w, mean_sims)[: self.geo.band()[1]]
+        # k IS the OLS regression: k(T) = T/ALLOC(T) = T^(1-beta)/alpha. Nothing
+        # else sets it. The scheduler's RAM bound still clamps afterwards because
+        # that one is physical, not a policy.
+        k_wanted = self.alloc.k(T)
+        # k_effective blends the allocation law, the measured clock and the RAM
+        # bound (Aman's general equation); sched.clamp stays because the RAM
+        # bound is physical and a blend must never be allowed above it.
+        k = self.sched.clamp(self.alloc.k_effective(T, self.sched.k_max))
         picks: List[tuple] = []           # (eid, cid, tier, trial)
-        seats = k - 1 if k >= 2 else k          # the last seat is the trial's
-        for cid in present[:seats]:
-            eid = self._pick(cid, route, chosen)
-            if eid is None:
-                continue
-            chosen.add(eid)
-            picks.append((eid, cid, self.geo.tier(home, cid), False))
-        if k >= 2:
-            routed = present[0]                     # the trial is measured where the input actually routed
-            t = self.standing.trial(routed, chosen)
-            if t is not None:
-                picks.append((t, routed, self.geo.tier(home, routed), True))
+        if curriculum is not None:
+            experts = curriculum.experts(k, present[0], self.standing,
+                                         resident=getattr(self.sched.pool, 'resident', ()))
+            # every seat is measured on the cluster the input actually routed to,
+            # so the observations of a whole sweep are comparable across experts.
+            routed = present[0]
+            tier = self.geo.tier(home, routed)
+            picks = [(int(e), routed, tier, False) for e in experts[:k]]
+        else:
+            route = self.gate.route_logits(pooled)
+            chosen: set = set()
+            seats = k - 1 if k >= 2 else k          # the last seat is the trial's
+            for cid in present[:seats]:
+                eid = self._pick(cid, route, chosen)
+                if eid is None:
+                    continue
+                chosen.add(eid)
+                picks.append((eid, cid, self.geo.tier(home, cid), False))
+            if k >= 2:
+                routed = present[0]                 # the trial is measured where the input actually routed
+                t = self.standing.trial(routed, chosen)
+                if t is not None:
+                    picks.append((t, routed, self.geo.tier(home, routed), True))
         plan = Plan(ids=ids, H=H, pooled=pooled, w=w, assign=assign, home=home, present=present,
-                    k_wanted=k_wanted, k=k)
-        plan.selections = self._spans(picks, w, assign, T)
+                    inside=inside, k_wanted=k_wanted, k=k, probe=probe)
+        place = AllocLaw.placement(self.standing.rank(self.geo.domain()))
+        plan.selections = self._spans(picks, assign, T, probe, place)
         return plan
 
     def _pick(self, cid: int, route: np.ndarray, chosen: set) -> Optional[int]:
         """known-good > unmeasured > known-bad. An expert that has HURT in this
         cluster must not keep its seat just because nobody else has been
-        measured yet; the unmeasured get their turn first."""
+        measured yet; the unmeasured get their turn first. Among experts whose
+        standing intervals overlap the leader's, the route head chooses — the
+        grounded signal cannot separate them, so the learned one is consulted."""
         ranked = [(e, s) for e, s in self.standing.ranked(cid) if e not in chosen]
         good = [(e, s) for e, s in ranked if s > 0]
         if good:
-            top = good[0][1]
-            near = [e for e, s in good if s >= top - 1e-9]
-            return int(max(near, key=lambda e: route[e]))       # tiebreak by learned preference
+            return int(good[0][0])                               # best measured rate, full stop
         measured = {e for e, _ in ranked}
         pool = [e for e in self.standing.members(cid) + self.standing.generals()
                 if e not in chosen and e not in measured]
@@ -107,38 +143,45 @@ class Router:
         rest = [e for e in range(self.standing.E) if e not in chosen]
         return int(max(rest, key=lambda e: route[e])) if rest else None
 
-    def _spans(self, picks: List[tuple], w: np.ndarray, assign: np.ndarray, T: int) -> List[Selection]:
-        """Contiguous consecutive spans, ordered by where each cluster's tokens
-        sit, sized by composition x tier weight, min SPAN_MIN each."""
+    def _spans(self, picks: List[tuple], assign: np.ndarray, T: int, probe: bool,
+               place: Dict[int, float]) -> List[Selection]:
+        """Split, then PAD. Anchors are contiguous and ordered by where each
+        cluster's tokens actually sit; the LENGTH is apex-nadir's, not the
+        router's — each expert gets the span its OWN rank earns it on the
+        fitted curves, padded around its anchor and clamped to the input. Span
+        size is a token-allocation question and allocation is fitted, not
+        weighted by tier.
+
+        In PROBE mode (training) the lengths come from the probe schedule
+        {t_lo, t_mid, t_hi} instead, cycled across the seats: the probe IS the
+        training allocation, so exploring span sizes costs no extra runs."""
         if not picks or T == 0:
             return []
+        picks = picks[:T]                       # never more spans than tokens
         com = []
         for eid, cid, tier, trial in picks:
             pos = np.where(assign == cid)[0]
             com.append(float(pos.mean()) if len(pos) else T / 2.0)
-        order = np.argsort(com)
-        raw = []
-        for i in order:
-            eid, cid, tier, trial = picks[i]
-            weight = float(w[cid]) * C.TIER_WEIGHT[tier]
-            raw.append((eid, cid, tier, trial, weight))
+        raw = [picks[i] for i in np.argsort(com)]
         n = len(raw)
-        min_each = min(C.SPAN_MIN, max(1, T // n))
-        total_w = sum(max(r[4], 1e-6) for r in raw)
-        spare = max(0, T - min_each * n)
-        lengths = [min_each + int(spare * max(r[4], 1e-6) / total_w) for r in raw]
-        lengths[-1] += T - sum(lengths)
-        out, start = [], 0
-        for (eid, cid, tier, trial, _), L in zip(raw, lengths):
-            L = max(1, L)
+        # apex-nadir explores span sizes, but not past what a gradient step can
+        # afford: the backward pass is linear in prompt length (~12 MB/token) and
+        # t_hi = T would ask for 13 GB on a long row. Same physical clamp as k_max.
+        T_eff = min(T, self.sched.span_max)
+        sizes = probe_sizes(T_eff) if probe else None
+        out = []
+        for i, (eid, cid, tier, trial) in enumerate(raw):
+            # rotate the probe across BATCHES as well as seats: at k=1 (the §7
+            # identity fallback, which is the live state until the law fits)
+            # `i` is always 0, so every probe would land on t_lo and the
+            # envelopes could never be fitted over a range at all.
+            L = sizes[(self.alloc.n_seen + i) % 3] if sizes else self.alloc.alloc(T_eff, place.get(eid, 0.5))
+            L = max(1, min(int(L), T_eff))
+            start = (T * i) // n                              # contiguous anchor
             end = min(T, start + L)
-            if trial:
-                end = min(T, start + max(1, min(L, C.SPAN_MIN)))
+            start = max(0, end - L)                           # pad back when we run off the end
             out.append(Selection(eid=eid, cid=cid, tier=tier, start=start, end=end, trial=trial))
-            start = end
-        if out and out[-1].end < T:
-            out[-1].end = T
-        return out
+        return [sel for sel in out if sel.n_tokens > 0]
 
     def gate_step(self, plan: Plan, deltas: Dict[int, float]) -> float:
         return self.gate.train_step(plan.pooled, deltas)

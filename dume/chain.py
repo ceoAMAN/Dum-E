@@ -5,13 +5,13 @@ is non-stationary, and every seductive Markov result (stationary distribution,
 equilibrium populations) assumes transitions hold still. They don't. This module
 offers ONE-step prediction and nothing more.
 
-Verified properties (tests in the previous session): bounded evidence (no 1/n
-freeze), Dirichlet prior instead of an abstain guard, self-scoring accuracy,
-seed strength in absolute pseudo-observations capped at what the pool has seen.
+Verified properties: bounded evidence (no 1/n freeze), Dirichlet prior instead
+of an abstain guard, self-scoring accuracy.
 """
 from __future__ import annotations
 
-from typing import Dict, Optional, Tuple
+from collections import deque
+from typing import List, Optional, Sequence
 
 import numpy as np
 
@@ -41,14 +41,6 @@ class MarkovChain:
             row *= self.memory / (total + 1.0)
         row[j] += 1.0
 
-    def seed_from(self, other: "MarkovChain", strength: float = 1.0) -> None:
-        if other.n_states != self.n_states:
-            return
-        pool_evidence = other.N.sum(axis=1) - other.alpha * other.n_states
-        w = np.minimum(1.0, np.maximum(0.0, pool_evidence) / max(strength, 1e-9))
-        rows = other.N / other.N.sum(axis=1, keepdims=True)
-        self.N = self.alpha + strength * rows * w[:, None]
-
     def predict(self, i: int) -> np.ndarray:
         row = self.N[int(i)]
         return row / row.sum()
@@ -66,69 +58,75 @@ class MarkovChain:
 # ── mounting 1: expert migration ────────────────────────────────────────────
 class MigrationChains:
     """State = cluster index, plus one extra state DORMANT (= n_clusters) for the
-    surplus pool — "where do dormants go" is the trend that matters most. Pool
-    chain carries the signal; per-expert chains refine it once an expert has
-    actually moved enough to have an opinion."""
+    surplus pool — "where do dormants go" is the trend that matters most. One
+    pool chain; its self-scored accuracy is what health reads. (The per-expert
+    refinement was deleted: it had no consumer.)"""
 
     def __init__(self, n_clusters: int):
         self.n_clusters = int(n_clusters)
         self.n_states = self.n_clusters + 1
         self.DORMANT = self.n_clusters
         self.pool = MarkovChain(self.n_states)
-        self.per_expert: Dict[int, MarkovChain] = {}
 
     def _state(self, cluster: int) -> int:
         return self.DORMANT if cluster < 0 else int(cluster)
 
-    def _chain(self, eid: int) -> MarkovChain:
-        if eid not in self.per_expert:
-            c = MarkovChain(self.n_states)
-            c.seed_from(self.pool, strength=C.CHAIN_SEED_STRENGTH)
-            self.per_expert[eid] = c
-        return self.per_expert[eid]
-
     def record_move(self, eid: int, from_cluster: int, to_cluster: int) -> None:
-        i, j = self._state(from_cluster), self._state(to_cluster)
-        self.pool.observe(i, j)
-        self._chain(int(eid)).observe(i, j)
-
-    def predict_next(self, eid: int, current: int) -> Tuple[int, float]:
-        current = self._state(current)
-        c = self._chain(int(eid))
-        own_w, pool_w = c.evidence(current), self.pool.evidence(current)
-        if own_w + pool_w <= 0.0:
-            return int(current), 0.0
-        p = (own_w * c.predict(current) + pool_w * self.pool.predict(current)) / (own_w + pool_w)
-        j = int(np.argmax(p))
-        return j, float(p[j])
+        self.pool.observe(self._state(from_cluster), self._state(to_cluster))
 
 
 # ── mounting 2: cluster territory ───────────────────────────────────────────
 # High traffic -> TIGHTEN (self-correcting). High traffic -> widen is a runaway.
 STARVED, LIGHT, HEALTHY, HEAVY, OVERFULL = 0, 1, 2, 3, 4
 LOAD_REGIMES = ("STARVED", "LIGHT", "HEALTHY", "HEAVY", "OVERFULL")
-_REGIME_CUTS = (0.25, 0.75, 1.5, 3.0)
+_REGIME_CUTS = (0.25, 0.75, 1.5, 3.0)        # of the population-average presence rate
 _TAU_STEP = {STARVED: -2.0, LIGHT: -1.0, HEALTHY: 0.0, HEAVY: +1.0, OVERFULL: +2.0}
 
 
-def classify_load(share: float, n_clusters: int) -> int:
-    rel = float(share) * float(max(1, n_clusters))
+def classify_load(rel: float) -> int:
+    """rel = this cluster's presence rate / the average cluster's presence rate."""
     for state, cut in enumerate(_REGIME_CUTS):
-        if rel < cut:
+        if float(rel) < cut:
             return state
     return OVERFULL
 
 
 class SizeChains:
-    def __init__(self, n_clusters: int):
-        self.chains = [MarkovChain(len(LOAD_REGIMES)) for _ in range(int(n_clusters))]
-        self.state = [HEALTHY] * int(n_clusters)
+    """Load is PRESENCE: how often a cluster's territory contains the input
+    (sim >= tau_c), over a window of 10*C batches. That is exactly the quantity
+    tau gates — tightening reduces it — so the loop self-corrects. The regime is
+    relative to the population average, so the setpoint is reachable: the
+    average cluster is HEALTHY by construction, a cluster present far more
+    often than average tightens, one never present widens. (The earlier version
+    measured share of allocated tokens against 1/C; with <= k_max seats among C
+    clusters that setpoint was unreachable and every tau ran to a rail.)"""
 
-    def observe_load(self, c: int, share: float, n_clusters: int) -> int:
-        nxt = classify_load(share, n_clusters)
-        self.chains[c].observe(self.state[c], nxt)
-        self.state[c] = nxt
-        return nxt
+    def __init__(self, n_clusters: int):
+        self.C = int(n_clusters)
+        self.chains = [MarkovChain(len(LOAD_REGIMES)) for _ in range(self.C)]
+        self.state = [HEALTHY] * self.C
+        self.window: deque = deque(maxlen=C.LOAD_WINDOW_PER_CLUSTER * self.C)
+
+    def observe(self, inside: Sequence[int]) -> Optional[np.ndarray]:
+        """Record which clusters' territories contained this input. Returns the
+        per-cluster presence rate once the window holds >= C batches (every
+        cluster has had a turn), else None: no measurement, no move."""
+        mask = np.zeros(self.C, dtype=np.float64)
+        for c in inside:
+            if 0 <= int(c) < self.C:
+                mask[int(c)] = 1.0
+        self.window.append(mask)
+        if len(self.window) < self.C:
+            return None
+        rate = np.mean(np.stack(self.window), axis=0)
+        ref = float(rate.mean())
+        if ref <= 0.0:
+            return None
+        for c in range(self.C):
+            nxt = classify_load(rate[c] / ref)
+            self.chains[c].observe(self.state[c], nxt)
+            self.state[c] = nxt
+        return rate
 
     def next_tau(self, c: int, tau_now: float) -> float:
         """Move tau toward where the cluster is HEADING. Step-limited and clamped
@@ -143,3 +141,6 @@ class SizeChains:
         hits = sum(ch.hits for ch in self.chains)
         trials = sum(ch.trials for ch in self.chains)
         return (hits / trials) if trials else None
+
+    def regimes(self) -> List[str]:
+        return [LOAD_REGIMES[s] for s in self.state]

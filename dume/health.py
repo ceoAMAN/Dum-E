@@ -6,16 +6,19 @@ here publishes into this record and it is printed every HEALTH_EVERY batches
 (rule 22). Every scalar is finite-checked at the point it is RECORDED.
 
 Canaries (see docs/grounded-reward.md):
-  A  standing counters strictly increasing         (y never arrives)
-  B  context grew / zero-delta fraction             (both forwards saw the same context)
-  C  rolling std of delta; sign fraction 30-60%     (delta degenerates to a band)
-  E  reliability vector flatness                    (vector collapses to the scalar)
+  A  standing counters advance within STANDING_A_WINDOW batches   (y never arrives / all refused)
+  B  zero-delta fraction; dropped expert texts                     (both forwards saw the same context)
+  C  rolling std of delta; sign fraction 15-85%                    (delta degenerates to a band)
+  E  reliability vector flatness                                   (vector collapses to the scalar)
+  U  expert updates actually applied vs skipped                    (a loss printed for a step that never ran)
+Canary D (verifiable exact-match split) is NOT implemented: it needs a Central
+generation per batch. Open.
 """
 from __future__ import annotations
 
 import math
 from collections import deque
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 import numpy as np
 
@@ -28,8 +31,11 @@ class Health:
         self.rec: Dict[str, float] = {}
         self.deltas = deque(maxlen=200)
         self.zero = deque(maxlen=100)
-        self.n_hist = deque(maxlen=100)
+        self.n_hist = deque(maxlen=C.STANDING_A_WINDOW)
         self.clones = deque(maxlen=100)
+        self.applied = deque(maxlen=100)      # 1 = an expert update ran, 0 = skipped
+        self.updates = 0
+        self.dropped = 0
         self.alarms: List[str] = []
         self.nonfinite = 0
 
@@ -52,18 +58,27 @@ class Health:
             vals = list(texts.values())
             self.clones.append(1.0 if len(set(vals)) < len(vals) else 0.0)
 
-    def deltas_seen(self, deltas: Dict[int, float], zero: Dict[int, bool]) -> None:
+    def deltas_seen(self, deltas: Dict[int, float], zero: Dict[int, bool], dropped: int = 0) -> None:
         for e, d in deltas.items():
             if math.isfinite(d):
                 self.deltas.append(d)
             self.zero.append(1.0 if zero.get(e, False) else 0.0)
+        self.dropped += int(dropped)
+
+    def update_seen(self, loss) -> None:
+        """None = skipped (nothing ran); a float = an optimiser step happened."""
+        if loss is None:
+            self.applied.append(0.0)
+        else:
+            self.applied.append(1.0)
+            self.updates += 1
 
     def tick(self, standing_total_n: float, reliability, size_chains=None, migration=None) -> List[str]:
         self.batch += 1
         alarms: List[str] = []
         self.n_hist.append(standing_total_n)
-        if len(self.n_hist) >= 100 and self.n_hist[-1] <= self.n_hist[0]:
-            alarms.append("A: standing has not advanced in 100 batches — y is not arriving")
+        if len(self.n_hist) == self.n_hist.maxlen and self.n_hist[-1] <= self.n_hist[0]:
+            alarms.append(f"A: standing has not advanced in {self.n_hist.maxlen} batches — y is not arriving or every batch is refused")
         if len(self.zero) >= 50 and float(np.mean(self.zero)) > 0.05:
             alarms.append(f"B: {100*float(np.mean(self.zero)):.0f}% of expert deltas identically zero — same context both passes?")
         if len(self.deltas) >= 50:
@@ -76,6 +91,12 @@ class Health:
                 alarms.append(f"C: {100*neg:.0f}% of deltas negative — a scorer that cannot say 'hurt' is not measuring")
         if self.clones:
             self.put(clone_frac=float(np.mean(self.clones)))
+        if len(self.applied) >= 50:
+            frac = float(np.mean(self.applied))
+            self.put(update_frac=frac)
+            if frac < 0.5:
+                alarms.append(f"U: only {100*frac:.0f}% of admitted batches applied an expert update")
+        self.put(expert_updates=self.updates, dropped_texts=self.dropped)
         flat = reliability.flatness()
         if flat is not None:
             self.put(reliability_spread=flat)
