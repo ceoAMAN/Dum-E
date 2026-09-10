@@ -211,6 +211,24 @@ def main() -> int:
     s7.settle_generals()
     s7.migrate(MigrationChains(2))
     assert cur.advance(s7) and cur.phase == SPECIALIZE, (cur.state(), s7.members(1))
+    # a membership change must NOT restart the rota: migration thrashes at this
+    # SNR, so restarting starves whoever sorts late in members().
+    cur2 = Curriculum(n_experts=40, seed=3); cur2.phase = SPECIALIZE
+    s10 = Standing(2)
+    for e in (10, 11, 12, 13):
+        for _ in range(MIN_MOVE_OBS):
+            s10.observe(e, 0, 1.0, 32)
+    s10.assigned[[10, 11, 12, 13]] = 0
+    seen10 = {}
+    for step in range(12):
+        for e in cur2.experts(2, 0, s10):
+            seen10[e] = seen10.get(e, 0) + 1
+        if step == 5:                      # membership changes mid-stream
+            s10.observe(14, 0, 1.0, 32); s10.observe(14, 0, 1.0, 32)
+            s10.assigned[14] = 0
+    early = sum(seen10.get(e, 0) for e in (10, 11))
+    late = sum(seen10.get(e, 0) for e in (12, 13))
+    assert late >= early - 2, f"rota restart starved the late members {seen10}"
     # specialize: the routed centroid is served by ITS OWN members, cycled
     got = set()
     for _ in range(4):

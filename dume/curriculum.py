@@ -93,8 +93,18 @@ class Curriculum:
             return self._sweep_batch(k)
         at = self.rota_at.get(cid, 0)
         rota = self.rota.get(cid)
-        if rota != members:                   # membership moved: restart this rota
-            self.rota[cid], rota, at = list(members), list(members), 0
+        if rota != members:
+            # Membership moved. CARRY THE CURSOR — do not restart at 0. Migration
+            # thrashes at this SNR (the same experts oscillate in and out of a
+            # full centroid every MIGRATE_EVERY batches: e91 went -1,2,-1,2 and
+            # e42 the same), so a reset here fires almost every 20 batches and the
+            # rota never advances past its first entries. members() is sorted by
+            # id, so that starved the high-id members of every centroid: measured
+            # at b1200, the first two of each rota had a median of 31 observations
+            # against 18 for the rest, and e37 had 7 where e17 had 35. Equal
+            # exposure is the entire promise of the rota; a reset breaks it.
+            self.rota[cid], rota = list(members), list(members)
+            at = at % max(len(rota), 1)
         out = [rota[(at + i) % len(rota)] for i in range(min(k, len(rota)))]
         self.rota_at[cid] = (at + len(out)) % len(rota)
         return [int(e) for e in out]
