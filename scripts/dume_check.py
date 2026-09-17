@@ -275,6 +275,25 @@ def main() -> int:
         pass
     frac = sum(is_heldout(f"k{i}") for i in range(4000)) / 4000
     assert 0.2 < frac < 0.3, frac
+    # THE RELIABILITY DEDUCTION IS DEPLOYMENT-ONLY. Training has y, so gradients
+    # flow at full strength; rho is MEASURED there and APPLIED in answer(), where
+    # ceil(n_notes * (1 - trust)) decides how much of the synthesis the experts
+    # carry. Pins the deployment formula, and that nothing in the training path
+    # scales by rho any more.
+    import inspect as _insp
+    from dume import train as _tr, models as _md
+    assert "sc.rho" not in _insp.getsource(_tr.System._expert_update), "expert advantage still rho-scaled"
+    assert "rho" not in _insp.signature(_md.ExpertPool.sample).parameters, "sample() still takes rho"
+    assert "weight" not in _insp.signature(_md.Central.pretrain_step).parameters, "Central step still weighted"
+    src_ans = _insp.getsource(_tr.System.answer)
+    assert "math.ceil(len(notes) * (1.0 - trust))" in src_ans, "deployment deduction formula changed"
+    # Central's step: outside admission, and guarded against held-out AND self-referent
+    src_one = _insp.getsource(_tr.System._train_one)
+    i_adm, i_cen = src_one.index("elif sc.admitted:"), src_one.index("self.central.pretrain_step(")
+    assert i_cen > i_adm, "Central step precedes the admitted block"
+    guard = src_one[src_one.rindex("if not heldout", 0, i_cen):i_cen]
+    assert "not s.self_referent" in guard, "Central can train on its own delivered answer"
+    assert "self.central.save()" in _insp.getsource(_tr.System.save), "Central's in-loop training is not persisted"
     print(f"reliability   OK  (cold=1.0; vector {r.vector().round(2)}; misalignment refused; heldout {frac:.2f})")
 
     # allocation law: probe schedule, per-expert spread, admissibility, log clearing

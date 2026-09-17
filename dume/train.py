@@ -148,6 +148,9 @@ class System:
                     "clock": self.clock, "batch": self.batch, "consumed": self.consumed})
         self.gate.save()
         self.pool.save_all()
+        # Central trains in-loop now; before this line every one of its steps
+        # was discarded at exit and Central.load() restored the pretrain ckpt.
+        self.central.save()
 
     def stream(self):
         if self._stream is None:
@@ -296,26 +299,39 @@ class System:
             imit = self._imitate(sels, spans, texts, sc, s)
             if imit is not None:
                 rec["imitate_loss"] = imit
-            # SYMBIOSIS. rho is Central's held-out reliability on THIS composition.
-            # High rho: Central is the judge — it GIVES gradient (experts step
-            # further on its verdict, and stop exploring) and TAKES little. Low
-            # rho: the experts carry the input and Central is the one that has to
-            # learn from the answer. The two weights are rho and 1-rho, so they
-            # sum to one and neither side needs a schedule.
-            #
-            # LAST, not earlier: _expert_update re-runs Central through score_one
-            # to grade the sampled candidate against the SAME baseline b measured
-            # at the top of this batch. Stepping Central before that would grade
-            # d_s on a different instrument than b — the paired difference is only
-            # meaningful while Central is frozen, which is the whole premise of
-            # the reward. Never on a held-out sample either: reliability is fitted
-            # there, and training on it would flatter the number that gates this.
-            if not heldout and self.central.model is not None:
-                cw = 1.0 - float(min(max(sc.rho, 0.0), 1.0))
-                if cw > 0.0:
-                    cl, _ = self.central.pretrain_step(s.prompt, s.answer, cw)
-                    if math.isfinite(cl):
-                        rec["central_loss"] = cl
+        # Central trains on the real answer, at FULL weight, on EVERY sample that
+        # has one. Training has y, so there is nothing to discount: "natural
+        # gradients will flow" (Aman, 2026-09-17). The reliability score rho is
+        # MEASURED here (Reliability.observe, held-out shard) and APPLIED only in
+        # deployment, where there is no y and `trust` decides how much of the
+        # synthesis Central holds — see answer(). The scalar rho on the training
+        # gradients was a deduction applied where nothing needed deducting.
+        #
+        # Deliberately OUTSIDE `elif sc.admitted`: admission (rho >= R_MIN and
+        # M >= TARGET_MIN_TOKENS) is support for the expert DELTA — a mean over M
+        # tokens needs M, and a composition Central cannot read cannot grade an
+        # expert. Neither reason applies to Central's own CE on y: a 2-token
+        # answer is still a real answer, and rho < R_MIN is exactly where Central
+        # most needs the data. Nesting it under admission re-imposed a rho gate.
+        #
+        # Two samples are excluded, both because y is not REAL there:
+        #   held-out      reliability is fitted on it; training on it would
+        #                 flatter the number deployment reads.
+        #   self_referent y is Central's OWN delivered answer (dead_time). A
+        #                 legitimate frozen referent for scoring EXPERTS against,
+        #                 but Central learning from it is self-distillation with
+        #                 no ground, at full weight. Note heldout is already
+        #                 False for these, so the guard must be explicit.
+        #
+        # LAST in the batch, not earlier: _expert_update re-runs Central through
+        # score_one to grade the sampled candidate against the SAME baseline b
+        # measured at the top. Stepping Central first would grade d_s on a
+        # different instrument than b, and the paired difference is only
+        # meaningful while Central is frozen — the premise of the reward.
+        if not heldout and not s.self_referent and self.central.model is not None:
+            cl, _ = self.central.pretrain_step(s.prompt, s.answer)
+            if math.isfinite(cl):
+                rec["central_loss"] = cl
         if self.alloc.input_seen(len(plan.ids)):          # every E inputs
             self.alloc.fit()
             print(f"[alloc] {self.alloc.state()}")
@@ -376,8 +392,7 @@ class System:
         eid = sel.eid
         greedy, d_g = texts[eid], sc.deltas[eid]
         sampled = self.pool.sample(eid, spans[eid], s.prompt,
-                                   budget=len(self.pool.tok.encode(greedy)) or None,
-                                   rho=sc.rho)
+                                   budget=len(self.pool.tok.encode(greedy)) or None)
         if not sampled or sampled == greedy:
             return None
         d_s = score_one(self.central, s.prompt, y, sc.b, sc.w, sampled, sc.base_len)
@@ -390,11 +405,13 @@ class System:
         if abs(d_g - d_s) <= floor:
             return None
         m = (d_g + d_s) / 2.0
-        # the other half of the symbiosis: the advantage is Central's verdict, so
-        # it is worth exactly what Central is worth on this composition.
-        g = float(min(max(sc.rho, 0.0), 1.0))
+        # No scalar rho on the advantage: d is graded against real y, and rho is
+        # a deployment deduction, not a training one. (The per-TOKEN reliability
+        # weighting inside d itself — reward.weights(), w[t] = R[centroid(t)] —
+        # is a different and older mechanism, the "reliability vector"; whether
+        # it also belongs only in deployment is an open question for Aman.)
         return self.pool.update(eid, self.pool.prompt(spans[eid], s.prompt), [greedy, sampled],
-                                [g * (d_g - m), g * (d_s - m)])
+                                [d_g - m, d_s - m])
 
     def _imitate(self, sels, spans, texts, sc, s) -> Optional[float]:
         """Dormant distillation. The trial seat learns the TEXT of the best-scoring
@@ -468,14 +485,17 @@ class System:
         # no _breathe, no clock: deployment inputs are a different population and must
         # not move the territory the training loop is controlling (two writers, one tau)
         #
-        # This is the SYNTHESIS half of the symbiosis, and it is DEPLOYMENT ONLY
-        # (Aman, 2026-09-10: "this in deployment; during training we just gather
-        # scores, train and specialize"). `trust` is the same quantity as training's
-        # rho, measured the only way it can be here — composition-weighted, since
-        # deployment has no y to weight per target token. High trust: Central holds
-        # the majority section and few notes get in. Low trust: the experts carry
-        # the answer. Training never biases synthesis this way; it grades every
-        # expert on an unbiased baseline and lets standing do the rest.
+        # THE RELIABILITY DEDUCTION. Deployment-only, by construction: there is
+        # no y here, so the only thing that can say how far to trust Central on
+        # this composition is the reliability score training MEASURED for it
+        # (paraphrasing Aman, 2026-09-17: the reliability score is a deduction
+        # factor for a specific composition of centroids, and it is for when
+        # there is no real data to measure the output against). `trust` is that
+        # score, composition-
+        # weighted since there are no target tokens to weight per token. High
+        # trust: Central holds the majority section and few notes get in. Low
+        # trust: the experts carry the answer. Training never applies this — it
+        # has y, gradients flow at full strength, and standing does the rest.
         m = max(1, int(math.ceil(len(notes) * (1.0 - trust)))) if notes else 0
         notes.sort(key=lambda x: -x[0])
         use = [t for _, t in notes[:m]]

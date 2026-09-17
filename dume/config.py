@@ -37,12 +37,10 @@ TARGET_MAX_TOKENS = 128      # y is truncated ONCE to min(this, limit//4) before
 # produced every outlier delta in the b0-b31 run (+6.75, +6.69, +2.63, +2.29).
 # VALUE NEEDS AMAN: 4 refuses 18% of the corpus, 8 refuses 22%, 16 refuses 29%.
 TARGET_MIN_TOKENS = 4
-SAMPLE_TEMP = 0.8            # CEILING on the second candidate's temperature, not the value.
-                             # The value is temp = SAMPLE_TEMP * (1 - rho): when Central is
-                             # reliable on this composition the experts should ACCEPT it and
-                             # stop exploring; when it is not, exploration is all they have.
-                             # A bound is safe here; a fixed 0.8 would have been a constant
-                             # closing an adaptive loop, which is the failure mode of record.
+SAMPLE_TEMP = 0.8            # temperature of the second candidate in self-imitation. A plain
+                             # exploration hyperparameter, not a loop-closing threshold: nothing
+                             # compares against it. (It was briefly rho-modulated; rho is a
+                             # deployment deduction and does not belong in training.)
 WORKING_PROBE_TOKENS = 1024  # question length the working-memory reserve is measured at
 EXPERT_PROBE_TOKENS = 256    # expert peak is measured at this. RAISING THIS CRASHED THE
                              # MACHINE: the probe runs with Central resident and a longer

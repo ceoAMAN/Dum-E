@@ -4,8 +4,10 @@ Gate    — backbone FROZEN. Cluster geometry is formed from its hidden states a
           stamped with its weight hash, so the backbone may not move online
           (rule 15/16). Only the route head trains, by regression onto the
           grounded delta, so it has a gradient at k=1.
-Central — LoRA'd. Trains ONLY in the pretrain phase (plain CE on q|y). In the
-          joint phase it is the frozen instrument.
+Central — LoRA'd. Plain CE on q|y, in pretrain AND in the training loop
+          (last in each batch, after the experts are graded, so it is the
+          frozen instrument WHILE a batch is scored and never differentiated
+          through). Never on held-out or self-referent samples.
 Experts — LoRA'd. Train by reward-weighted self-imitation on their own text.
 
 ExpertPool has NO cap and NO eviction policy of its own: the scheduler is the
@@ -305,31 +307,20 @@ class Central:
             self._opt = optim.Adam(learning_rate=C.LR)
         return self._opt
 
-    def pretrain_step(self, question: str, answer: str, weight: float = 1.0) -> Tuple[float, int]:
-        """Plain next-token CE on the real answer.
-
-        `weight` is the SYMBIOSIS (Aman, 2026-09-10): "when central has better it
-        gives more gradients, experts accept it; central receives less. When the
-        composition is one central is bad at, it is the opposite." One measured
-        number governs both directions — rho, the composition-weighted mean of
-        Central's own HELD-OUT reliability, already computed on every input:
-
-            expert advantage  x  rho          trust the teacher where it is right
-            central weight    x  (1 - rho)    learn from the data where it is not
-
-        so the pair sums to one and neither side needs a schedule. Central never
-        takes this step on a held-out sample: reliability is fitted there, and
-        training on it would make the very number that gates this optimistic."""
+    def pretrain_step(self, question: str, answer: str) -> Tuple[float, int]:
+        """Plain next-token CE on the real answer, at full weight. Used by both
+        `pretrain` and the training loop: whenever a REAL y exists, Central learns
+        from it unscaled — admitted or refused. The reliability score is a
+        DEPLOYMENT deduction (see System.answer), never a training one. The loop
+        calls this last in the batch, and never on a held-out or self-referent
+        sample — see the comment there for why each is excluded."""
         y = self.target_ids(answer)
         ctx = self.context_ids(question, [], len(y))
         ids = mx.array(ctx + y)
-        w = float(max(0.0, weight))
-        if w <= 0.0:
-            return 0.0, 0
         self.model.train()
 
         def loss_fn(m):
-            return w * mx.mean(ce_per_token(m, ids, len(ctx)))
+            return mx.mean(ce_per_token(m, ids, len(ctx)))
 
         loss, grads = nn.value_and_grad(self.model, loss_fn)(self.model)
         self.model.eval()
@@ -507,12 +498,9 @@ class ExpertPool:
         return text, time.perf_counter() - t0
 
     def sample(self, eid: int, span_text: str, question: str,
-               budget: Optional[int] = None, rho: float = 0.0) -> str:
-        """The exploring candidate. Temperature is SAMPLE_TEMP * (1 - rho): where
-        Central is reliable the expert should accept it rather than wander, and
-        where Central is weak exploration is the only thing that can help."""
-        t = C.SAMPLE_TEMP * (1.0 - float(min(max(rho, 0.0), 1.0)))
-        return self._gen(eid, self.prompt(span_text, question), t, budget)
+               budget: Optional[int] = None) -> str:
+        """The exploring candidate for self-imitation, at SAMPLE_TEMP."""
+        return self._gen(eid, self.prompt(span_text, question), C.SAMPLE_TEMP, budget)
 
     def update(self, eid: int, prompt: str, texts: List[str], advantages: List[float]) -> Optional[float]:
         """Reward-weighted self-imitation: loss = sum_g A_g * CE(e_g | prompt).

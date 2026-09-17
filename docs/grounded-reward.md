@@ -70,7 +70,7 @@ and Δ is noise, not a small number. **Refuse to measure rather than measure bad
 
 ## The expert weight update
 
-Replaces the MSE. Central stays frozen; it is never differentiated through.
+Replaces the MSE. Central is frozen while the batch is scored and is never differentiated through; its own CE step on `y` runs last in the batch, after the experts are graded.
 
 Expert `i` emits `G ≥ 2` candidates `e^1..e^G` of its fragment (temperature ~0.8). Score
 each by `s^g = Δ^g / n_g`. Then:
