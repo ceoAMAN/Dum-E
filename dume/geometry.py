@@ -193,26 +193,29 @@ class Geometry:
         return int(np.nanargmax(np.nanmean(off, axis=1)))
 
     def tier(self, home: int, c: int) -> str:
-        """How cluster `c` stands to this input's home, on the 10:20:30:40 bands
-        over the frozen pair-similarity matrix. A DEPLOYMENT primitive (Aman,
-        2026-09-18): training does not consult it, because training sweeps the
-        pool for equal exposure and must not prefer one cluster's experts over
-        another's — that is exactly the concentration the curriculum exists to
-        avoid. It is a pure query on the geometry, so it costs nothing when
-        uncalled; it currently has NO consumer, since answer() orders notes by
-        standing alone.
+        """Where cluster `c` SITS relative to this input's home: member, the
+        immediate neighbour, or far. Three rungs, not four (Aman, 2026-09-18:
+        "remove close, it is just neighbour, it is the immediate centroid next
+        to it") — SIM_NEIGHBOUR is the whole boundary, and SIM_FAR stays what it
+        has always been, the floor tau may not fall below.
+
+        This is POSITIONING only. A centroid adapts to its own data stream — the
+        input that lands inside its territory, which is what grow() and the tau
+        chains read — never to these pair-similarity manoeuvres. B and pair_sim
+        are frozen (rules 15/16), so tier can only report the layout, never
+        move it.
+
+        A DEPLOYMENT primitive: training sweeps the pool for equal exposure and
+        must not prefer one cluster's experts over another's, which is exactly
+        the concentration the curriculum exists to avoid. It is a pure query on
+        the geometry, so it costs nothing while it has no consumer.
 
         Distinct from the EXPERT tier (standing / membership): this one is about
         the distance between centroids, that one about how well an expert does.
         Two tier systems, deliberately separate."""
         if c == home:
             return "member"
-        s = float(self.pair_sim[home, c])
-        if s >= C.SIM_NEIGHBOUR:
-            return "neighbour"
-        if s >= C.SIM_FAR:
-            return "close"
-        return "far"
+        return "neighbour" if float(self.pair_sim[home, c]) >= C.SIM_NEIGHBOUR else "far"
 
     # ── the one online write ────────────────────────────────────────────────
     def set_tau(self, c: int, tau: float) -> None:
