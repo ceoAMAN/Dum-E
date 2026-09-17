@@ -193,6 +193,18 @@ class Geometry:
         return int(np.nanargmax(np.nanmean(off, axis=1)))
 
     def tier(self, home: int, c: int) -> str:
+        """How cluster `c` stands to this input's home, on the 10:20:30:40 bands
+        over the frozen pair-similarity matrix. A DEPLOYMENT primitive (Aman,
+        2026-09-18): training does not consult it, because training sweeps the
+        pool for equal exposure and must not prefer one cluster's experts over
+        another's — that is exactly the concentration the curriculum exists to
+        avoid. It is a pure query on the geometry, so it costs nothing when
+        uncalled; it currently has NO consumer, since answer() orders notes by
+        standing alone.
+
+        Distinct from the EXPERT tier (standing / membership): this one is about
+        the distance between centroids, that one about how well an expert does.
+        Two tier systems, deliberately separate."""
         if c == home:
             return "member"
         s = float(self.pair_sim[home, c])
