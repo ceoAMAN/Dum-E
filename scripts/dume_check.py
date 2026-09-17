@@ -381,6 +381,14 @@ def main() -> int:
     assert h.nonfinite == 1
     h.update_seen(None); h.update_seen(1.0)
     assert h.updates == 1 and list(h.applied) == [0.0, 1.0], "skipped update counted as applied"
+    # the update floor must be ROBUST: one short-answer outlier inflated
+    # arr.std() enough to refuse 96% of gradient steps over 1700 batches.
+    from dume.health import mad_sigma
+    clean = np.random.default_rng(0).normal(0, 0.05, 50)
+    dirty = np.concatenate([clean, [2.90]])
+    assert abs(mad_sigma(clean) - clean.std()) < 0.02, "MAD disagrees with std on clean data"
+    assert mad_sigma(dirty) < 2 * mad_sigma(clean), "one outlier moved the robust spread"
+    assert dirty.std() > 4 * clean.std(), "the std should be the fragile one"
     print("health        OK  (non-finite caught at record time; skipped update is not a loss)")
     print("ALL CHECKS PASS")
     return 0

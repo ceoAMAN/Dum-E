@@ -386,7 +386,7 @@ class System:
         # Gate on the reward's OWN measured noise, not an invented 1e-6: standardising
         # by the pair's spread turned every difference, however tiny, into a full-strength
         # +-0.5 coin flip. Below the noise floor there is no direction to learn.
-        floor = float(self.health.rec.get("delta_std", 0.0)) * 0.25
+        floor = float(self.health.rec.get("delta_mad", 0.0)) * 0.25
         if abs(d_g - d_s) <= floor:
             return None
         m = (d_g + d_s) / 2.0

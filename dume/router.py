@@ -101,7 +101,15 @@ class Router:
             # so the observations of a whole sweep are comparable across experts.
             routed = present[0]
             tier = self.geo.tier(home, routed)
-            picks = [(int(e), routed, tier, False) for e in experts[:k]]
+            # The LAST seat of the batch is the trial, exactly as on the router
+            # path. Marking every seat trial=False silently deleted the dormant
+            # slot the moment training stopped routing: `_imitate` looks for
+            # sel.trial and found none, so imitation ran 0 times in 1700 batches.
+            # The curriculum still chooses WHICH experts sit; this only labels
+            # one of them, so equal exposure is untouched.
+            chosen = [int(e) for e in experts[:k]]
+            picks = [(e, routed, tier, i == len(chosen) - 1 and len(chosen) >= 2)
+                     for i, e in enumerate(chosen)]
         else:
             route = self.gate.route_logits(pooled)
             chosen: set = set()

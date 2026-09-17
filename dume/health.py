@@ -25,6 +25,31 @@ import numpy as np
 from . import config as C
 
 
+def mad_sigma(x: np.ndarray) -> float:
+    """Spread of the deltas, ROBUST. 1.4826 * median|x - median x| equals the
+    standard deviation on clean Gaussian data, so the number means the same
+    thing — but a median cannot be dragged by how FAR an outlier sits, only by
+    how many there are.
+
+    This matters because the outliers here are structural, not accidental: a
+    delta is a MEAN over M target tokens, so a 2-token answer has enormous
+    variance by construction, and sciq/ai2_arc supply a fifth of the mixture.
+    In the 1700-batch run one such row (deltas of -2.69 and +2.90 were logged on
+    M=2) inflated arr.std() for the whole 50-batch window, and `_expert_update`
+    refuses when |d_g - d_s| <= 0.25 * that. Typical greedy-vs-sampled
+    differences are ~0.02, so the floor sat an order of magnitude above the
+    signal and 96% of gradient steps were refused: 415 updates across 100
+    experts in four and a half hours. The gate was built to stop learning from
+    noise and was stopping learning from everything.
+
+    delta_std is kept alongside it, unchanged, because the "reward degenerating
+    to a band" alarm is calibrated against a standard deviation.
+    """
+    if x.size == 0:
+        return 0.0
+    return float(1.4826 * np.median(np.abs(x - np.median(x))))
+
+
 class Health:
     def __init__(self):
         self.batch = 0
@@ -84,7 +109,8 @@ class Health:
         if len(self.deltas) >= 50:
             arr = np.array(self.deltas)
             sd, neg = float(arr.std()), float((arr < 0).mean())
-            self.put(delta_std=sd, delta_neg_frac=neg, delta_mean=float(arr.mean()))
+            self.put(delta_std=sd, delta_neg_frac=neg, delta_mean=float(arr.mean()),
+                     delta_mad=mad_sigma(arr))
             if sd < 0.01:
                 alarms.append(f"C: delta std {sd:.4f} < 0.01 — reward degenerating to a band")
             if not (0.15 <= neg <= 0.85):
