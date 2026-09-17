@@ -395,7 +395,7 @@ class System:
                                    budget=len(self.pool.tok.encode(greedy)) or None)
         if not sampled or sampled == greedy:
             return None
-        d_s = score_one(self.central, s.prompt, y, sc.b, sc.w, sampled, sc.base_len)
+        d_s = score_one(self.central, s.prompt, y, sc.b, sampled, sc.base_len)
         if d_s is None:
             return None
         # Gate on the reward's OWN measured noise, not an invented 1e-6: standardising
@@ -405,11 +405,9 @@ class System:
         if abs(d_g - d_s) <= floor:
             return None
         m = (d_g + d_s) / 2.0
-        # No scalar rho on the advantage: d is graded against real y, and rho is
-        # a deployment deduction, not a training one. (The per-TOKEN reliability
-        # weighting inside d itself — reward.weights(), w[t] = R[centroid(t)] —
-        # is a different and older mechanism, the "reliability vector"; whether
-        # it also belongs only in deployment is an open question for Aman.)
+        # No rho on the advantage, scalar or per-token: d is a plain mean over
+        # real y, and rho is a deployment deduction, not a training one. The
+        # delta already carries reliability on its own (see reward.py header).
         return self.pool.update(eid, self.pool.prompt(spans[eid], s.prompt), [greedy, sampled],
                                 [d_g - m, d_s - m])
 

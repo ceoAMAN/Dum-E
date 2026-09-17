@@ -272,13 +272,6 @@ class Standing:
                 self._move(e, frm, to, moves, chains)
         return moves
 
-    def _settled(self, eid: int, cid: int) -> Optional[float]:
-        """Standing, but only once the pair has run more than once. A seat is a
-        durable decision and one batch is not evidence for one: promoting on a
-        single observation produced pure churn (12 moves in one migrate, the
-        same experts thrashing between surplus and their cluster)."""
-        return self.score(eid, cid) if self.n[eid, cid] >= MIN_MOVE_OBS else None
-
     def _move(self, e: int, frm: int, to: int, moves, chains) -> None:
         self.assigned[e] = to
         self.moves += 1

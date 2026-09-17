@@ -24,7 +24,7 @@ from dume import config as C                                   # noqa: E402
 from dume.chain import MarkovChain, MigrationChains, SizeChains  # noqa: E402
 from dume.geometry import Geometry                             # noqa: E402
 from dume.health import Health                                 # noqa: E402
-from dume.reward import CentralBand, Reliability, is_heldout, weights       # noqa: E402
+from dume.reward import CentralBand, Reliability, _split, is_heldout, rho_of   # noqa: E402
 from dume.alloc import AllocLaw, probe_sizes
 from dume.curriculum import SPECIALIZE, TEST, Curriculum       # noqa: E402
 from dume.router import Router                                 # noqa: E402
@@ -267,12 +267,19 @@ def main() -> int:
     r.observe(np.full(200, 0.5), np.zeros(200, dtype=int))
     r.observe(np.full(200, 3.0), np.ones(200, dtype=int))
     assert r.R(0) > r.R(1)
-    assert len(weights(r, np.array([0, 0, 1, 1]), 4)) == 4
+    rho = rho_of(r, np.array([0, 0, 1, 1]), 4)
+    assert abs(rho - (r.R(0) + r.R(1)) / 2) < 1e-12, "rho is not the mean R over token types"
     try:
-        weights(r, np.array([0, 0, 1, 1]), 8)
-        raise AssertionError("weights accepted a misaligned assignment")
+        rho_of(r, np.array([0, 0, 1, 1]), 8)
+        raise AssertionError("rho accepted a misaligned assignment")
     except RuntimeError:
         pass
+    # R is MEASURED in training, never applied to the delta: the reward is a plain
+    # mean over tokens. A token on an unreliable centroid counts exactly as much as
+    # one on a reliable centroid — the delta already carries the headroom.
+    d = np.array([1.0, 1.0, -0.5, -0.5])
+    net, cor, hal = _split(d)
+    assert abs(net - d.mean()) < 1e-12 and abs(cor - 0.5) < 1e-12 and abs(hal - 0.25) < 1e-12, (net, cor, hal)
     frac = sum(is_heldout(f"k{i}") for i in range(4000)) / 4000
     assert 0.2 < frac < 0.3, frac
     # THE RELIABILITY DEDUCTION IS DEPLOYMENT-ONLY. Training has y, so gradients
@@ -341,7 +348,7 @@ def main() -> int:
     # router spans: anchors ordered and contiguous, every span padded to its allocation
     T = 400
     assign_t = np.array([0] * 200 + [1] * 200)
-    picks = [(50, 0, "member", False), (60, 1, "neighbour", False), (70, 0, "member", True)]
+    picks = [(50, 0, False), (60, 1, False), (70, 0, True)]
     rt = Router.__new__(Router)
     rt.alloc = law
     rt.sched = SimpleNamespace(span_max=1 << 30)          # unbounded for the geometry checks

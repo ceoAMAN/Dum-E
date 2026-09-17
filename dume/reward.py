@@ -11,15 +11,22 @@ frame is identical in both passes and in pretraining (question, newline; expert
 text, newline), so the paired difference is not confounded by a format change.
 
 Reliability R[c] is a vector over token types (= centroids), fitted ONLY on a
-held-out shard, so it is never fitted on the tokens it grades. It weights the
-delta per token: an expert whose gain lands where Central cannot read is
-discounted. With a scalar R this weight cancels across experts exactly; the
-vector is what makes it do work. Writer and reader index the SAME assign_y[t]:
-the caller builds assign_y from the target ids themselves, so len == M always.
+held-out shard, so it is never fitted on the tokens it grades. In training it is
+MEASURED, not applied (Aman, 2026-09-18): the delta is a plain mean over the M
+target tokens. rho — the mean of R over this target's token types — is still
+computed, because admission needs it (a composition Central cannot read cannot
+grade an expert) and deployment reads it as the deduction factor.
 
-SIGN CHOICE (flagged for Aman): weight = R (trust the instrument where it is
-accurate). The alternative — weight by Central's UNreliability, "reward the
-headroom" — re-introduces a Goodhart target. One-line change in `weights()`.
+Why not weight the delta by R: the paired delta already carries reliability.
+Where Central is reliable, b[t] is small, so there is no headroom and d[t] is
+small; where it is not, the headroom is large and a good note earns a large
+d[t]. High reliability -> low gradient, low reliability -> high gradient, with
+no scalar anywhere. Multiplying by R on top of that (the old "trust the
+instrument" weighting) pushed the other way: it downweighted exactly the
+tokens with the most headroom. Live magnitude when removed: R spanned
+[0.36, 0.60] across centroids, a 1.7x thumb on the scale against the natural
+effect. Writer and reader still index the SAME assign_y[t]: the caller builds
+assign_y from the target ids themselves, so len == M always.
 """
 from __future__ import annotations
 
@@ -78,7 +85,6 @@ class Reliability:
 @dataclass
 class Scored:
     b: np.ndarray
-    w: np.ndarray
     base_len: int = 0
     deltas: Dict[int, float] = field(default_factory=dict)
     zero_delta: Dict[int, bool] = field(default_factory=dict)
@@ -89,13 +95,14 @@ class Scored:
     admitted: bool = True
 
 
-def weights(reliability: Reliability, assign_y: np.ndarray, M: int) -> np.ndarray:
-    """Per-target-token weight. SIGN CHOICE lives here: R, not 1-R. Refuses a
+def rho_of(reliability: Reliability, assign_y: np.ndarray, M: int) -> float:
+    """Mean reliability over this target's token types — the composition's
+    deduction factor, MEASURED here and applied only at deployment. Refuses a
     misaligned assignment rather than resampling it (rule 20)."""
     a = np.asarray(assign_y)
     if len(a) != M:
-        raise RuntimeError(f"weights: {len(a)} token types for {M} target tokens")
-    return np.array([reliability.R(int(c)) for c in a], dtype=np.float64)
+        raise RuntimeError(f"rho: {len(a)} token types for {M} target tokens")
+    return float(np.mean([reliability.R(int(c)) for c in a])) if M else 0.0
 
 
 def score(central, question: str, y: List[int], assign_y: np.ndarray,
@@ -104,8 +111,7 @@ def score(central, question: str, y: List[int], assign_y: np.ndarray,
     b = central.ce_vector(ctx0, y).astype(np.float64)
     M = len(b)
     base_len = len(ctx0)
-    w = weights(reliability, assign_y, M)
-    out = Scored(b=b, w=w, base_len=base_len, rho=float(w.mean()) if M else 0.0)
+    out = Scored(b=b, base_len=base_len, rho=rho_of(reliability, assign_y, M))
     # M >= TARGET_MIN_TOKENS: a mean over one token is not a measurement, and the
     # short-answer sources are a fifth of the mixture, not a rare accident.
     out.admitted = out.rho >= C.R_MIN and M >= C.TARGET_MIN_TOKENS
@@ -114,12 +120,12 @@ def score(central, question: str, y: List[int], assign_y: np.ndarray,
         if d is None:                        # context did not grow: the text was cut, a_i == b by construction
             out.dropped.append(eid)
             continue
-        out.deltas[eid], out.correct[eid], out.halluc[eid] = _split(w, d)
+        out.deltas[eid], out.correct[eid], out.halluc[eid] = _split(d)
         out.zero_delta[eid] = bool(np.max(np.abs(d)) < 1e-6) if M else True
     return out
 
 
-def _split(w: np.ndarray, d: np.ndarray) -> tuple:
+def _split(d: np.ndarray) -> tuple:
     """CORRECTNESS and HALLUCINATION are the same gradient, read on both sides
     of zero (Aman, 2026-09-10: "hallucination and correctness is give as
     gradient ... validated on training data").
@@ -134,11 +140,10 @@ def _split(w: np.ndarray, d: np.ndarray) -> tuple:
     helps hugely on half the tokens and hurts on the other half from one that
     does nothing at all — both average to zero. Splitting at zero can, and
     correct - halluc is EXACTLY the old delta, so nothing downstream shifts."""
-    tot = float(w.sum())
-    if tot <= 0:
+    if d.size == 0:
         return 0.0, 0.0, 0.0
-    pos = float((w * np.maximum(d, 0.0)).sum() / tot)
-    neg = float((w * np.maximum(-d, 0.0)).sum() / tot)
+    pos = float(np.maximum(d, 0.0).mean())
+    neg = float(np.maximum(-d, 0.0).mean())
     return pos - neg, pos, neg
 
 
@@ -153,12 +158,12 @@ def _delta_vector(central, question: str, y: List[int], b: np.ndarray, text: str
     return b - a
 
 
-def score_one(central, question: str, y: List[int], b: np.ndarray, w: np.ndarray, text: str,
+def score_one(central, question: str, y: List[int], b: np.ndarray, text: str,
               ctx0_len: int) -> Optional[float]:
     d = _delta_vector(central, question, y, b, text, ctx0_len)
     if d is None:
         return None
-    return float((w * d).sum() / w.sum()) if w.sum() > 0 else 0.0
+    return float(d.mean()) if d.size else 0.0
 
 
 class CentralBand:

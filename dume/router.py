@@ -34,7 +34,6 @@ from .standing import Standing
 class Selection:
     eid: int
     cid: int
-    tier: str
     start: int
     end: int
     trial: bool = False
@@ -93,14 +92,13 @@ class Router:
         # bound (Aman's general equation); sched.clamp stays because the RAM
         # bound is physical and a blend must never be allowed above it.
         k = self.sched.clamp(self.alloc.k_effective(T, self.sched.k_max))
-        picks: List[tuple] = []           # (eid, cid, tier, trial)
+        picks: List[tuple] = []           # (eid, cid, trial)
         if curriculum is not None:
             experts = curriculum.experts(k, present[0], self.standing,
                                          resident=getattr(self.sched.pool, 'resident', ()))
             # every seat is measured on the cluster the input actually routed to,
             # so the observations of a whole sweep are comparable across experts.
             routed = present[0]
-            tier = self.geo.tier(home, routed)
             # The LAST seat of the batch is the trial, exactly as on the router
             # path. Marking every seat trial=False silently deleted the dormant
             # slot the moment training stopped routing: `_imitate` looks for
@@ -108,7 +106,7 @@ class Router:
             # The curriculum still chooses WHICH experts sit; this only labels
             # one of them, so equal exposure is untouched.
             chosen = [int(e) for e in experts[:k]]
-            picks = [(e, routed, tier, i == len(chosen) - 1 and len(chosen) >= 2)
+            picks = [(e, routed, i == len(chosen) - 1 and len(chosen) >= 2)
                      for i, e in enumerate(chosen)]
         else:
             route = self.gate.route_logits(pooled)
@@ -119,12 +117,12 @@ class Router:
                 if eid is None:
                     continue
                 chosen.add(eid)
-                picks.append((eid, cid, self.geo.tier(home, cid), False))
+                picks.append((eid, cid, False))
             if k >= 2:
                 routed = present[0]                 # the trial is measured where the input actually routed
                 t = self.standing.trial(routed, chosen)
                 if t is not None:
-                    picks.append((t, routed, self.geo.tier(home, routed), True))
+                    picks.append((t, routed, True))
         plan = Plan(ids=ids, H=H, pooled=pooled, w=w, assign=assign, home=home, present=present,
                     inside=inside, k_wanted=k_wanted, k=k, probe=probe)
         place = AllocLaw.placement(self.standing.rank(self.geo.domain()))
@@ -158,7 +156,7 @@ class Router:
         router's — each expert gets the span its OWN rank earns it on the
         fitted curves, padded around its anchor and clamped to the input. Span
         size is a token-allocation question and allocation is fitted, not
-        weighted by tier.
+        weighted by the cluster's relation to home.
 
         In PROBE mode (training) the lengths come from the probe schedule
         {t_lo, t_mid, t_hi} instead, cycled across the seats: the probe IS the
@@ -167,7 +165,7 @@ class Router:
             return []
         picks = picks[:T]                       # never more spans than tokens
         com = []
-        for eid, cid, tier, trial in picks:
+        for eid, cid, trial in picks:
             pos = np.where(assign == cid)[0]
             com.append(float(pos.mean()) if len(pos) else T / 2.0)
         raw = [picks[i] for i in np.argsort(com)]
@@ -178,7 +176,7 @@ class Router:
         T_eff = min(T, self.sched.span_max)
         sizes = probe_sizes(T_eff) if probe else None
         out = []
-        for i, (eid, cid, tier, trial) in enumerate(raw):
+        for i, (eid, cid, trial) in enumerate(raw):
             # rotate the probe across BATCHES as well as seats: at k=1 (the §7
             # identity fallback, which is the live state until the law fits)
             # `i` is always 0, so every probe would land on t_lo and the
@@ -188,7 +186,7 @@ class Router:
             start = (T * i) // n                              # contiguous anchor
             end = min(T, start + L)
             start = max(0, end - L)                           # pad back when we run off the end
-            out.append(Selection(eid=eid, cid=cid, tier=tier, start=start, end=end, trial=trial))
+            out.append(Selection(eid=eid, cid=cid, start=start, end=end, trial=trial))
         return [sel for sel in out if sel.n_tokens > 0]
 
     def gate_step(self, plan: Plan, deltas: Dict[int, float]) -> float:
