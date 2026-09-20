@@ -328,7 +328,7 @@ class AllocLaw:
             return None
         return float(np.mean([s for _, s in self.lat]))
 
-    def k_effective(self, T: int, k_ram: int) -> int:
+    def k_effective(self, T: int, k_ram: int, k_thermal: Optional[float] = None) -> int:
         """Aman's general equation (2026-09-10), made dimensional.
 
         His form was `1/experts + 1/estimated_time + tokens_per_second`. The
@@ -362,12 +362,39 @@ class AllocLaw:
         yet, so the honest form is the two constraints that are grounded and
         independent. Put the third back when there is a clock to answer to.
 
+        THE THIRD TERM IS THE DEVICE (Aman, 2026-09-20): "it is a constant tug
+        of war — the device wants k less so it doesn't get hot, its input is
+        temperature; the system wants to do work fastest so it wants k high, as
+        high k adds more tokens per second and processing". k_gate is the system
+        pulling up, k_thermal is the device pulling down, and the harmonic mean
+        is the negotiation. k_thermal comes from NSProcessInfo's thermal state
+        via Scheduler.k_thermal, so the device's side has a real measured input
+        rather than an assumed one.
+
+        It is a bound as well as a blend term, exactly like k_ram: a soft mean
+        over three terms can still land above what the device is asking for, and
+        at `serious` the OS is already throttling, so running more experts makes
+        the thing it is complaining about worse.
+
         Until the allocation law is fitted this degrades to k_gate, which is the
-        §7 identity fallback — a refusal, not a guess."""
+        §7 identity fallback — a refusal, not a guess.
+
+        The device does NOT enter as a third voice. Heat and RAM are the same
+        axis — both say how much this machine will do right now — so thermal
+        pressure MODULATES the physical bound rather than adding a term. That
+        also makes a nominal device exactly free: k_thermal == k_ram at nominal,
+        so turning the sensor on cannot move k until the machine is actually
+        warm. A third harmonic term would have shifted every k the moment the
+        sensor was installed, which is a silent behaviour change, not a
+        measurement.
+        """
         k_gate = max(1.0, float(self.k(T)))
-        k_r = max(1.0, float(k_ram))
-        eff = 2.0 / (1.0 / k_gate + 1.0 / k_r)
-        return max(1, min(int(round(eff)), int(k_ram)))
+        # what the machine will allow RIGHT NOW: the physical bound, tightened
+        # by whatever the device is currently asking for
+        k_dev = float(k_ram) if k_thermal is None else min(float(k_ram), max(1.0, float(k_thermal)))
+        k_dev = max(1.0, k_dev)
+        eff = 2.0 / (1.0 / k_gate + 1.0 / k_dev)
+        return max(1, min(int(round(eff)), max(1, int(round(k_dev)))))
 
     def state(self) -> Dict[str, object]:
         return {"fitted": self.fitted, "alpha": round(self.alpha, 5), "beta": round(self.beta, 5),

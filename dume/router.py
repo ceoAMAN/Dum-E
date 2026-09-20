@@ -91,7 +91,8 @@ class Router:
         # k_effective blends the allocation law, the measured clock and the RAM
         # bound (Aman's general equation); sched.clamp stays because the RAM
         # bound is physical and a blend must never be allowed above it.
-        k = self.sched.clamp(self.alloc.k_effective(T, self.sched.k_max))
+        k = self.sched.clamp(self.alloc.k_effective(T, self.sched.k_max,
+                                                    self.sched.k_thermal))
         picks: List[tuple] = []           # (eid, cid, trial)
         if curriculum is not None:
             experts = curriculum.experts(k, present[0], self.standing,

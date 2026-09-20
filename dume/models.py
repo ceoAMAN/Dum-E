@@ -128,6 +128,43 @@ def reset_peak() -> None:
     mx.reset_peak_memory()
 
 
+_THERMAL = None          # NSProcessInfo, resolved once; None means unavailable
+
+
+def thermal_state() -> int:
+    """The device's own thermal pressure, 0..3 (nominal / fair / serious /
+    critical), straight from NSProcessInfo.
+
+    This is the DEVICE's side of the tug of war over k (Aman, 2026-09-20: "the
+    device wants k less so it doesn't get hot, its input is temperature; the
+    system wants to do work fastest so it wants k high"). It is a real input,
+    not a proxy: macOS decides these levels from the sensors we cannot read
+    ourselves, and it costs 1.6 us to poll, so it can be read every batch.
+
+    A raw temperature would be better and is not available here: `pmset -g
+    therm` has never recorded a warning on this machine, no thermal sysctl or
+    SMC key is exposed, and `powermetrics --samplers smc` does not exist on this
+    OS. Reading degrees needs sudo on every call, which cannot run unattended
+    inside the loop.
+
+    Returns 0 when the framework is missing, which is the honest default — an
+    unmeasurable device is not a hot one, and a missing sensor must not quietly
+    throttle the pool."""
+    global _THERMAL
+    if _THERMAL is None:
+        try:
+            import Foundation                            # pyobjc-framework-Cocoa
+            _THERMAL = Foundation.NSProcessInfo.processInfo()
+        except Exception:                                # noqa: BLE001
+            _THERMAL = False
+    if _THERMAL is False:
+        return 0
+    try:
+        return max(0, min(3, int(_THERMAL.thermalState())))
+    except Exception:                                    # noqa: BLE001
+        return 0
+
+
 def total_ram_mb() -> float:
     out = subprocess.check_output(["sysctl", "-n", "hw.memsize"], text=True).strip()
     return float(int(out)) / 2**20

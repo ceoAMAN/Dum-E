@@ -439,6 +439,26 @@ def main() -> int:
         convex.observe(t, q, 1.0)
     convex._fit_envelopes()
     assert convex.A is None and "convex" in convex.last_reject, convex.last_reject
+    # THE DEVICE'S SIDE OF THE TUG OF WAR over k. k_gate pulls up, the device
+    # pulls down, and its input is real: NSProcessInfo's thermal state, not a
+    # proxy and not a constant.
+    from dume.models import thermal_state as _ts
+    assert _ts() in (0, 1, 2, 3), f"thermal state out of range: {_ts()}"
+    kt = [16.0 ** (1.0 / (1.0 + st)) for st in range(4)]      # k_max=16
+    ks = [law.k_effective(512, 16, t) for t in kt]
+    assert ks == sorted(ks, reverse=True), f"heat did not lower k: {ks}"
+    assert ks[0] > ks[-1], f"thermal pressure had no effect at all: {ks}"
+    assert all(k >= 1 for k in ks), ks
+    # nominal costs nothing: a device asking for nothing leaves the physical
+    # bound exactly where it was
+    assert law.k_effective(512, 16, kt[0]) == law.k_effective(512, 16), \
+        "nominal thermal state moved k"
+    # the device can never push k ABOVE what RAM allows — that would be an OOM,
+    # not a preference
+    assert law.k_effective(512, 4, 999.0) <= 4, "thermal term escaped the RAM clamp"
+    # a machine with no sensor is not a hot machine
+    assert law.k_effective(512, 16, None) == law.k_effective(512, 16, kt[0]), \
+        "a missing sensor quietly throttled the pool"
     print(f"alloc         OK  (probe from T alone; beta {law.beta:.3f}; k non-decreasing; "
           f"convex + narrow-span refused; logs cleared)")
 

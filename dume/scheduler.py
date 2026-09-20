@@ -32,7 +32,7 @@ import math
 from typing import Iterable, List
 
 from . import config as C
-from .models import ExpertPool, active_mb, total_ram_mb, working_set_mb
+from .models import ExpertPool, active_mb, thermal_state, total_ram_mb, working_set_mb
 
 
 class Scheduler:
@@ -78,6 +78,22 @@ class Scheduler:
                   f"— the GPU refuses allocations past that ceiling")
         if self.k_max < 1:
             raise RuntimeError("scheduler: not one expert fits alongside central+gate — refusing to run")
+
+    @property
+    def k_thermal(self) -> float:
+        """How many experts the DEVICE is willing to run right now.
+
+        Each level of thermal pressure takes another root of the RAM bound —
+        the same sqrt bracket k_tier, GENERAL_EXPERTS and capacity() are built
+        from, so no new constant enters. On k_max=4 that is 4.00 nominal, 2.00
+        fair, 1.59 serious, 1.41 critical: at nominal the device asks for
+        nothing and the bound is exactly the physical one, and it tightens
+        geometrically as the OS reports heat.
+
+        The levels are ordinal — macOS publishes no degrees — so a geometric
+        backoff is the only honest shape; a linear map would need a scale
+        nobody measured."""
+        return float(self.k_max) ** (1.0 / (1.0 + thermal_state()))
 
     def clamp(self, k_wanted: int) -> int:
         return max(1, min(int(k_wanted), self.k_max))

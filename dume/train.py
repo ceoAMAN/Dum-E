@@ -24,7 +24,7 @@ from .chain import MigrationChains, SizeChains
 from .curriculum import Curriculum
 from .geometry import Geometry
 from .health import Health
-from .models import (Central, ExpertPool, Gate, active_mb, measure_expert_peak_mb,
+from .models import (Central, ExpertPool, Gate, active_mb, measure_expert_peak_mb, thermal_state,
                      measure_update_slope_mb, measure_slot_mb, reset_peak)
 from .reward import CentralBand, Reliability, is_heldout, rho_of, score, score_one
 from .router import Router
@@ -341,6 +341,10 @@ class System:
         self.health.tick(self.standing.total_n(), self.rel, self.size, self.mig)
         d = " ".join(f"e{sel.eid}{'*' if sel.trial else ''}:{sc.deltas.get(sel.eid, float('nan')):+.3f}" for sel in sels)
         rec["k_alloc"] = float(self.alloc.k(len(plan.ids)))
+        # the device's side of the k tug of war, recorded so a run can show
+        # whether heat ever got a vote at all
+        rec["thermal"] = float(thermal_state())
+        rec["k_thermal"] = float(self.sched.k_thermal)
         losses = " ".join(f"{k}={rec[k]:.3f}" for k in ("gate_loss", "expert_loss", "central_loss") if k in rec)
         print(f"[b{self.batch}] {s.source} T{tl} k={len(sels)}/{plan.k_wanted} home={plan.home} present={plan.present} "
               f"M={len(y)} rho={sc.rho:.2f} {'HELDOUT' if heldout else ('ADMIT' if sc.admitted else 'REFUSE')} {d} {losses}")
