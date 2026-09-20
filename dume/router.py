@@ -126,7 +126,19 @@ class Router:
         plan = Plan(ids=ids, H=H, pooled=pooled, w=w, assign=assign, home=home, present=present,
                     inside=inside, k_wanted=k_wanted, k=k, probe=probe)
         place = AllocLaw.placement(self.standing.rank(self.geo.domain()))
-        plan.selections = self._spans(picks, assign, T, probe, place)
+        # FRAGMENT CYCLES (Aman, 2026-09-20). k_effective is not only a count:
+        # it is the number of experts handed to the gate "with instruction to
+        # increase token fragment cycles on them, so then we avoid swapping k
+        # experts on regular intervals". The law asked for k_wanted experts; RAM
+        # allows k. The deficit is paid in CYCLES on the experts we are already
+        # holding rather than in swaps, so the input still gets covered and the
+        # adapter stays live between its own fragments.
+        #
+        # Deployment only. Training's lengths come from the probe schedule —
+        # the probe IS the training allocation — and cycling there would spend
+        # the run's wall clock on coverage it does not need.
+        cycles = 1 if probe else max(1, k_wanted // max(k, 1))
+        plan.selections = self._spans(picks, assign, T, probe, place, cycles)
         return plan
 
     def _pick(self, cid: int, route: np.ndarray, chosen: set) -> Optional[int]:
@@ -150,7 +162,7 @@ class Router:
         return int(max(rest, key=lambda e: route[e])) if rest else None
 
     def _spans(self, picks: List[tuple], assign: np.ndarray, T: int, probe: bool,
-               place: Dict[int, float]) -> List[Selection]:
+               place: Dict[int, float], cycles: int = 1) -> List[Selection]:
         """Split, then PAD. Anchors are contiguous and ordered by where each
         cluster's tokens actually sit; the LENGTH is apex-nadir's, not the
         router's — each expert gets the span its OWN rank earns it on the
@@ -175,6 +187,11 @@ class Router:
         # t_hi = T would ask for 13 GB on a long row. Same physical clamp as k_max.
         T_eff = min(T, self.sched.span_max)
         sizes = probe_sizes(T_eff) if probe else None
+        # the probe IS the training allocation: cycling there would spend the
+        # run's wall clock covering input the probe schedule is deliberately
+        # sampling instead. The guard lives here as well as in plan() so the
+        # invariant is local to the function that would break it.
+        cycles = 1 if probe else max(1, int(cycles))
         out = []
         for i, (eid, cid, trial) in enumerate(raw):
             # rotate the probe across BATCHES as well as seats: at k=1 (the §7
@@ -183,11 +200,29 @@ class Router:
             # envelopes could never be fitted over a range at all.
             L = sizes[(self.alloc.n_seen + i) % 3] if sizes else self.alloc.alloc(T_eff, place.get(eid, 0.5))
             L = max(1, min(int(L), T_eff))
-            start = (T * i) // n                              # contiguous anchor
-            end = min(T, start + L)
-            start = max(0, end - L)                           # pad back when we run off the end
-            out.append(Selection(eid=eid, cid=cid, start=start, end=end, trial=trial))
-        return [sel for sel in out if sel.n_tokens > 0]
+            # each expert owns a contiguous REGION and reads it in `cycles`
+            # fragments. Its fragments are emitted consecutively, so the adapter
+            # is made live once and stays live for all of them — the swap is per
+            # EXPERT, not per fragment, which is the whole point of paying the
+            # deficit in cycles.
+            lo, hi = (T * i) // n, (T * (i + 1)) // n
+            # cycles are bounded by COVERAGE, not by the deficit alone: once an
+            # expert's own region is tiled by its span there is nothing left to
+            # read, and a bigger deficit would only buy duplicate passes. So the
+            # instruction is "cover your region", and the deficit is the ceiling
+            # on how hard it may try.
+            need = max(1, -(-(hi - lo) // L))                 # ceil(region / span)
+            reps = max(1, min(cycles, need))
+            step = max(1, (hi - lo) // reps) if reps > 1 else 0
+            for j in range(reps):
+                start = min(lo + j * step, max(0, T - 1))
+                end = min(T, start + L)
+                start = max(0, end - L)                       # pad back off the end
+                sel = Selection(eid=eid, cid=cid, start=start, end=end, trial=trial)
+                if sel.n_tokens > 0 and not any(
+                        o.eid == eid and o.start == start and o.end == end for o in out):
+                    out.append(sel)                           # a region shorter than
+        return out                                            # `cycles` stops repeating itself
 
     def gate_step(self, plan: Plan, deltas: Dict[int, float]) -> float:
         return self.gate.train_step(plan.pooled, deltas)

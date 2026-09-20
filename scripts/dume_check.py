@@ -471,6 +471,29 @@ def main() -> int:
     assert set(s.n_tokens for s in bounded) == set(probe_sizes(64)), \
         "the probe must still sweep three sizes inside the bound, not collapse to it"
     rt.sched = SimpleNamespace(span_max=1 << 30)
+    # FRAGMENT CYCLES: the k deficit is paid on the experts already held, so the
+    # swap count is per EXPERT and does not grow with coverage (Aman,
+    # 2026-09-20: "increase token fragment cycles on them, so then we avoid
+    # swapping k experts on regular intervals"). Deployment only.
+    rt.sched = SimpleNamespace(span_max=50)   # short spans, so a region needs tiling
+    cyc = rt._spans([(3, 0, False), (7, 1, False)], assign_t, T, False,
+                    {3: 0.5, 7: 0.5}, cycles=6)
+    order = [x.eid for x in cyc]
+    swaps = sum(1 for i in range(len(order)) if i == 0 or order[i] != order[i - 1])
+    assert len(cyc) > 2, f"cycles produced no extra fragments: {len(cyc)}"
+    assert swaps == 2, f"a fragment cost a swap: {swaps} over {order}"
+    assert len(set(order)) == 2, "cycles changed WHICH experts run"
+    assert all(0 <= x.start < x.end <= T for x in cyc), "a fragment left the input"
+    one = rt._spans([(3, 0, False), (7, 1, False)], assign_t, T, False, {3: 0.5, 7: 0.5})
+    cov_1 = len({t for x in one for t in range(x.start, x.end)})
+    cov_n = len({t for x in cyc for t in range(x.start, x.end)})
+    assert cov_n > cov_1, f"cycles bought no coverage: {cov_1} -> {cov_n}"
+    # bounded by COVERAGE: a region already tiled buys no duplicate passes
+    assert len(rt._spans([(3, 0, False)], assign_t, T, False, {3: 0.5}, cycles=9999)) <= T
+    # and the training path is untouched
+    assert len(rt._spans([(3, 0, False)], assign_t, T, True, {}, cycles=9)) == 1, \
+        "cycles leaked into the probe (training) path"
+    rt.sched = SimpleNamespace(span_max=1 << 30)
     print(f"router        OK  (anchors ordered, spans within input; probe spans "
           f"{sorted(s.n_tokens for s in probe_spans)}; span_max clamps t_hi)")
 
