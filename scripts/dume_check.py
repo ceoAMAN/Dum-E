@@ -95,36 +95,76 @@ def main() -> int:
     s1.observe(80, 0, 99.0, 32)
     s1.migrate(MigrationChains(2))
     assert s1.assigned[80] == GENERAL, "one batch bought a seat"
-    # a seat follows the ROW: e10 sits in c0 on -0.34/token; give it a
-    # less-bad c1 row (still negative, so it stays out of the elite) and its
-    # home must move. This is the case the clipped position() could not express.
+    # THE GENERAL CLASS IS A SPACE, NOT A SET OF MEMBERS (Aman, 2026-09-20:
+    # "generals aren't unreachable elites ... if someone performs better it can
+    # replace it"). e10 is seated in c0; give it a far better c1 row and it must
+    # take a general seat from an incumbent, who drops back to a centroid.
+    before = sorted(s1.elite)
     for _ in range(MIN_MOVE_OBS):
         s1.observe(10, 1, -0.1, 32)
     s1.migrate(mig := MigrationChains(2))
-    assert s1.assigned[10] == 1, f"the home did not follow the row: {s1.assigned[10]}"
+    assert len(s1.elite) == C.GENERAL_EXPERTS, f"the space changed size: {len(s1.elite)}"
+    assert 10 in s1.elite, f"a better performer did not replace an incumbent: {sorted(s1.elite)}"
+    displaced = set(before) - set(s1.elite)
+    assert len(displaced) == 1, f"exactly one incumbent must fall out, got {displaced}"
+    assert s1.assigned[list(displaced)[0]] != GENERAL, "the displaced general took no centroid seat"
+    # a seat still follows the ROW for an expert that does NOT reach the class:
+    # e13 is the worst of the pool; its best row must decide its home.
+    for _ in range(MIN_MOVE_OBS):
+        s1.observe(13, 0, -13.0, 32)
+    s1.migrate(MigrationChains(2))
+    assert 13 not in s1.elite and s1.assigned[13] == 0, \
+        f"the home did not follow the row: elite={13 in s1.elite} assigned={s1.assigned[13]}"
     assert sum(mig.pool.evidence(i) for i in range(mig.pool.n_states)) > 0, \
         "migration chain did not observe the move"
     # RANKING = normalised weighted sum of correctness, hallucination, throughput
     # (p4). All three are measured: the first two are the same per-token gradient
     # split at zero, the third is wall time.
+    # DOMAIN WEIGHTING: both experts are measured in the SAME two clusters, so
+    # the only thing separating them is WHERE they are good. Being good in the
+    # 0.8 domain must beat being equally good in the 0.1 domain. (The old test
+    # gave each expert one cluster and relied on the unmeasured cells scoring
+    # 0.0 — which only ranks correctly when rates are positive, and 202 of the
+    # 222 measured cells in the live state are negative, so that dot product
+    # preferred the specialist in the SMALL domain exactly when it mattered.)
     s3 = Standing(3)
-    s3.observe(20, 0, 1.0, 32, correct=1.0, halluc=0.0, seconds=1.0)
-    s3.observe(21, 2, 1.0, 32, correct=1.0, halluc=0.0, seconds=1.0)
+    for _ in range(MIN_MOVE_OBS):
+        s3.observe(20, 0, 1.0, 32, correct=2.0, halluc=0.0, seconds=1.0)   # good where it counts
+        s3.observe(20, 2, 1.0, 32, correct=1.0, halluc=0.0, seconds=1.0)
+        s3.observe(21, 0, 1.0, 32, correct=1.0, halluc=0.0, seconds=1.0)
+        s3.observe(21, 2, 1.0, 32, correct=2.0, halluc=0.0, seconds=1.0)   # good in the small one
     rk = s3.rank(np.array([0.8, 0.1, 0.1]))
-    assert rk[20] > rk[21], "domain rank did not weight the overall ranking"
+    assert rk[20] > rk[21], f"domain rank did not weight the overall ranking {rk}"
+    # and an expert measured NOWHERE ELSE must not beat one measured everywhere
+    # just by leaving cells blank (the ignorance bias, on negative rates)
+    s3b = Standing(3)
+    for _ in range(MIN_MOVE_OBS):
+        s3b.observe(30, 0, -0.5, 32)                       # thin, one cluster
+        for c in range(3):
+            s3b.observe(31, c, -0.5, 32)                   # same rate, measured everywhere
+    ov = s3b._overall(s3b.rates(), np.array([0.8, 0.1, 0.1]), s3b.n >= MIN_MOVE_OBS)
+    assert ov[30] <= ov[31] + 1e-12, f"thin evidence outscored full evidence: {ov[30]} vs {ov[31]}"
     place = AllocLaw.placement(rk)
     assert place[20] == 1.0 and place[21] == 0.0, place
     # two experts with the SAME net delta but different volatility must not rank
     # equal: correct-minus-halluc is what the old scalar saw, and it is blind here
+    # THREE SEPARATE TERMS, each on its own normaliser: efficiency, NON-
+    # hallucination, throughput. They used to share one scale and enter as
+    # (cor - hal), so W_HALLUC was inert at 1.0 by construction.
     s8 = Standing(1)
-    s8.observe(1, 0, 0.0, 32, correct=0.0, halluc=0.0, seconds=1.0)   # inert
-    s8.observe(2, 0, 0.0, 32, correct=3.0, halluc=3.0, seconds=1.0)   # volatile
+    s8.observe(1, 0, 0.0, 32, correct=2.0, halluc=1.0, seconds=1.0)
+    s8.observe(2, 0, 0.0, 32, correct=4.0, halluc=3.0, seconds=1.0)   # same net, 3x the halluc
     assert s8.score(1, 0) == s8.score(2, 0), "the net rate should be identical"
-    r8 = s8.rank(np.array([1.0]))
-    # at W_HALLUC == 1 the two gradient terms CANCEL and volatility is invisible.
-    # This is not a bug to paper over — it is the algebra, and it is why W_HALLUC
-    # is the one coefficient that has to come from Aman.
-    assert r8[1] == r8[2], f"equal weights should tie {r8}"
+    import dume.standing as _st
+    assert s8.rank(np.array([1.0]))[1] == s8.rank(np.array([1.0]))[2], \
+        "equal weights on a proportional pair still tie — that is the algebra"
+    _st.W_HALLUC = 2.0
+    try:
+        r8 = s8.rank(np.array([1.0]))
+        assert r8[1] > r8[2], f"W_HALLUC>1 must punish the hallucinator {r8}"
+    finally:
+        _st.W_HALLUC = 1.0
+
     import dume.standing as _st
     _st.W_HALLUC = 2.0
     try:
@@ -138,25 +178,35 @@ def main() -> int:
     s9.observe(2, 0, 1.0, 32, correct=1.0, halluc=0.0, seconds=1.0)
     r9 = s9.rank(np.array([1.0]))
     assert r9[2] > r9[1], f"processing time was ignored {r9}"
-    # the general class is ELECTED ONCE and LOCKED: kept and trained, never
-    # re-compared. A newcomer that outperforms every general does NOT take the
-    # class from one — it takes a SEAT. Re-ranking generals every migrate was
-    # churn: at the measured noise the top ten settles to 8.8/10 carry-over even
-    # when no expert is better than any other, so a stable set proves nothing.
+    # the general class is a SPACE OF FIXED SIZE, not a fixed set of members
+    # (Aman, 2026-09-20). The size never changes; a newcomer that outperforms an
+    # incumbent TAKES its place and the incumbent drops to a centroid seat.
     sL = Standing(2)
     for e in range(N):
         for _ in range(MIN_MOVE_OBS):
             sL.observe(e, e % 2, -1.0 - e, 32)
     assert sL.settle_generals() == list(range(C.GENERAL_EXPERTS)), sL.settle_generals()
-    locked = set(sL.elite)
+    was = set(sL.elite)
     for _ in range(MIN_MOVE_OBS):
         sL.observe(13, 0, 500.0, 32)              # a seated expert becomes the best alive
     sL.migrate(MigrationChains(2))
-    assert set(sL.elite) == locked, "the general class was re-elected"
-    assert sL.assigned[13] == 0, "the new best expert was not placed on its row"
-    assert all(sL.assigned[e] == GENERAL for e in locked), "a locked general lost its class"
-    # unplaced experts are general by RESIDUE, not election: still ranked, still movable
-    assert 13 not in sL.elite and sL.assigned[13] != GENERAL
+    assert len(sL.elite) == C.GENERAL_EXPERTS, f"the space changed size: {len(sL.elite)}"
+    assert 13 in sL.elite, "the best expert alive did not take a general seat"
+    out = was - set(sL.elite)
+    # >= 1, not exactly 1: an unmeasured cell is imputed from the POOL, so one
+    # expert's new result moves everyone's estimate in that cluster. The
+    # contract is the SIZE and the replacement, not which incumbent falls.
+    assert out, "a better performer displaced nobody"
+    assert all(sL.assigned[e] != GENERAL for e in out), "a displaced general took no centroid seat"
+    assert sL.assigned[13] == GENERAL, "a general must not also hold a centroid seat"
+    # and generals are REACHABLE: the curriculum must be able to seat them, or
+    # they can never be measured and never replaced
+    from dume.curriculum import Curriculum, SPECIALIZE
+    cg = Curriculum(n_experts=N); cg.phase = SPECIALIZE
+    drawn = set()
+    for _ in range(40):
+        drawn |= set(cg.experts(2, 0, sL))
+    assert drawn & set(sL.elite), f"the curriculum cannot reach a general: drew {sorted(drawn)}"
     # anti-dominance: more claimants than seats -> the weakest go GENERAL, they
     # are NOT shoved into a centroid they do not point at
     s5 = Standing(2)
@@ -167,7 +217,7 @@ def main() -> int:
     assert len(s5.members(0)) == C.CENTROID_EXPERTS, f"cap violated {s5.members(0)}"
     assert not s5.members(1), "overflow was displaced into a centroid it never earned"
     assert all(s5.assigned[e] == GENERAL for e in range(3)), "the weakest claimants kept seats"
-    print("standing      OK  (rank-and-fill; negatives place; general class elected once then LOCKED)")
+    print("standing      OK  (rank-and-fill; negatives place; general class is a fixed-size space, membership replaceable)")
 
     # growth: a centroid EARNS seats from the input it receives, ceilinged
     gg = Geometry(np.eye(10, 32).astype(np.float32), np.full(10, 0.5, np.float32), {"gate": "t"})

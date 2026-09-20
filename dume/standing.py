@@ -130,6 +130,32 @@ class Standing:
         out[mask] = 0.5 if hi - lo < 1e-12 else (v[mask] - lo) / (hi - lo)
         return out
 
+    def _overall(self, M: np.ndarray, d: np.ndarray, mask: np.ndarray) -> np.ndarray:
+        """Domain-weighted overall rate, with an unmeasured cluster imputed from
+        the POOL rather than from zero.
+
+        This was `M @ d`, a dot product over all C clusters in which a cell the
+        expert had never been tried in contributed exactly 0.0. 202 of the 222
+        measured cells in the live state are negative, so every gap was a free
+        win: measured on that state, pearson(overall, clusters measured) =
+        -0.283, p=0.0044. The metric paid for ignorance — and it is the metric
+        that elects the general class, whose ten members had 4-9 observations
+        each.
+
+        Renormalising over the measured clusters instead would fix that and
+        break something load-bearing: it makes "good in one small domain"
+        identical to "good in one big domain", and weighting by domain size is
+        exactly what `general` MEANS here. So the gap is filled with what the
+        POOL does in that cluster — the best available estimate of an unknown
+        cell — which is neutral by construction, while every cluster keeps its
+        domain weight."""
+        mask = np.asarray(mask, dtype=bool)
+        col_n = mask.sum(0)
+        col_mean = np.divide((M * mask).sum(0), col_n, where=col_n > 0,
+                             out=np.zeros(self.C, dtype=np.float64))
+        filled = np.where(mask, M, col_mean[None, :])
+        return filled @ d
+
     def rank(self, domain: np.ndarray) -> Dict[int, float]:
         """r[e] = sum_c D[c] * S[e,c] over the clusters where e has run. One
         number per expert, comparable across the whole pool: good in a big
@@ -140,23 +166,26 @@ class Standing:
         d = self._domain(domain)
         seen = self.n > 0
         div = np.maximum(self.sn, 1e-9)
-        cor = np.divide(self.sc, div, where=seen, out=np.zeros_like(self.sc)) @ d
-        hal = np.divide(self.sh, div, where=seen, out=np.zeros_like(self.sh)) @ d
+        cor = self._overall(np.divide(self.sc, div, where=seen, out=np.zeros_like(self.sc)), d, seen)
+        hal = self._overall(np.divide(self.sh, div, where=seen, out=np.zeros_like(self.sh)), d, seen)
         tps = self.throughput()
         m = seen.any(axis=1)
-        # normalised weighted sum (p4). Hallucination enters NEGATED — it is the
-        # only one of the three where more is worse. Equal weights: Aman named the
-        # three terms, not their coefficients, and inventing a split would be a
-        # tuned constant closing an adaptive loop.
-        # correctness and hallucination share ONE normaliser: they are the same
-        # quantity in the same units, and scaling them apart would invent an
-        # asymmetry the data never showed. Throughput is unrelated, so it gets
-        # its own. Weights are applied AFTER, where W_HALLUC can do its work.
-        scale = max(float(np.abs(cor[m]).max()) if m.any() else 0.0,
-                    float(np.abs(hal[m]).max()) if m.any() else 0.0, 1e-12)
-        grad = (W_CORRECT * cor - W_HALLUC * hal) / scale
+        # THREE SEPARATE TERMS (Aman, 2026-09-20: "ranking rewards non
+        # hallucination, most processing in less time and efficiency").
+        #
+        #   efficiency       unit(cor)      nats the expert SAVED per token
+        #   non-hallucination 1 - unit(hal) nats it COST, rewarded for being low
+        #   processing/time  unit(tps)      tokens per second
+        #
+        # Correctness and hallucination used to share one normaliser and enter
+        # as (cor - hal), so at W_HALLUC = 1.0 the two terms cancelled
+        # algebraically and the "reward non-hallucination" half of the equation
+        # did nothing. Each term now carries its own min-max, so every weight is
+        # live at 1.0 and W_HALLUC > 1 makes volatility cost more rather than
+        # being the only way it costs anything at all.
         wsum = W_CORRECT + W_HALLUC + W_TIME
-        score = ((W_CORRECT + W_HALLUC) * self._unit(grad, m)
+        score = (W_CORRECT * self._unit(cor, m)
+                 + W_HALLUC * (1.0 - self._unit(hal, m))
                  + W_TIME * self._unit(tps, m)) / wsum
         return {int(e): float(score[e]) for e in range(self.E) if m[e]}
 
@@ -214,16 +243,22 @@ class Standing:
         return bool((self.n[eid] >= MIN_MOVE_OBS).any())
 
     def settle_generals(self, domain=None) -> List[int]:
-        """Elect the general class and LOCK it. Called once, when the curriculum
-        leaves TEST — every expert has been swept the same number of times, so
-        this is the one moment the whole pool is comparable on equal evidence.
-        After this they are kept and trained, never compared again."""
+        """Elect the general class for the first time, when the curriculum
+        leaves TEST — the one moment the whole pool has been swept equally and
+        is comparable on equal evidence.
+
+        It is NOT a lock (Aman, 2026-09-20: "generals aren't unreachable elites,
+        they are just centroids with an unchangeable space; if someone performs
+        better it can replace it"). The SPACE is fixed at GENERAL_EXPERTS; the
+        membership is re-decided by migrate() on every pass, so an expert that
+        out-performs an incumbent takes its seat and the incumbent falls back to
+        a centroid. Locking it froze ten experts that had 4-9 observations each
+        and then starved them of every further seat."""
         if self.elite:
             return sorted(self.elite)
         d = self._domain(domain)
-        rate = self.rates()
         order = sorted((e for e in range(self.E) if self.rankable(e)),
-                       key=lambda e: -float(rate[e] @ d))
+                       key=lambda e: -float(self._overall(self.rates(), d, self.n >= MIN_MOVE_OBS)[e]))
         self.elite = set(order[: C.GENERAL_EXPERTS])
         return sorted(self.elite)
 
@@ -234,13 +269,19 @@ class Standing:
     def migrate(self, chains=None, cap=None, domain=None) -> List[Tuple[int, int, int]]:
         """Rank and fill. The only writer of membership.
 
-        Rank every measured expert by overall rate (domain-weighted, the same
-        number alloc ranks by). The top GENERAL_EXPERTS stay GENERAL. The rest,
-        best first, take a seat in whichever centroid their own row favours that
-        still has room; no room anywhere -> GENERAL.
+        Rank every measured expert by overall rate (domain-weighted over the
+        clusters it has actually been measured in). The top GENERAL_EXPERTS are
+        the general class. The rest, best first, take a seat in whichever
+        centroid their own row favours that still has room; no room anywhere ->
+        GENERAL by residue.
 
-        Once settle_generals() has run, the elite is excluded outright: it is
-        neither ranked nor placed, and it cannot lose its class to a newcomer.
+        The general class is re-decided HERE, every pass. It is a space of fixed
+        size, not a set of fixed members: a newcomer that out-ranks an incumbent
+        takes its place and the incumbent drops to a centroid seat. The previous
+        version excluded a settled elite from `order` entirely, so it could
+        neither be displaced nor re-seated, and since _centroid_batch draws only
+        from members() those ten experts then took zero of 3550 observations in
+        1566 batches.
 
         The per-centroid cap is anti-dominance AND growth: a centroid holds only
         the seats it has EARNED (geometry.capacity(), floor(sqrt(input seen)),
@@ -249,13 +290,13 @@ class Standing:
                 else [int(x) for x in np.asarray(cap).reshape(-1)[: self.C]])
         d = self._domain(domain)
         rate = self.rates()
-        measured = [e for e in range(self.E)
-                    if self.rankable(e) and e not in self.elite]
-        order = sorted(measured, key=lambda e: -float(rate[e] @ d))
-        # before the class is locked the skim is PROVISIONAL: the current best
-        # stand aside so the seats go to the rest. After settle_generals() the
-        # elite is out of `order` entirely and nothing skims.
-        if not self.elite:
+        overall = self._overall(rate, d, self.n >= MIN_MOVE_OBS)
+        order = sorted((e for e in range(self.E) if self.rankable(e)),
+                       key=lambda e: -float(overall[e]))
+        # the top of the order IS the general class, re-decided here every pass.
+        # They stand aside from the fill, so the centroid seats go to the rest.
+        if order:
+            self.elite = set(order[: C.GENERAL_EXPERTS])
             order = order[C.GENERAL_EXPERTS:]
         want: Dict[int, int] = {e: GENERAL for e in range(self.E)}
         free = list(caps)

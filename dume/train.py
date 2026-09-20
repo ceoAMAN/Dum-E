@@ -430,6 +430,15 @@ class System:
         if not peers:
             return None
         best = max(peers, key=lambda x: sc.deltas[x.eid])
+        # The teacher must have HELPED, not merely have hurt less. d is measured
+        # against y, which came off disk, so "everything in training is checked
+        # against real data" (Aman, 2026-09-20) applies here too: a negative
+        # delta is real data saying that note raised Central's CE, and pulling a
+        # dormant expert toward it at a full +1.0 advantage teaches the damage.
+        # The old guard was relative only, and 359 of the 470 imitation steps in
+        # the last run (76.4%) had a teacher whose own delta was negative.
+        if sc.deltas[best.eid] <= 0.0:
+            return None                       # real data says this note hurt
         if sc.deltas[best.eid] <= sc.deltas.get(trial.eid, -1e9):
             return None                       # nothing superior to imitate
         return self.pool.update(trial.eid, self.pool.prompt(spans[trial.eid], s.prompt),

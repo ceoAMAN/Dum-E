@@ -88,7 +88,14 @@ class Curriculum:
 
     # ── specialize: each centroid serves its own members ────────────────────
     def _centroid_batch(self, cid: int, k: int, standing) -> List[int]:
-        members = standing.members(cid)
+        # The general class rides EVERY centroid's rota. A general is an expert
+        # that is good everywhere and at home nowhere, so the input it should be
+        # measured on is all of them — and it has to be measured, or it can
+        # never be compared and never replaced (Aman, 2026-09-20: "if someone
+        # performs better it can replace it"). Drawing only from members() made
+        # the class structurally unreachable: the ten generals took 0 of 3550
+        # observations across 1566 batches while 36 seated experts took 3377.
+        members = standing.members(cid) + standing.generals()
         if not members:                       # no home here yet: fall back to the sweep
             return self._sweep_batch(k)
         at = self.rota_at.get(cid, 0)

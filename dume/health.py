@@ -135,7 +135,15 @@ class Health:
         if migration is not None:
             acc = migration.pool.accuracy()
             self.put(migration_chain_acc=(acc if acc is not None else -1.0))
-        self.alarms.extend(alarms)
+        # THIS TICK's alarms, not every alarm ever raised. The list used to be
+        # append-only while print() emitted its last five unconditionally, so a
+        # condition that cleared kept printing forever: 170 of the 399 ALARM U
+        # lines in the last run were printed at a health record whose own
+        # update_frac was already >= 0.5. A record whose job is to say whether a
+        # mechanism is doing anything must not report history in the present
+        # tense. NONFINITE entries raised by put() since the last print survive,
+        # because those name a value that really was recorded.
+        self.alarms = [a for a in self.alarms if a.startswith("NONFINITE")] + alarms
         if self.batch % C.HEALTH_EVERY == 0:
             self.print()
         return alarms
