@@ -337,14 +337,13 @@ class System:
             print(f"[alloc] {self.alloc.state()}")
         self._breathe(plan)
         self.clock += len(plan.ids)
+        # the device's side of the k tug of war, recorded BEFORE the put so a
+        # run can show whether heat ever got a vote at all
+        rec["thermal"] = float(thermal_state())
+        rec["k_thermal"] = float(self.sched.k_thermal)
         self.health.put(**rec, clock=self.clock, active_mb=active_mb())
         self.health.tick(self.standing.total_n(), self.rel, self.size, self.mig)
         d = " ".join(f"e{sel.eid}{'*' if sel.trial else ''}:{sc.deltas.get(sel.eid, float('nan')):+.3f}" for sel in sels)
-        rec["k_alloc"] = float(self.alloc.k(len(plan.ids)))
-        # the device's side of the k tug of war, recorded so a run can show
-        # whether heat ever got a vote at all
-        rec["thermal"] = float(thermal_state())
-        rec["k_thermal"] = float(self.sched.k_thermal)
         losses = " ".join(f"{k}={rec[k]:.3f}" for k in ("gate_loss", "expert_loss", "central_loss") if k in rec)
         print(f"[b{self.batch}] {s.source} T{tl} k={len(sels)}/{plan.k_wanted} home={plan.home} present={plan.present} "
               f"M={len(y)} rho={sc.rho:.2f} {'HELDOUT' if heldout else ('ADMIT' if sc.admitted else 'REFUSE')} {d} {losses}")
