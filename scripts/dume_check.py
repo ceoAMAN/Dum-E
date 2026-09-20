@@ -267,6 +267,26 @@ def main() -> int:
     r.observe(np.full(200, 0.5), np.zeros(200, dtype=int))
     r.observe(np.full(200, 3.0), np.ones(200, dtype=int))
     assert r.R(0) > r.R(1)
+    # R TRACKS CURRENT PERFORMANCE. Reliability is applied at deployment but it
+    # moves in training, because that is where the model moves. A lifetime mean
+    # could not: it stiffens as 1/N. After a long bad history, a window of good
+    # observations must win.
+    rt = Reliability(2)
+    rt.observe(np.full(20000, 3.0), np.zeros(20000, dtype=int))
+    stale = rt.R(0)
+    W = C.RELIABILITY_MIN_OBS
+    rt.observe(np.full(4 * W, 0.1), np.zeros(4 * W, dtype=int))
+    assert rt.R(0) > 0.80, f"four windows of good data did not overcome 20k bad ({rt.R(0)})"
+    rt.observe(np.full(4 * W, 0.1), np.zeros(4 * W, dtype=int))
+    assert abs(rt.R(0) - np.exp(-0.1)) < 0.01, (stale, rt.R(0), np.exp(-0.1))
+    # ... and 20k observations of history do not hold it back
+    assert rt.N[0] == 20000 + 8 * W, "support counter must not decay"
+    # states pickled with a cumulative S migrate to the EWMA at the SAME R
+    old = Reliability(2)
+    old.__dict__.clear()
+    old.__setstate__({"N": np.array([400.0, 100.0]), "S": np.array([200.0, 50.0])})
+    assert not hasattr(old, "S") and abs(old.R(0) - np.exp(-0.5)) < 1e-9, "S -> M migration changed R"
+
     # rho is the COMPOSITION's score: percentage in the constituent x that
     # centroid's measured mean. Not a per-token mean over the target, and not
     # per-cluster: a centroid absent from the composition has w=0 and cannot

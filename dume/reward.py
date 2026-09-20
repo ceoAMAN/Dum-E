@@ -46,11 +46,37 @@ def is_heldout(sample_key: str) -> bool:
 
 class Reliability:
     """Per-centroid mean baseline CE, as a likelihood in (0, 1]. Cold clusters
-    pool to the global estimate (coldness = n_observations, never a flag)."""
+    pool to the global estimate (coldness = n_observations, never a flag).
+
+    The mean is EXPONENTIAL, not lifetime. Reliability is applied at deployment,
+    but it MOVES in training, because that is where the model moves: "when we
+    training the model take new gradients, new performance, so they change, so
+    it changes reliability score also" (Aman, 2026-09-20). A cumulative sum
+    cannot do that — it stiffens as 1/N, and it had already stiffened past the
+    point of usefulness. Measured on the b3425 state, one 128-token batch moved
+    R by +0.0100 on c0 (N=1991) and -0.0001 on c1 (N=25549); after another 500k
+    tokens c1 would move 2e-5. Central would train and its score would sit
+    still, which is the opposite of what the score is for.
+
+    The window is RELIABILITY_MIN_OBS, the count this file already declares to
+    be the minimum support for a meaningful estimate — the shortest window the
+    code is willing to call measured, so the score tracks as fast as it can
+    while still being an estimate. N stays an undecayed counter so the warm test
+    and the cold pooling are untouched by the change."""
 
     def __init__(self, n_clusters: int):
-        self.N = np.zeros(int(n_clusters), dtype=np.float64)
-        self.S = np.zeros(int(n_clusters), dtype=np.float64)
+        self.N = np.zeros(int(n_clusters), dtype=np.float64)   # support; never decays
+        self.M = np.zeros(int(n_clusters), dtype=np.float64)   # EWMA of baseline CE
+
+    def __setstate__(self, d: Dict) -> None:
+        """States pickled before the EWMA carry S, a cumulative sum. Its
+        lifetime mean S/N is the best available seed, so migrate rather than
+        discard 57k observations — the window re-converges on current
+        performance within RELIABILITY_MIN_OBS observations per centroid."""
+        if "M" not in d and "S" in d:
+            d = {**d, "M": np.asarray(d["S"], dtype=np.float64) / np.maximum(d["N"], 1.0)}
+            d.pop("S", None)
+        self.__dict__.update(d)
 
     @property
     def C(self) -> int:
@@ -58,9 +84,9 @@ class Reliability:
 
     def R(self, c: int) -> float:
         if self.N[c] >= C.RELIABILITY_MIN_OBS:
-            return float(np.exp(-self.S[c] / self.N[c]))
-        tot = self.N.sum()
-        return float(np.exp(-self.S.sum() / tot)) if tot > 0 else 1.0
+            return float(np.exp(-self.M[c]))
+        tot = float(self.N.sum())
+        return float(np.exp(-float(self.N @ self.M) / tot)) if tot > 0 else 1.0
 
     def vector(self) -> np.ndarray:
         return np.array([self.R(c) for c in range(self.C)], dtype=np.float32)
@@ -68,11 +94,14 @@ class Reliability:
     def observe(self, b: np.ndarray, assign: np.ndarray) -> None:
         if len(b) != len(assign):
             raise RuntimeError(f"reliability: {len(b)} baseline tokens vs {len(assign)} token types")
+        a = 1.0 / float(C.RELIABILITY_MIN_OBS)
         for t in range(len(b)):
             c = int(assign[t])
             if 0 <= c < self.C:
                 self.N[c] += 1.0
-                self.S[c] += float(b[t])
+                # the first observation IS the estimate; starting the EWMA from
+                # zero would read a cold centroid as perfect for a full window
+                self.M[c] = float(b[t]) if self.N[c] == 1.0 else (1.0 - a) * self.M[c] + a * float(b[t])
 
     def flatness(self) -> Optional[float]:
         warm = [self.R(c) for c in range(self.C) if self.N[c] >= C.RELIABILITY_MIN_OBS]
