@@ -11,7 +11,7 @@ of an abstain guard, self-scoring accuracy.
 from __future__ import annotations
 
 from collections import deque
-from typing import List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 
@@ -144,3 +144,59 @@ class SizeChains:
 
     def regimes(self) -> List[str]:
         return [LOAD_REGIMES[s] for s in self.state]
+
+
+class ThermalRegulator:
+    """The device's thermal pressure, measured against where it NORMALLY sits.
+
+    The raw level is REACTIVE (Aman, 2026-09-20: "don't you feel like it is
+    reactive to all changes"). It answers a reading identically whether the
+    machine has been sitting there all day or just jumped to it, so a box that
+    idles warm is permanently throttled and one that spikes for a single batch
+    is treated like one that has been climbing for an hour. Two measured
+    components fix that:
+
+      BASELINE - "mean temp, the temp at which the system normally works
+      happily". The running mean of every level this run has seen. Pressure is
+      only what sits ABOVE it, so the regulator costs nothing at the machine's
+      own normal operating point, whatever that turns out to be.
+
+      VOLATILITY - "the mean of all change in temp per run, to measure how
+      radically it is changing". The running mean of |level - previous level|.
+      A machine whose temperature is swinging needs a firmer hand than one
+      drifting gently to the same place, so it multiplies the response.
+
+        pressure = max(0, level - baseline) * (1 + volatility)
+
+    Both are means over the run, not constants, and both start at zero, so a
+    cold regulator applies nothing and has to EARN the right to throttle. This
+    is a lifetime mean rather than a window on purpose: unlike reliability,
+    whose subject moves as the model trains, the point where a machine runs
+    happily is a property of the machine."""
+
+    def __init__(self) -> None:
+        self.n = 0.0
+        self.baseline = 0.0       # mean level
+        self.volatility = 0.0     # mean |change| between consecutive reads
+        self.last: Optional[float] = None
+        self.peak = 0.0
+
+    def observe(self, level: float) -> None:
+        level = float(level)
+        if self.last is not None:
+            d = abs(level - self.last)
+            self.volatility += (d - self.volatility) / max(self.n, 1.0)
+        self.n += 1.0
+        self.baseline += (level - self.baseline) / self.n
+        self.last = level
+        self.peak = max(self.peak, level)
+
+    def pressure(self, level: Optional[float] = None) -> float:
+        """How hard to throttle, in the units k_thermal takes its root in. Zero
+        at or below the baseline: normal operation is free."""
+        cur = float(self.last if level is None else level)
+        return max(0.0, cur - self.baseline) * (1.0 + self.volatility)
+
+    def state(self) -> Dict[str, float]:
+        return {"n": self.n, "baseline": self.baseline, "volatility": self.volatility,
+                "peak": self.peak, "last": float(self.last or 0.0)}

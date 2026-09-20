@@ -443,7 +443,29 @@ def main() -> int:
     # pulls down, and its input is real: NSProcessInfo's thermal state, not a
     # proxy and not a constant.
     from dume.models import thermal_state as _ts
+    from dume.chain import ThermalRegulator
     assert _ts() in (0, 1, 2, 3), f"thermal state out of range: {_ts()}"
+    # THE REGULATOR IS NOT REACTIVE. It measures against where this machine
+    # NORMALLY sits, and how radically it has been moving.
+    steady = ThermalRegulator()
+    for _ in range(50):
+        steady.observe(1)                      # warm, but warm is its normal
+    assert steady.baseline == 1.0 and steady.volatility == 0.0
+    assert steady.pressure() == 0.0, "a machine that always runs warm was throttled for it"
+    climb = ThermalRegulator()
+    for _ in range(40):
+        climb.observe(0)
+    climb.observe(2)
+    assert climb.pressure() > 0.0, "a real climb above the baseline applied nothing"
+    swing = ThermalRegulator()
+    for i in range(40):
+        swing.observe(i % 3)                   # same mean level, far more movement
+    swing.observe(2)
+    assert swing.volatility > climb.volatility, "volatility did not register"
+    assert swing.pressure() > climb.pressure(), \
+        "a swinging machine was not regulated harder than a calm one at the same level"
+    assert ThermalRegulator().pressure(0.0) == 0.0, "a cold regulator invented pressure"
+
     # THE SYSTEM'S SIDE: small input -> max k and less time; longer input ->
     # fewer experts, because past one pass another expert buys no coverage and
     # costs another fixed load-in.

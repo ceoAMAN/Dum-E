@@ -39,6 +39,7 @@ class Scheduler:
     def __init__(self, pool: ExpertPool, expert_peak_mb, central_mb: float, gate_mb: float,
                  update_slope_mb: float = 0.0, slot_mb: float = 0.0):
         self.pool = pool
+        self.thermal = None      # a ThermalRegulator, set by System._wire()
         R = total_ram_mb()
         ws = working_set_mb()
         # Aman's law:  space for k  =  R - sqrt(R) - central - gate
@@ -83,7 +84,7 @@ class Scheduler:
     def k_thermal(self) -> float:
         """How many experts the DEVICE is willing to run right now.
 
-        Each level of thermal pressure takes another root of the RAM bound —
+        Each unit of thermal PRESSURE takes another root of the RAM bound —
         the same sqrt bracket k_tier, GENERAL_EXPERTS and capacity() are built
         from, so no new constant enters. On k_max=4 that is 4.00 nominal, 2.00
         fair, 1.59 serious, 1.41 critical: at nominal the device asks for
@@ -92,8 +93,18 @@ class Scheduler:
 
         The levels are ordinal — macOS publishes no degrees — so a geometric
         backoff is the only honest shape; a linear map would need a scale
-        nobody measured."""
-        return float(self.k_max) ** (1.0 / (1.0 + thermal_state()))
+        nobody measured.
+
+        Pressure is the raw level measured against where this machine NORMALLY
+        sits, scaled by how radically it has been moving — see
+        ThermalRegulator. At the baseline the pressure is 0 and the bound is
+        exactly the physical one, so a machine that simply runs warm is never
+        throttled for it."""
+        lvl = thermal_state()
+        if self.thermal is not None:
+            self.thermal.observe(lvl)
+            return float(self.k_max) ** (1.0 / (1.0 + self.thermal.pressure(lvl)))
+        return float(self.k_max) ** (1.0 / (1.0 + lvl))
 
     def clamp(self, k_wanted: int) -> int:
         return max(1, min(int(k_wanted), self.k_max))

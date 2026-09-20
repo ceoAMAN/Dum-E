@@ -20,7 +20,7 @@ import numpy as np
 from . import config as C
 from . import data, state
 from .alloc import AllocLaw
-from .chain import MigrationChains, SizeChains
+from .chain import MigrationChains, SizeChains, ThermalRegulator
 from .curriculum import Curriculum
 from .geometry import Geometry
 from .health import Health
@@ -66,6 +66,7 @@ class System:
         self.alloc: Optional[AllocLaw] = None
         self.band: Optional[CentralBand] = None
         self.curric: Optional[Curriculum] = None
+        self.therm: Optional[ThermalRegulator] = None
         self.sched: Optional[Scheduler] = None
         self.router: Optional[Router] = None
         self.health = Health()
@@ -119,6 +120,7 @@ class System:
             self.size = _restored(blob.get("size"), SizeChains, self.geo.C)
             self.alloc = _restored(blob.get("alloc"), AllocLaw)
             self.band = _restored(blob.get("band"), CentralBand)
+            self.therm = _restored(blob.get("thermal"), ThermalRegulator)
             if blob.get("curriculum"):
                 self.curric = Curriculum.from_dict(blob["curriculum"])
             print(f"[state] restored: {self.geo.C} clusters, standing n={self.standing.total_n():.0f}, "
@@ -137,6 +139,9 @@ class System:
             self.band = CentralBand()
         if self.curric is None:
             self.curric = Curriculum()
+        if self.therm is None:
+            self.therm = ThermalRegulator()
+        self.sched.thermal = self.therm
         self.router = Router(self.gate, self.geo, self.standing, self.sched, self.alloc)
 
     def save(self) -> None:
@@ -145,6 +150,7 @@ class System:
         state.save({"geometry": self.geo.to_dict(), "standing": self.standing.to_dict(),
                     "reliability": self.rel, "migration": self.mig, "size": self.size,
                     "alloc": self.alloc, "band": self.band, "curriculum": self.curric.to_dict(),
+                    "thermal": self.therm,
                     "clock": self.clock, "batch": self.batch, "consumed": self.consumed})
         self.gate.save()
         self.pool.save_all()
@@ -169,6 +175,7 @@ class System:
         self.geo = Geometry.form(X, C.MAX_CLUSTERS, {"gate": self.gate.weight_hash(),
                                                      "extractor": "extract_pair.v1"})
         self.standing = self.rel = self.mig = self.size = self.alloc = self.band = None
+        self.therm = None
         self.curric = None                   # a new geometry retires the schedule too
         self.batch, self.clock = 0, 0        # a new geometry has no history; `consumed` stays
         self.health = Health()
@@ -339,8 +346,12 @@ class System:
         self.clock += len(plan.ids)
         # the device's side of the k tug of war, recorded BEFORE the put so a
         # run can show whether heat ever got a vote at all
-        rec["thermal"] = float(thermal_state())
-        rec["k_thermal"] = float(self.sched.k_thermal)
+        rec["k_thermal"] = float(self.sched.k_thermal)   # observes the level itself
+        ts = self.therm.state()
+        rec["thermal"] = ts["last"]
+        rec["thermal_base"] = ts["baseline"]
+        rec["thermal_vol"] = ts["volatility"]
+        rec["thermal_peak"] = ts["peak"]
         self.health.put(**rec, clock=self.clock, active_mb=active_mb())
         self.health.tick(self.standing.total_n(), self.rel, self.size, self.mig)
         d = " ".join(f"e{sel.eid}{'*' if sel.trial else ''}:{sc.deltas.get(sel.eid, float('nan')):+.3f}" for sel in sels)
