@@ -444,6 +444,22 @@ def main() -> int:
     # proxy and not a constant.
     from dume.models import thermal_state as _ts
     assert _ts() in (0, 1, 2, 3), f"thermal state out of range: {_ts()}"
+    # THE SYSTEM'S SIDE: small input -> max k and less time; longer input ->
+    # fewer experts, because past one pass another expert buys no coverage and
+    # costs another fixed load-in.
+    SM = 446
+    short = [law.k_effective(T, 16, 16.0, SM) for T in (16, 49, 128, 446)]
+    long_ = [law.k_effective(T, 16, 16.0, SM) for T in (1024, 2335, 4096)]
+    assert all(k == 16 for k in short), f"a small input did not get max k: {short}"
+    assert long_ == sorted(long_, reverse=True), f"k did not fall with length: {long_}"
+    assert long_[-1] < short[-1], f"a long input did not reduce k: {short[-1]} -> {long_[-1]}"
+    # ... and that is the OPPOSITE of what the allocation law's own k(T) asks
+    # for, which rises with T. k(T) is still reported as k_wanted; it no longer
+    # drives k.
+    assert law.k(4096) > law.k(16), "k_wanted should still rise with T"
+    # cooling raises k back: the relation runs both ways
+    warm = [law.k_effective(128, 16, 16.0 ** (1.0 / (1.0 + st)), SM) for st in (3, 2, 1, 0)]
+    assert warm == sorted(warm), f"cooling did not raise k: {warm}"
     kt = [16.0 ** (1.0 / (1.0 + st)) for st in range(4)]      # k_max=16
     ks = [law.k_effective(512, 16, t) for t in kt]
     assert ks == sorted(ks, reverse=True), f"heat did not lower k: {ks}"

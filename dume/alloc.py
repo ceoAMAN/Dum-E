@@ -328,72 +328,61 @@ class AllocLaw:
             return None
         return float(np.mean([s for _, s in self.lat]))
 
-    def k_effective(self, T: int, k_ram: int, k_thermal: Optional[float] = None) -> int:
-        """Aman's general equation (2026-09-10), made dimensional.
+    def k_effective(self, T: int, k_ram: int, k_thermal: Optional[float] = None,
+                    span_max: Optional[int] = None) -> int:
+        """The tug of war over k. Both sides start at what the machine can hold
+        and pull down for their own reason; the harmonic mean negotiates, which
+        is a soft minimum where the tightest constraint dominates smoothly
+        instead of the hard `min` the scheduler uses.
 
-        His form was `1/experts + 1/estimated_time + tokens_per_second`. The
-        three terms as written are a count, a per-second and a rate, so the sum
-        is not a number of experts. What survives is the SHAPE, which is right:
-        a soft minimum where the tightest constraint dominates smoothly, instead
-        of the hard `min` the scheduler uses. Each constraint is converted into
-        a number of experts and they are combined by HARMONIC MEAN — n/(sum 1/x),
-        not 1/(sum 1/x). The latter returns 2 when both say 4; the mean returns 4
-        when they agree and collapses toward the smaller when they do not.
+        THE SYSTEM SIDE — input length (Aman, 2026-09-20): "if small input the
+        system, if possible, uses max k and less time; when it is longer the
+        system reduces k."
 
-            k_gate = T / ALLOC(T)          what apex-nadir asks for
-            k_ram  = the scheduler's bound (still a HARD clamp afterwards: a soft
-                                           blend can land above it, and that is
-                                           an OOM, not a preference)
+            k_len = k_ram * min(1, span_max / T)
 
-        THERE IS NO k_time TERM, and that is deliberate. It used to be
-        tau / (a + b*alloc(T)), where tau = mean_pass_seconds() is the mean of
-        the latency bank and (a, b) is the line fitted to that SAME bank — one
-        curve divided by itself at two points, with no deadline, budget or
-        latency target entering anywhere. Measured on the live fit it sat at
-        1.08-1.14 across T = 64..2048 and did not move when the machine changed
-        speed, because tau and c(t) scale together and cancel. A harmonic mean is
-        dominated by its smallest term, so that ~1 alone set k: across all 1566
-        batches of the last run k was 2 while k_gate asked for 11 to 114, and
-        3/(1/k_gate + 1 + 1/k_ram) is below 3 for EVERY k_gate and k_ram that
-        exist. A term carrying no information was outvoting both terms that do.
+        While the whole input fits in ONE pass there is nothing to divide, so
+        every expert the machine can hold may look at all of it and the answer
+        comes back in the fewest sequential passes. Past that each expert is
+        already reading a full pass's worth, so another expert buys no coverage
+        and costs another fixed a = 0.48 s of load-in. span_max is the measured
+        memory bound on a single pass, not a chosen number.
 
-        A real time term needs a real budget — a deadline, or Central's own
-        measured pass time to spend against. Nothing in the system measures one
-        yet, so the honest form is the two constraints that are grounded and
-        independent. Put the third back when there is a clock to answer to.
+        This REPLACES k(T) = T/ALLOC(T) as the driver. That quantity runs the
+        other way — 4 experts at T=16 rising to 123 at T=2335 — so it asked for
+        the most experts exactly where each one is most expensive. It is still
+        computed and still reported as k_wanted, because it is the allocation
+        law's own answer and the paper needs it, but it no longer sets k.
 
-        THE THIRD TERM IS THE DEVICE (Aman, 2026-09-20): "it is a constant tug
-        of war — the device wants k less so it doesn't get hot, its input is
-        temperature; the system wants to do work fastest so it wants k high, as
-        high k adds more tokens per second and processing". k_gate is the system
-        pulling up, k_thermal is the device pulling down, and the harmonic mean
-        is the negotiation. k_thermal comes from NSProcessInfo's thermal state
-        via Scheduler.k_thermal, so the device's side has a real measured input
-        rather than an assumed one.
+        THE DEVICE SIDE — heat (same conversation): "the device wants k less so
+        it doesn't get hot, its input is temperature ... as temp increases k
+        decreases, as temp decreases k increases." k_thermal comes from
+        NSProcessInfo via Scheduler.k_thermal, so this side has a real measured
+        input rather than an assumed one.
 
-        It is a bound as well as a blend term, exactly like k_ram: a soft mean
-        over three terms can still land above what the device is asking for, and
-        at `serious` the OS is already throttling, so running more experts makes
+        Heat does NOT enter as a third voice: heat and RAM are the same axis —
+        both say what this machine will do right now — so thermal pressure
+        modulates the physical bound. That makes a nominal device exactly free,
+        and installing the sensor cannot move k until the machine is warm.
+
+        THE DEVICE ALWAYS HAS A VETO. k_ram is a hard clamp afterwards because a
+        soft blend can land above it and that is an OOM, not a preference; at
+        `serious` the OS is already throttling, so running more experts makes
         the thing it is complaining about worse.
 
-        Until the allocation law is fitted this degrades to k_gate, which is the
-        §7 identity fallback — a refusal, not a guess.
-
-        The device does NOT enter as a third voice. Heat and RAM are the same
-        axis — both say how much this machine will do right now — so thermal
-        pressure MODULATES the physical bound rather than adding a term. That
-        also makes a nominal device exactly free: k_thermal == k_ram at nominal,
-        so turning the sensor on cannot move k until the machine is actually
-        warm. A third harmonic term would have shifted every k the moment the
-        sensor was installed, which is a silent behaviour change, not a
-        measurement.
-        """
-        k_gate = max(1.0, float(self.k(T)))
-        # what the machine will allow RIGHT NOW: the physical bound, tightened
-        # by whatever the device is currently asking for
-        k_dev = float(k_ram) if k_thermal is None else min(float(k_ram), max(1.0, float(k_thermal)))
-        k_dev = max(1.0, k_dev)
-        eff = 2.0 / (1.0 / k_gate + 1.0 / k_dev)
+        There is no k_time term. It used to be tau / (a + b*alloc(T)), with tau
+        the mean of the latency bank and (a, b) the line fitted to that SAME
+        bank — one curve divided by itself, measured at 1.08-1.14 across
+        T = 64..2048 and unmoved by machine speed. It pinned k at 2 for every
+        one of 1566 batches. Length and heat are what a time term was reaching
+        for, and both of them have real inputs."""
+        cap = max(1.0, float(k_ram))
+        # system: max k until the input outgrows a single pass, then fewer
+        k_len = cap if not span_max else cap * min(1.0, float(span_max) / max(1.0, float(T)))
+        # device: the physical bound, tightened by whatever heat is asking for
+        k_dev = cap if k_thermal is None else min(cap, max(1.0, float(k_thermal)))
+        k_len, k_dev = max(1.0, k_len), max(1.0, k_dev)
+        eff = 2.0 / (1.0 / k_len + 1.0 / k_dev)
         return max(1, min(int(round(eff)), max(1, int(round(k_dev)))))
 
     def state(self) -> Dict[str, object]:

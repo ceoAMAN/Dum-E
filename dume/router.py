@@ -92,7 +92,8 @@ class Router:
         # bound (Aman's general equation); sched.clamp stays because the RAM
         # bound is physical and a blend must never be allowed above it.
         k = self.sched.clamp(self.alloc.k_effective(T, self.sched.k_max,
-                                                    self.sched.k_thermal))
+                                                    self.sched.k_thermal,
+                                                    self.sched.span_max))
         picks: List[tuple] = []           # (eid, cid, trial)
         if curriculum is not None:
             experts = curriculum.experts(k, present[0], self.standing,
