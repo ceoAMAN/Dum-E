@@ -26,7 +26,7 @@ from .geometry import Geometry
 from .health import Health
 from .models import (Central, ExpertPool, Gate, active_mb, measure_expert_peak_mb,
                      measure_update_slope_mb, measure_slot_mb, reset_peak)
-from .reward import CentralBand, Reliability, is_heldout, score, score_one
+from .reward import CentralBand, Reliability, is_heldout, rho_of, score, score_one
 from .router import Router
 from .scheduler import Scheduler
 from .standing import Standing
@@ -257,11 +257,11 @@ class System:
             texts[sel.eid], _ = self.pool.run(sel.eid, span_text, s.prompt, budget=budget)
             secs[sel.eid] = time.time() - t_run
             emitted[sel.eid] = len(self.pool.tok.encode(texts[sel.eid])) if texts[sel.eid] else 0
-        sc = score(self.central, s.prompt, y, assign_y, texts, self.rel)
+        sc = score(self.central, s.prompt, y, plan.w, texts, self.rel)
         heldout = is_heldout(s.key) and not s.self_referent
         self.health.deltas_seen(sc.deltas, sc.zero_delta, dropped=len(sc.dropped))
         self.health.texts_seen(texts)
-        trust = float(plan.w @ self.rel.vector())
+        trust = rho_of(self.rel, plan.w)     # Central's score on THIS input's composition
         place = AllocLaw.placement(self.standing.rank(self.geo.domain()))
         u_best = max([place.get(sel.eid, 0.5) for sel in sels], default=0.5)
         tl = self.band.decide(self.alloc, len(plan.ids), u_best)
@@ -460,7 +460,7 @@ class System:
             return {"text": self.central.generate(prompt, [], max_tokens), "k": 0, "timeline": "A",
                     "trust": 1.0, "notes": []}
         plan = self.router.plan(prompt, probe=False)     # fitted allocation, padded spans
-        trust = float(plan.w @ self.rel.vector())
+        trust = rho_of(self.rel, plan.w)     # Central's score on THIS input's composition
         place = AllocLaw.placement(self.standing.rank(self.geo.domain()))
         u_best = max([place.get(sel.eid, 0.5) for sel in plan.selections], default=0.5)
         if self.band.decide(self.alloc, len(plan.ids), u_best) == "A":
@@ -484,18 +484,57 @@ class System:
         # not move the territory the training loop is controlling (two writers, one tau)
         #
         # THE RELIABILITY DEDUCTION. Deployment-only, by construction: there is
-        # no y here, so the only thing that can say how far to trust Central on
-        # this composition is the reliability score training MEASURED for it
-        # (paraphrasing Aman, 2026-09-17: the reliability score is a deduction
-        # factor for a specific composition of centroids, and it is for when
-        # there is no real data to measure the output against). `trust` is that
-        # score, composition-
-        # weighted since there are no target tokens to weight per token. High
-        # trust: Central holds the majority section and few notes get in. Low
-        # trust: the experts carry the answer. Training never applies this — it
-        # has y, gradients flow at full strength, and standing does the rest.
-        m = max(1, int(math.ceil(len(notes) * (1.0 - trust)))) if notes else 0
+        # no y here, so the only thing that can say how far to trust either side
+        # is the reliability training MEASURED per centroid (Aman, 2026-09-17:
+        # the reliability score is a deduction factor for a specific composition
+        # of centroids, for when there is no real data to measure the output
+        # against). Training never applies it — it has y, gradients flow at full
+        # strength, and standing does the rest.
+        #
+        # THREE PASSES (Aman, 2026-09-20). Central answers alone; the centroids
+        # produce a synthesis out of the individual expert outputs; Central then
+        # builds one answer out of both. The split between them is not a
+        # constant: each side is scored, and "central's output is leaned towards
+        # more and has heavier weight in synthesis ... when central has better
+        # score".
         notes.sort(key=lambda x: -x[0])
-        use = [t for _, t in notes[:m]]
-        return {"text": self.central.generate(prompt, use, max_tokens), "k": len(notes), "timeline": "B",
-                "trust": trust, "notes": use, "home": plan.home, "w": plan.w.round(3).tolist()}
+        if not notes:
+            return {"text": self.central.generate(prompt, [], max_tokens), "k": 0,
+                    "timeline": "B", "trust": trust, "rho_synth": 0.0, "lean": 1.0,
+                    "notes": [], "home": plan.home, "w": plan.w.round(3).tolist()}
+        own = self.central.generate(prompt, [], max_tokens)          # 1. Central alone
+        synth = "\n".join(t.strip() for _, t in notes if t and t.strip())   # 2. the centroids'
+        # 3. the similarity score and the dot products are measured ON THAT
+        # SYNTHESIS, not on the input: the synthesis is its own point in the
+        # space and lands in its own composition, which is what its reliability
+        # has to be read off. The input's composition scores Central; the
+        # synthesis's composition scores the synthesis.
+        rho_synth, w_synth = 0.0, None
+        if synth:
+            ids = self.gate.encode(synth)[: C.WORKING_PROBE_TOKENS]
+            if ids:
+                w_synth = self.geo.compose(self.gate.hidden(ids))[0]
+                rho_synth = rho_of(self.rel, w_synth)
+        tot = trust + rho_synth
+        lean = float(trust / tot) if tot > 1e-12 else 0.5      # Central's share of the merge
+        # WHICH OUTPUT IS IN CHARGE is the comparison itself (Aman, 2026-09-20:
+        # "the comparison is done against which is more reliability score — if
+        # pool then synthesised output (made from expert parts, not final which
+        # is answer), if central you know it"). The winner leads the merge and
+        # the loser becomes material for it; the deduction, unchanged in shape,
+        # still says how much of the pool gets in when Central is the one
+        # leading. Central emits the final answer either way — the synthesis is
+        # made of expert parts and is never itself the answer.
+        if trust >= rho_synth:
+            lead, label = "central", "Your own draft answer"
+            base = own
+            use = [t for _, t in notes[: max(1, int(math.ceil(len(notes) * (1.0 - lean))))]]
+        else:
+            lead, label = "pool", "The experts' synthesis, which scored higher than your own read"
+            base = synth
+            use = [own]
+        return {"text": self.central.generate(prompt, use, max_tokens, base=base, base_label=label),
+                "k": len(notes), "timeline": "B", "trust": trust, "rho_synth": rho_synth,
+                "lean": lean, "lead": lead, "notes": use, "own": own, "synth": synth,
+                "home": plan.home, "w": plan.w.round(3).tolist(),
+                "w_synth": (w_synth.round(3).tolist() if w_synth is not None else None)}

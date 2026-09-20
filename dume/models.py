@@ -331,13 +331,37 @@ class Central:
         mx.eval(self.model.parameters(), self.opt.state)
         return float(loss.item()), len(y)
 
-    def generate(self, question: str, notes: List[str], max_tokens: int = 256) -> str:
+    def generate(self, question: str, notes: List[str], max_tokens: int = 256,
+                 base: str = "", base_label: str = "Your own draft answer") -> str:
+        """`base` is the output IN CHARGE of this merge; `notes` support it.
+
+        Deployment runs three passes (Aman, 2026-09-20: "central for producing
+        output does first it's own, then centroids synthesised output then uses
+        both of it create one"), and this is the third. Which output leads is
+        decided by reliability, not by rank: "the comparison is done against
+        which is more reliability score — if pool then synthesised output, if
+        central you know it". So `base` is Central's own draft when Central
+        scores higher and the experts' synthesis when the pool does, and
+        `base_label` says which, because a synthesis presented as Central's own
+        draft is exactly the wrong prior.
+
+        The final answer is always emitted here. The synthesis is made from the
+        expert parts and is never itself the answer."""
         from mlx_lm import generate
         content = question
         clean = [n.strip() for n in notes if n and n.strip()]
+        base = base.strip()
+        if base:
+            content += f"\n\n{base_label}:\n" + base
         if clean:
-            content += "\n\nExpert analyses to consider:\n" + "\n".join(f"- {n}" for n in clean)
+            content += "\n\nAlso consider:\n" + "\n".join(f"- {n}" for n in clean)
+        if clean and base:
+            content += ("\n\nWeigh them against each other and give the best final "
+                        "answer, starting from the first.")
+        elif clean:
             content += "\n\nUse the analyses where they help and give the best final answer."
+        elif base:
+            content += "\n\nGive the best final answer."
         tmpl = getattr(self.tok, "apply_chat_template", None)
         prompt = (tmpl([{"role": "user", "content": content}], tokenize=False, add_generation_prompt=True)
                   if tmpl and getattr(self.tok, "chat_template", None) else content)

@@ -95,23 +95,38 @@ class Scored:
     admitted: bool = True
 
 
-def rho_of(reliability: Reliability, assign_y: np.ndarray, M: int) -> float:
-    """Mean reliability over this target's token types — the composition's
-    deduction factor, MEASURED here and applied only at deployment. Refuses a
-    misaligned assignment rather than resampling it (rule 20)."""
-    a = np.asarray(assign_y)
-    if len(a) != M:
-        raise RuntimeError(f"rho: {len(a)} token types for {M} target tokens")
-    return float(np.mean([reliability.R(int(c)) for c in a])) if M else 0.0
+def rho_of(reliability: Reliability, w: np.ndarray) -> float:
+    """Reliability of a COMPOSITION: the percentage each centroid contributes,
+    weighted against that centroid's measured mean (Aman, 2026-09-20: "when we
+    take reliability score per composition we take a weighted mean of vectors
+    and percentage in constituent and the avg mean of centroid").
+
+    It is NOT a per-cluster or per-input quantity. R(c) is centroid c's
+    performance on real data, accumulated by observe() over every target token
+    that ever landed on c; w is this input's NNLS composition, already summing
+    to 1, and already zero on every centroid that is not a constituent. The dot
+    product is the whole definition.
+
+    This used to be a plain mean of R over the TARGET's per-token centroid
+    assignments, which read the same rows through a lens deployment never used:
+    answer() has always dotted the composition against R. Two definitions of one
+    number, and the training one gated `admitted`. Now there is one, and both
+    callers use it.
+    """
+    r = reliability.vector().astype(np.float64)
+    w = np.asarray(w, dtype=np.float64)
+    if w.shape[0] != r.shape[0]:
+        raise RuntimeError(f"rho: composition over {w.shape[0]} centroids, reliability has {r.shape[0]}")
+    return float(w @ r)
 
 
-def score(central, question: str, y: List[int], assign_y: np.ndarray,
+def score(central, question: str, y: List[int], w: np.ndarray,
           expert_texts: Dict[int, str], reliability: Reliability) -> Scored:
     ctx0 = central.context_ids(question, [], len(y))
     b = central.ce_vector(ctx0, y).astype(np.float64)
     M = len(b)
     base_len = len(ctx0)
-    out = Scored(b=b, base_len=base_len, rho=rho_of(reliability, assign_y, M))
+    out = Scored(b=b, base_len=base_len, rho=rho_of(reliability, w))
     # M >= TARGET_MIN_TOKENS: a mean over one token is not a measurement, and the
     # short-answer sources are a fifth of the mixture, not a rare accident.
     out.admitted = out.rho >= C.R_MIN and M >= C.TARGET_MIN_TOKENS

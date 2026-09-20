@@ -267,11 +267,19 @@ def main() -> int:
     r.observe(np.full(200, 0.5), np.zeros(200, dtype=int))
     r.observe(np.full(200, 3.0), np.ones(200, dtype=int))
     assert r.R(0) > r.R(1)
-    rho = rho_of(r, np.array([0, 0, 1, 1]), 4)
-    assert abs(rho - (r.R(0) + r.R(1)) / 2) < 1e-12, "rho is not the mean R over token types"
+    # rho is the COMPOSITION's score: percentage in the constituent x that
+    # centroid's measured mean. Not a per-token mean over the target, and not
+    # per-cluster: a centroid absent from the composition has w=0 and cannot
+    # move it, however good or bad its own row is.
+    w = np.zeros(g.C); w[0], w[1] = 0.75, 0.25
+    # 1e-7, not 1e-12: vector() is float32 and rho_of reads R through it.
+    assert abs(rho_of(r, w) - (0.75 * r.R(0) + 0.25 * r.R(1))) < 1e-7, "rho is not the weighted mean"
+    w_all0 = np.zeros(g.C); w_all0[0] = 1.0
+    assert abs(rho_of(r, w_all0) - r.R(0)) < 1e-7, "a pure composition must be that centroid's own R"
+    assert rho_of(r, w) < rho_of(r, w_all0), "the bad centroid's share must pull rho down"
     try:
-        rho_of(r, np.array([0, 0, 1, 1]), 8)
-        raise AssertionError("rho accepted a misaligned assignment")
+        rho_of(r, np.zeros(g.C + 3))
+        raise AssertionError("rho accepted a composition of the wrong width")
     except RuntimeError:
         pass
     # R is MEASURED in training, never applied to the delta: the reward is a plain
@@ -293,7 +301,21 @@ def main() -> int:
     assert "rho" not in _insp.signature(_md.ExpertPool.sample).parameters, "sample() still takes rho"
     assert "weight" not in _insp.signature(_md.Central.pretrain_step).parameters, "Central step still weighted"
     src_ans = _insp.getsource(_tr.System.answer)
-    assert "math.ceil(len(notes) * (1.0 - trust))" in src_ans, "deployment deduction formula changed"
+    assert "math.ceil(len(notes) * (1.0 - lean))" in src_ans, "deployment deduction formula changed"
+    # THREE PASSES, and the split between them is a COMPARISON, not a constant:
+    # Central alone, the centroids' synthesis, then one answer built from both.
+    # The dot products that score the synthesis are measured on the synthesis.
+    assert "self.central.generate(prompt, [], max_tokens)" in src_ans, "Central no longer drafts alone"
+    assert 'lead, label = "central"' in src_ans and 'lead, label = "pool"' in src_ans, \
+        "the comparison no longer decides which output is in charge"
+    assert "base=base, base_label=label" in src_ans, "the merge base is not the winner of the comparison"
+    assert "self.geo.compose(self.gate.hidden(ids))" in src_ans, "synthesis is not composed"
+    assert "trust / tot" in src_ans, "the lean is not a comparison of the two scores"
+    assert "base" in _insp.signature(_md.Central.generate).parameters, "generate() has no base slot"
+    # the training path scores the COMPOSITION, never the target's assignment
+    src_one_w = _insp.getsource(_tr.System._train_one)
+    assert "score(self.central, s.prompt, y, plan.w," in src_one_w, "training rho is not composition-weighted"
+    assert "self.rel.observe(sc.b, assign_y)" in src_one_w, "per-token measurement of R was lost"
     # Central's step: outside admission, and guarded against held-out AND self-referent
     src_one = _insp.getsource(_tr.System._train_one)
     i_adm, i_cen = src_one.index("elif sc.admitted:"), src_one.index("self.central.pretrain_step(")
