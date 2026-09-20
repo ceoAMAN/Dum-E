@@ -57,3 +57,22 @@ it a useful baseline.
 ## Restoring
 
     cp raw/state_b3425.pkl ../../state/dume/state.pkl
+
+## Expert adapters
+
+`ckpt_experts/` holds the 87 trained expert adapters from this run (2.8 GB,
+git-ignored). They were MOVED out of `state/dume/ckpt/` so the fresh run starts
+from a uniform cold pool — `ExpertPool.load()` finds no checkpoint and falls
+back to `_fresh()`, which re-draws lora_a per expert.
+
+Why they were not kept: they were trained under the broken imitation (359 of
+470 teachers had a negative delta) and the constant MAD floor, and they are
+UNEVEN — 48 experts received roughly ten gradient steps and 52 received none.
+A claim that the architecture learns should not start from that.
+
+Central (63 MB) and the gate (352 KB) were kept: the gate's weight hash stamps
+the geometry, and re-forming would need a fresh model pass.
+
+Restore:
+
+    mv analysis/run_20260920_b3425/ckpt_experts/expert_* state/dume/ckpt/

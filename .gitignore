@@ -18,3 +18,6 @@ scripts/*.log
 # Large local training data (kept off the public engine repo)
 data/custom_prompts.jsonl
 data/raw_prompts/
+
+# archived expert adapters from the b3425 run (3 GB, restore by moving back)
+analysis/*/ckpt_experts/
