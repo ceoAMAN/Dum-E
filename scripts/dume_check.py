@@ -512,22 +512,31 @@ def main() -> int:
     for a, b in zip(spans, spans[1:]):
         assert b.start >= a.start, "anchors out of order"
     assert all(0 <= s.start < s.end <= T for s in spans), "span left the input"
+    # TRAINING = FAIR SHARE: the allocated tokens divided by the experts sharing
+    # them. Equal spans, contiguous anchors, so the k experts TILE the input —
+    # everybody is judged on the same amount of material, which is what makes
+    # their deltas comparable.
     probe_spans = rt._spans(picks, assign_t, T, True)
-    assert {s.n_tokens for s in probe_spans} == set(probe_sizes(T)), \
-        f"probe spans {[s.n_tokens for s in probe_spans]} != {probe_sizes(T)}"
-    # at k=1 the probe must still sweep all three sizes, across BATCHES
-    seen1 = set()
-    for b in range(3):
-        law.n_seen = b
-        seen1.add(rt._spans([picks[0]], assign_t, T, True)[0].n_tokens)
-    assert seen1 == set(probe_sizes(T)), f"k=1 probe stuck at {seen1}"
+    assert len({s.n_tokens for s in probe_spans}) == 1, \
+        f"training spans are not an equal share: {[s.n_tokens for s in probe_spans]}"
+    assert probe_spans[0].n_tokens == T // len(picks), \
+        f"share is not T/k: {probe_spans[0].n_tokens} vs {T // len(picks)}"
+    covered = {t for sp in probe_spans for t in range(sp.start, sp.end)}
+    assert len(covered) >= T - len(picks), f"the shares did not tile the input: {len(covered)}/{T}"
+    # one expert gets the whole allocation, not a third of it
+    assert rt._spans([picks[0]], assign_t, T, True)[0].n_tokens == T, "k=1 did not get the whole input"
+    # and the share still varies enough across (T, k) for the envelopes to fit
+    widths = {rt._spans(picks[:k], assign_t, TT, True)[0].n_tokens
+              for TT in (32, 96, 400) for k in (1, 2, 3)}
+    assert len(widths) >= 3, f"fair share collapsed the span range: {sorted(widths)}"
     # the MEMORY bound on span: the backward pass is linear in prompt length, so
     # t_hi may not be T on a long row. Same physical clamp as k_max on k.
     rt.sched = SimpleNamespace(span_max=64)
     bounded = rt._spans(picks, assign_t, T, True)
     assert max(s.n_tokens for s in bounded) <= 64, [s.n_tokens for s in bounded]
-    assert set(s.n_tokens for s in bounded) == set(probe_sizes(64)), \
-        "the probe must still sweep three sizes inside the bound, not collapse to it"
+    # the share is divided out of what the MEMORY bound allows, not out of T
+    assert bounded[0].n_tokens == 64 // len(picks), \
+        f"the share ignored span_max: {bounded[0].n_tokens} vs {64 // len(picks)}"
     rt.sched = SimpleNamespace(span_max=1 << 30)
     # FRAGMENT CYCLES: the k deficit is paid on the experts already held, so the
     # swap count is per EXPERT and does not grow with coverage (Aman,
@@ -551,8 +560,8 @@ def main() -> int:
     assert len(rt._spans([(3, 0, False)], assign_t, T, True, cycles=9)) == 1, \
         "cycles leaked into the probe (training) path"
     rt.sched = SimpleNamespace(span_max=1 << 30)
-    print(f"router        OK  (anchors ordered, spans within input; probe spans "
-          f"{sorted(s.n_tokens for s in probe_spans)}; span_max clamps t_hi)")
+    print(f"router        OK  (anchors ordered, spans within input; training shares "
+          f"{sorted(s.n_tokens for s in probe_spans)}; span_max clamps the share)")
 
     # Timeline A/B: decided by the MEASURED gain, not a quantile and not a constant
     band = CentralBand()

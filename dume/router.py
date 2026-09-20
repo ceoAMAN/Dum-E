@@ -23,7 +23,7 @@ from typing import Dict, List, Optional
 import numpy as np
 
 from . import config as C
-from .alloc import AllocLaw, probe_sizes
+from .alloc import AllocLaw
 from .geometry import Geometry
 from .models import Gate
 from .scheduler import Scheduler
@@ -190,7 +190,7 @@ class Router:
         # afford: the backward pass is linear in prompt length (~12 MB/token) and
         # t_hi = T would ask for 13 GB on a long row. Same physical clamp as k_max.
         T_eff = min(T, self.sched.span_max)
-        sizes = probe_sizes(T_eff) if probe else None
+        sizes = True if probe else None      # training divides; deployment shares by throughput
         share = None
         if not probe and rate:
             tps = np.array([float(rate.get(eid, 0.0)) for eid, _, _ in raw])
@@ -207,8 +207,23 @@ class Router:
             # identity fallback, which is the live state until the law fits)
             # `i` is always 0, so every probe would land on t_lo and the
             # envelopes could never be fitted over a range at all.
-            if sizes:
-                L = sizes[(self.alloc.n_seen + i) % 3]
+            if sizes is not None:
+                # TRAINING: the allocated tokens divided by the experts sharing
+                # them (Aman, 2026-09-20: "when token is allocated we redefine —
+                # we divide allocated tokens / e = tokens per expert"). With
+                # contiguous anchors this TILES the input: the k experts between
+                # them read all of it once, nobody twice, and every expert gets
+                # the same amount of material to be judged on, which is what
+                # makes their deltas comparable in the first place.
+                #
+                # This replaces the {t_lo, t_mid, t_hi} probe rotation. The
+                # rotation existed to give apex-nadir three span sizes per batch
+                # for free; the fair share still varies the span across batches,
+                # because T runs 8..2511 and k runs 1..4, so the bank sees a
+                # WIDER range than the rotation gave it (the archived run fitted
+                # its envelopes over t in [6.0, 29.5] and then extrapolated them
+                # out to 446 — that narrowness was the rotation's doing).
+                L = T_eff / float(n)
             else:
                 # THE TOKENS ARE NORMALISED (Aman, 2026-09-20): the selection
                 # equation is the total token count, the number of experts, and
