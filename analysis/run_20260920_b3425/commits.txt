@@ -1,0 +1,13 @@
+0e7cb35 Normalise the tokens: a span is the expert's share of the input
+233153e k_effective carries an instruction, not just a count: fragment cycles
+7c60d04 Measure the hallucination weight; delete the k_time term that measured nothing
+cfc2a40 Generals are a replaceable class; the ranking pays for evidence, not ignorance
+db4376c Reliability tracks current performance instead of all of history
+04d5a82 Reliability is a composition score, and it decides who leads the merge
+4fa403e Geometry.tier: three rungs, member / neighbour / far
+6a00c58 Geometry.tier: record it as a deployment primitive
+2f86048 Reward is a plain mean over tokens; drop dead tier/_settled plumbing
+6b4f0b9 Reliability is a deployment deduction: training runs natural gradients
+0c9aabe Unblock expert training: robust update floor, restore the trial seat
+7b8b7ff Curriculum rota: carry the cursor across membership changes
+7a95cb4 Training curriculum, measured membership, shared expert base, symbiosis

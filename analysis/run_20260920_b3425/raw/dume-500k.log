@@ -1,0 +1,72 @@
+[loop] ── attempt 1 (fresh) ──
+============================================================
+  STURNUS — Learning Marathon
+============================================================
+  Target:    500,000 tokens
+  Gradients: ON (gate and experts will learn)
+============================================================
+Note: Environment variable`HF_TOKEN` is set and is the current active token independently from the token you've just configured.
+[boot] HF auth OK
+[boot] Gate loaded and trainable (LoRA backbone + learned routing head)
+[boot] Central deferred
+[boot] phys=16384MB base=4157MB usable_peak=11791MB | expert_ram=831MB(measured) | x_start=1 mem_ceiling=6 cache=6
+[boot] held-out eval set: 40 balanced prompts
+[boot] Starting from 0 tokens
+
+[data] Initialising mixture streams: ['github_code', 'python_instructions', 'gsm8k', 'metamath', 'ai2_arc', 'camel_science', 'slimorca', 'ultrachat']
+[data] Opening stream ai2_arc (allenai/ai2_arc)
+[data] Opening stream github_code (HuggingFaceH4/CodeAlpaca_20K)
+[data] Opening stream gsm8k (openai/gsm8k)
+[data] Opening stream python_instructions (iamtarun/python_code_instructions_18k_alpaca)
+[data] Opening stream camel_science (sciq)
+[data] Opening stream slimorca (Open-Orca/SlimOrca)
+[data] Opening stream metamath (meta-math/MetaMathQA)
+[learn] batch=10 | tok=871 | k=1 | loss=0.4429 | r_i=0.4292 | λ=[eff0.25 dom0.26 rel0.23 div0.25] | tok/s=128 | x=1(util78%,60°C) | experts=[6] | 00:00:54
+[data] Opening stream ultrachat (HuggingFaceH4/ultrachat_200k)
+[learn] batch=20 | tok=1,727 | k=1 | loss=0.3089 | r_i=0.5100 | λ=[eff0.26 dom0.27 rel0.21 div0.26] | tok/s=134 | x=1(util84%,57°C) | experts=[6] | 00:01:01
+[learn] batch=30 | tok=2,769 | k=1 | loss=0.3084 | r_i=0.4084 | λ=[eff0.26 dom0.27 rel0.20 div0.27] | tok/s=44 | x=1(util84%,62°C) | experts=[78] | 00:01:38
+[learn] batch=40 | tok=3,760 | k=1 | loss=0.2620 | r_i=0.3947 | λ=[eff0.26 dom0.28 rel0.18 div0.28] | tok/s=145 | x=1(util73%,58°C) | experts=[30] | 00:01:47
+[learn] batch=50 | tok=4,822 | k=1 | loss=0.0070 | r_i=0.5172 | λ=[eff0.26 dom0.29 rel0.17 div0.28] | tok/s=145 | x=1(util84%,59°C) | experts=[78] | 00:02:04
+[ckpt] batch=50 | tok=4,822 | clusters=36
+[eval] tok=4,822 | gate_acc=82.5% | code=90% reas=70% know=100% gen=70%
+[bench] L=[eff0.126 dom0.843 rel0.043] mse=29.018 div_sim=0.000 | r_i=0.451 contrib=122.680 | wstd=0.0002 hit=0% kvel=-5.56e-05
+[learn] batch=60 | tok=5,714 | k=1 | loss=0.0002 | r_i=0.5057 | λ=[eff0.26 dom0.29 rel0.16 div0.28] | tok/s=125 | x=1(util87%,58°C) | experts=[6] | 00:02:16
+[learn] batch=70 | tok=6,862 | k=1 | loss=0.0003 | r_i=0.5252 | λ=[eff0.27 dom0.29 rel0.16 div0.29] | tok/s=91 | x=1(util79%,56°C) | experts=[58] | 00:02:25
+[learn] batch=80 | tok=7,858 | k=1 | loss=0.0014 | r_i=0.5524 | λ=[eff0.27 dom0.29 rel0.16 div0.29] | tok/s=139 | x=1(util78%,56°C) | experts=[48] | 00:02:33
+[learn] batch=90 | tok=8,733 | k=1 | loss=0.0008 | r_i=0.5872 | λ=[eff0.27 dom0.29 rel0.15 div0.29] | tok/s=109 | x=1(util74%,55°C) | experts=[48] | 00:02:42
+[learn] batch=100 | tok=9,864 | k=1 | loss=0.0000 | r_i=0.6518 | λ=[eff0.27 dom0.29 rel0.15 div0.29] | tok/s=91 | x=1(util74%,55°C) | experts=[58] | 00:02:52
+[ckpt] batch=100 | tok=9,864 | clusters=85
+[eval] tok=9,864 | gate_acc=90.0% | code=90% reas=90% know=100% gen=80%
+[bench] L=[eff0.061 dom0.410 rel0.021] mse=26.265 div_sim=0.000 | r_i=0.510 contrib=129.314 | wstd=0.0002 hit=0% kvel=-2.45e-05
+[learn] batch=110 | tok=10,969 | k=1 | loss=0.0000 | r_i=0.6946 | λ=[eff0.27 dom0.29 rel0.15 div0.29] | tok/s=117 | x=1(util76%,55°C) | experts=[48] | 00:03:03
+[learn] batch=120 | tok=12,084 | k=1 | loss=0.0000 | r_i=0.8073 | λ=[eff0.27 dom0.29 rel0.15 div0.29] | tok/s=111 | x=1(util76%,56°C) | experts=[93] | 00:03:14
+[learn] batch=130 | tok=13,017 | k=1 | loss=0.0001 | r_i=0.7361 | λ=[eff0.27 dom0.29 rel0.15 div0.29] | tok/s=85 | x=1(util73%,55°C) | experts=[6] | 00:03:25
+[learn] batch=140 | tok=13,974 | k=1 | loss=0.0000 | r_i=0.7654 | λ=[eff0.27 dom0.29 rel0.15 div0.29] | tok/s=56 | x=1(util70%,56°C) | experts=[6] | 00:03:35
+[learn] batch=150 | tok=15,082 | k=1 | loss=0.0000 | r_i=0.8814 | λ=[eff0.27 dom0.29 rel0.15 div0.29] | tok/s=97 | x=1(util77%,56°C) | experts=[58] | 00:03:47
+[ckpt] batch=150 | tok=15,082 | clusters=94
+[eval] tok=15,082 | gate_acc=90.0% | code=90% reas=100% know=100% gen=70%
+[bench] L=[eff0.040 dom0.270 rel0.014] mse=21.976 div_sim=0.000 | r_i=0.601 contrib=132.395 | wstd=0.0002 hit=0% kvel=-1.52e-05
+[learn] batch=160 | tok=16,133 | k=1 | loss=0.0000 | r_i=0.9115 | λ=[eff0.27 dom0.29 rel0.15 div0.29] | tok/s=99 | x=1(util74%,56°C) | experts=[48] | 00:04:01
+[learn] batch=170 | tok=17,333 | k=1 | loss=0.0000 | r_i=0.9058 | λ=[eff0.27 dom0.29 rel0.15 div0.29] | tok/s=98 | x=1(util74%,56°C) | experts=[93] | 00:04:15
+[learn] batch=180 | tok=18,520 | k=1 | loss=0.0000 | r_i=0.9016 | λ=[eff0.27 dom0.29 rel0.15 div0.29] | tok/s=86 | x=1(util72%,56°C) | experts=[48] | 00:04:28
+[learn] batch=190 | tok=19,442 | k=1 | loss=0.0000 | r_i=0.9122 | λ=[eff0.27 dom0.29 rel0.15 div0.29] | tok/s=73 | x=1(util70%,55°C) | experts=[58] | 00:04:39
+[learn] batch=200 | tok=20,347 | k=1 | loss=0.0185 | r_i=0.8935 | λ=[eff0.27 dom0.29 rel0.15 div0.29] | tok/s=98 | x=1(util77%,56°C) | experts=[48] | 00:04:50
+[ckpt] batch=200 | tok=20,347 | clusters=85
+[eval] tok=20,347 | gate_acc=92.5% | code=90% reas=90% know=90% gen=100%
+[bench] L=[eff0.030 dom0.205 rel0.010] mse=18.460 div_sim=0.000 | r_i=0.678 contrib=136.123 | wstd=0.0002 hit=3% kvel=-1.10e-05
+[learn] batch=210 | tok=21,380 | k=1 | loss=0.0000 | r_i=0.9229 | λ=[eff0.27 dom0.29 rel0.15 div0.29] | tok/s=103 | x=1(util75%,56°C) | experts=[48] | 00:05:03
+[learn] batch=220 | tok=22,637 | k=1 | loss=0.0000 | r_i=0.9205 | λ=[eff0.27 dom0.29 rel0.15 div0.29] | tok/s=101 | x=1(util76%,56°C) | experts=[93] | 00:05:17
+[learn] batch=230 | tok=23,718 | k=1 | loss=0.0000 | r_i=0.9121 | λ=[eff0.27 dom0.29 rel0.15 div0.29] | tok/s=100 | x=1(util74%,56°C) | experts=[58] | 00:05:29
+[learn] batch=240 | tok=24,815 | k=1 | loss=0.0000 | r_i=0.9360 | λ=[eff0.27 dom0.29 rel0.15 div0.29] | tok/s=67 | x=1(util72%,55°C) | experts=[58] | 00:05:41
+[learn] batch=250 | tok=25,912 | k=1 | loss=0.0000 | r_i=0.9371 | λ=[eff0.27 dom0.29 rel0.15 div0.29] | tok/s=113 | x=1(util75%,56°C) | experts=[93] | 00:05:52
+[ckpt] batch=250 | tok=25,912 | clusters=63
+[eval] tok=25,912 | gate_acc=90.0% | code=90% reas=90% know=80% gen=100%
+[bench] L=[eff0.000 dom0.004 rel0.000] mse=13.274 div_sim=0.000 | r_i=0.791 contrib=142.502 | wstd=0.0002 hit=5% kvel=-8.79e-06
+[learn] batch=260 | tok=26,999 | k=1 | loss=0.0000 | r_i=0.9223 | λ=[eff0.27 dom0.29 rel0.15 div0.29] | tok/s=102 | x=1(util74%,56°C) | experts=[6] | 00:06:06
+[learn] batch=270 | tok=28,221 | k=1 | loss=0.0000 | r_i=0.9410 | λ=[eff0.27 dom0.29 rel0.15 div0.29] | tok/s=115 | x=1(util75%,56°C) | experts=[93] | 00:06:18
+[learn] batch=280 | tok=29,422 | k=1 | loss=0.0000 | r_i=0.9224 | λ=[eff0.27 dom0.29 rel0.15 div0.29] | tok/s=87 | x=1(util73%,56°C) | experts=[93] | 00:06:31
+[learn] batch=290 | tok=30,376 | k=1 | loss=0.0000 | r_i=0.9587 | λ=[eff0.27 dom0.29 rel0.15 div0.29] | tok/s=56 | x=1(util71%,56°C) | experts=[58] | 00:06:42
+[learn] batch=300 | tok=31,599 | k=1 | loss=0.0000 | r_i=0.9624 | λ=[eff0.27 dom0.29 rel0.15 div0.29] | tok/s=101 | x=1(util74%,56°C) | experts=[48] | 00:06:55
+[ckpt] batch=300 | tok=31,599 | clusters=56
+/opt/homebrew/Cellar/python@3.14/3.14.2/Frameworks/Python.framework/Versions/3.14/lib/python3.14/multiprocessing/resource_tracker.py:396: UserWarning: resource_tracker: There appear to be 1 leaked semaphore objects to clean up at shutdown: {'/mp-4lqe9xa5'}
+  warnings.warn(
