@@ -333,36 +333,40 @@ class AllocLaw:
 
         His form was `1/experts + 1/estimated_time + tokens_per_second`. The
         three terms as written are a count, a per-second and a rate, so the sum
-        is not a number of experts; and `1/estimated_time` and `tokens_per_second`
-        are the same measured quantity written twice. What survives is the SHAPE,
-        which is right: a soft minimum where the tightest constraint dominates
-        smoothly, instead of the hard `min` the scheduler uses.
-
-        So each constraint is first converted into a number of experts, and they
-        are combined by HARMONIC MEAN — n/(sum 1/x), not 1/(sum 1/x). The latter
-        returns 2 when all three say 4; the mean returns 4 when they agree and
-        collapses toward the smallest when they do not.
+        is not a number of experts. What survives is the SHAPE, which is right:
+        a soft minimum where the tightest constraint dominates smoothly, instead
+        of the hard `min` the scheduler uses. Each constraint is converted into
+        a number of experts and they are combined by HARMONIC MEAN — n/(sum 1/x),
+        not 1/(sum 1/x). The latter returns 2 when both say 4; the mean returns 4
+        when they agree and collapses toward the smaller when they do not.
 
             k_gate = T / ALLOC(T)          what apex-nadir asks for
-            k_time = tau / (a + b*L)       how many passes of the CURRENT cost fit
-                                           in what a pass has been costing
             k_ram  = the scheduler's bound (still a HARD clamp afterwards: a soft
                                            blend can land above it, and that is
                                            an OOM, not a preference)
 
-        Until the cost curve exists there is no k_time and this degrades to
-        k_gate, which is the §7 identity fallback — a refusal, not a guess."""
-        k_gate = self.k(T)
-        tau, cost = self.mean_pass_seconds(), self.cost
-        if tau is None or cost is None:
-            return max(1, min(k_gate, int(k_ram)))
-        a, b = cost
-        per = a + b * float(self.alloc(T))
-        if per <= 0:
-            return max(1, min(k_gate, int(k_ram)))
-        k_time = max(1.0, tau / per)
-        terms = [max(1.0, float(k_gate)), k_time, max(1.0, float(k_ram))]
-        eff = len(terms) / sum(1.0 / x for x in terms)
+        THERE IS NO k_time TERM, and that is deliberate. It used to be
+        tau / (a + b*alloc(T)), where tau = mean_pass_seconds() is the mean of
+        the latency bank and (a, b) is the line fitted to that SAME bank — one
+        curve divided by itself at two points, with no deadline, budget or
+        latency target entering anywhere. Measured on the live fit it sat at
+        1.08-1.14 across T = 64..2048 and did not move when the machine changed
+        speed, because tau and c(t) scale together and cancel. A harmonic mean is
+        dominated by its smallest term, so that ~1 alone set k: across all 1566
+        batches of the last run k was 2 while k_gate asked for 11 to 114, and
+        3/(1/k_gate + 1 + 1/k_ram) is below 3 for EVERY k_gate and k_ram that
+        exist. A term carrying no information was outvoting both terms that do.
+
+        A real time term needs a real budget — a deadline, or Central's own
+        measured pass time to spend against. Nothing in the system measures one
+        yet, so the honest form is the two constraints that are grounded and
+        independent. Put the third back when there is a clock to answer to.
+
+        Until the allocation law is fitted this degrades to k_gate, which is the
+        §7 identity fallback — a refusal, not a guess."""
+        k_gate = max(1.0, float(self.k(T)))
+        k_r = max(1.0, float(k_ram))
+        eff = 2.0 / (1.0 / k_gate + 1.0 / k_r)
         return max(1, min(int(round(eff)), int(k_ram)))
 
     def state(self) -> Dict[str, object]:

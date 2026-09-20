@@ -77,15 +77,15 @@ from . import config as C
 # p4: ranking is a "normalized weighted sum" of correctness, hallucination and
 # processing time. Aman named the three terms; he did NOT name the coefficients.
 #
-# THE ONE THAT MATTERS IS W_HALLUC. Correctness and hallucination are the same
-# per-token gradient read on either side of zero, in the SAME units (nats), so at
-# W_CORRECT == W_HALLUC the pair collapses ALGEBRAICALLY to correct - halluc,
-# which is exactly the net delta the system already had — an expert that gains 3
-# nats and loses 3 ranks identically to one that does nothing. Only W_HALLUC > 1
-# makes volatility cost anything, and how much a hallucination should cost
-# against an equal correctness is a judgement about the product, not a fact the
-# data can supply. VALUE NEEDS AMAN; 1.0 is the neutral default, not a choice.
-W_CORRECT, W_HALLUC, W_TIME = 1.0, 1.0, 1.0
+# W_HALLUC IS NOT A COEFFICIENT ANY MORE — it is MEASURED (Aman, 2026-09-20:
+# "w_hall is score we get from real isn't it?"). It was the last hand-set number
+# in the ranking, and the file's own comment admitted it: "how much a
+# hallucination should cost against an equal correctness is a judgement ...
+# VALUE NEEDS AMAN". It isn't a judgement. Correctness and hallucination are the
+# same per-token gradient read on either side of zero, both against y, which
+# came off disk — so the pool's own books say what a hallucinated nat costs
+# against a correct one. See Standing.w_halluc().
+W_CORRECT, W_TIME = 1.0, 1.0
 
 GENERAL = -1      # performance never concentrated: candidate everywhere, at home nowhere
 MIN_MOVE_OBS = 2  # a rate needs more than one sample before it may move a seat
@@ -129,6 +129,23 @@ class Standing:
         lo, hi = float(v[mask].min()), float(v[mask].max())
         out[mask] = 0.5 if hi - lo < 1e-12 else (v[mask] - lo) / (hi - lo)
         return out
+
+    def w_halluc(self) -> float:
+        """What a hallucinated nat costs against a correct one, read off the
+        pool's own books: total nats hallucinated / total nats saved.
+
+        Both sums are accumulated by observe() from d = b - a against real y, so
+        this is a measurement, not a preference. On the 1566-batch run the pool
+        hallucinated 331.0 nats for every 105.1 it saved, so the weight lands
+        near 3.15 and the ranking leans on NOT hallucinating in exactly the
+        proportion the data says it should.
+
+        No clamp: wsum normalises, so a large weight simply makes the ranking
+        non-hallucination-dominated, which is the correct response to a pool
+        that mostly hurts. Falls back to 1.0 (the neutral pair) only when one
+        side has no evidence at all — a cold pool has nothing to measure."""
+        c, h = float(self.sc.sum()), float(self.sh.sum())
+        return (h / c) if c > 0.0 and h > 0.0 else 1.0
 
     def _overall(self, M: np.ndarray, d: np.ndarray, mask: np.ndarray) -> np.ndarray:
         """Domain-weighted overall rate, with an unmeasured cluster imputed from
@@ -183,9 +200,10 @@ class Standing:
         # did nothing. Each term now carries its own min-max, so every weight is
         # live at 1.0 and W_HALLUC > 1 makes volatility cost more rather than
         # being the only way it costs anything at all.
-        wsum = W_CORRECT + W_HALLUC + W_TIME
+        w_h = self.w_halluc()
+        wsum = W_CORRECT + w_h + W_TIME
         score = (W_CORRECT * self._unit(cor, m)
-                 + W_HALLUC * (1.0 - self._unit(hal, m))
+                 + w_h * (1.0 - self._unit(hal, m))
                  + W_TIME * self._unit(tps, m)) / wsum
         return {int(e): float(score[e]) for e in range(self.E) if m[e]}
 

@@ -146,32 +146,37 @@ def main() -> int:
     assert ov[30] <= ov[31] + 1e-12, f"thin evidence outscored full evidence: {ov[30]} vs {ov[31]}"
     place = AllocLaw.placement(rk)
     assert place[20] == 1.0 and place[21] == 0.0, place
-    # two experts with the SAME net delta but different volatility must not rank
-    # equal: correct-minus-halluc is what the old scalar saw, and it is blind here
     # THREE SEPARATE TERMS, each on its own normaliser: efficiency, NON-
     # hallucination, throughput. They used to share one scale and enter as
-    # (cor - hal), so W_HALLUC was inert at 1.0 by construction.
+    # (cor - hal), so the hallucination weight was inert by construction.
+    #
+    # AND THE WEIGHT IS MEASURED, not configured: w_halluc() = total nats
+    # hallucinated / total nats saved, both accumulated against real y.
     s8 = Standing(1)
     s8.observe(1, 0, 0.0, 32, correct=2.0, halluc=1.0, seconds=1.0)
     s8.observe(2, 0, 0.0, 32, correct=4.0, halluc=3.0, seconds=1.0)   # same net, 3x the halluc
     assert s8.score(1, 0) == s8.score(2, 0), "the net rate should be identical"
-    import dume.standing as _st
-    assert s8.rank(np.array([1.0]))[1] == s8.rank(np.array([1.0]))[2], \
-        "equal weights on a proportional pair still tie — that is the algebra"
-    _st.W_HALLUC = 2.0
-    try:
-        r8 = s8.rank(np.array([1.0]))
-        assert r8[1] > r8[2], f"W_HALLUC>1 must punish the hallucinator {r8}"
-    finally:
-        _st.W_HALLUC = 1.0
-
-    import dume.standing as _st
-    _st.W_HALLUC = 2.0
-    try:
-        r8b = s8.rank(np.array([1.0]))
-        assert r8b[1] > r8b[2], f"W_HALLUC>1 did not make volatility cost {r8b}"
-    finally:
-        _st.W_HALLUC = 1.0
+    # this pool hallucinated 4 nats against 6 saved -> weight 2/3, below the
+    # neutral pair, so a pool that mostly helps does NOT get a hallucination-led
+    # ranking. The number comes off the books, nobody chose it.
+    assert abs(s8.w_halluc() - (4.0 / 6.0)) < 1e-12, s8.w_halluc()
+    # at that weight e2's larger correctness outweighs its larger hallucination,
+    # and it SHOULD: the pool is net-helpful, so the books say correctness is
+    # the scarcer thing. The weight follows the data, not a preference.
+    r8 = s8.rank(np.array([1.0]))
+    assert r8[2] > r8[1], f"a net-helpful pool should still reward correctness {r8}"
+    # a pool that mostly HURTS measures a weight above 1 and leans harder on it
+    s8b = Standing(1)
+    s8b.observe(1, 0, 0.0, 32, correct=1.0, halluc=2.0, seconds=1.0)
+    s8b.observe(2, 0, 0.0, 32, correct=1.0, halluc=8.0, seconds=1.0)
+    assert s8b.w_halluc() == 10.0 / 2.0, s8b.w_halluc()
+    # THE INVARIANT, at any weight: hold correctness equal and more
+    # hallucination must rank lower. This is what "rewards non hallucination"
+    # means, and the old (cor - hal) form could not express it.
+    r8b = s8b.rank(np.array([1.0]))
+    assert r8b[1] > r8b[2], f"equal correctness, more hallucination must lose {r8b}"
+    # a cold pool has nothing to measure and falls back to the neutral pair
+    assert Standing(1).w_halluc() == 1.0, "cold pool must not invent a weight"
     # throughput enters: same gradient, half the time -> better rank
     s9 = Standing(1)
     s9.observe(1, 0, 1.0, 32, correct=1.0, halluc=0.0, seconds=2.0)
