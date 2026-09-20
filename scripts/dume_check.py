@@ -449,24 +449,24 @@ def main() -> int:
     rt = Router.__new__(Router)
     rt.alloc = law
     rt.sched = SimpleNamespace(span_max=1 << 30)          # unbounded for the geometry checks
-    spans = rt._spans(picks, assign_t, T, False, {50: 1.0, 60: 0.5, 70: 0.0})
+    spans = rt._spans(picks, assign_t, T, False)
     assert spans[0].start == 0, [(s.start, s.end) for s in spans]
     for a, b in zip(spans, spans[1:]):
         assert b.start >= a.start, "anchors out of order"
     assert all(0 <= s.start < s.end <= T for s in spans), "span left the input"
-    probe_spans = rt._spans(picks, assign_t, T, True, {})
+    probe_spans = rt._spans(picks, assign_t, T, True)
     assert {s.n_tokens for s in probe_spans} == set(probe_sizes(T)), \
         f"probe spans {[s.n_tokens for s in probe_spans]} != {probe_sizes(T)}"
     # at k=1 the probe must still sweep all three sizes, across BATCHES
     seen1 = set()
     for b in range(3):
         law.n_seen = b
-        seen1.add(rt._spans([picks[0]], assign_t, T, True, {})[0].n_tokens)
+        seen1.add(rt._spans([picks[0]], assign_t, T, True)[0].n_tokens)
     assert seen1 == set(probe_sizes(T)), f"k=1 probe stuck at {seen1}"
     # the MEMORY bound on span: the backward pass is linear in prompt length, so
     # t_hi may not be T on a long row. Same physical clamp as k_max on k.
     rt.sched = SimpleNamespace(span_max=64)
-    bounded = rt._spans(picks, assign_t, T, True, {})
+    bounded = rt._spans(picks, assign_t, T, True)
     assert max(s.n_tokens for s in bounded) <= 64, [s.n_tokens for s in bounded]
     assert set(s.n_tokens for s in bounded) == set(probe_sizes(64)), \
         "the probe must still sweep three sizes inside the bound, not collapse to it"
@@ -476,22 +476,21 @@ def main() -> int:
     # 2026-09-20: "increase token fragment cycles on them, so then we avoid
     # swapping k experts on regular intervals"). Deployment only.
     rt.sched = SimpleNamespace(span_max=50)   # short spans, so a region needs tiling
-    cyc = rt._spans([(3, 0, False), (7, 1, False)], assign_t, T, False,
-                    {3: 0.5, 7: 0.5}, cycles=6)
+    cyc = rt._spans([(3, 0, False), (7, 1, False)], assign_t, T, False, cycles=6)
     order = [x.eid for x in cyc]
     swaps = sum(1 for i in range(len(order)) if i == 0 or order[i] != order[i - 1])
     assert len(cyc) > 2, f"cycles produced no extra fragments: {len(cyc)}"
     assert swaps == 2, f"a fragment cost a swap: {swaps} over {order}"
     assert len(set(order)) == 2, "cycles changed WHICH experts run"
     assert all(0 <= x.start < x.end <= T for x in cyc), "a fragment left the input"
-    one = rt._spans([(3, 0, False), (7, 1, False)], assign_t, T, False, {3: 0.5, 7: 0.5})
+    one = rt._spans([(3, 0, False), (7, 1, False)], assign_t, T, False)
     cov_1 = len({t for x in one for t in range(x.start, x.end)})
     cov_n = len({t for x in cyc for t in range(x.start, x.end)})
     assert cov_n > cov_1, f"cycles bought no coverage: {cov_1} -> {cov_n}"
     # bounded by COVERAGE: a region already tiled buys no duplicate passes
-    assert len(rt._spans([(3, 0, False)], assign_t, T, False, {3: 0.5}, cycles=9999)) <= T
+    assert len(rt._spans([(3, 0, False)], assign_t, T, False, cycles=9999)) <= T
     # and the training path is untouched
-    assert len(rt._spans([(3, 0, False)], assign_t, T, True, {}, cycles=9)) == 1, \
+    assert len(rt._spans([(3, 0, False)], assign_t, T, True, cycles=9)) == 1, \
         "cycles leaked into the probe (training) path"
     rt.sched = SimpleNamespace(span_max=1 << 30)
     print(f"router        OK  (anchors ordered, spans within input; probe spans "

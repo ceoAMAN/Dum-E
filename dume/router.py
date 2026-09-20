@@ -138,7 +138,9 @@ class Router:
         # the probe IS the training allocation — and cycling there would spend
         # the run's wall clock on coverage it does not need.
         cycles = 1 if probe else max(1, k_wanted // max(k, 1))
-        plan.selections = self._spans(picks, assign, T, probe, place, cycles)
+        tp = self.standing.throughput()
+        plan.selections = self._spans(picks, assign, T, probe, cycles,
+                                      {int(e): float(tp[e]) for e in range(len(tp))})
         return plan
 
     def _pick(self, cid: int, route: np.ndarray, chosen: set) -> Optional[int]:
@@ -162,7 +164,7 @@ class Router:
         return int(max(rest, key=lambda e: route[e])) if rest else None
 
     def _spans(self, picks: List[tuple], assign: np.ndarray, T: int, probe: bool,
-               place: Dict[int, float], cycles: int = 1) -> List[Selection]:
+               cycles: int = 1, rate: Optional[Dict[int, float]] = None) -> List[Selection]:
         """Split, then PAD. Anchors are contiguous and ordered by where each
         cluster's tokens actually sit; the LENGTH is apex-nadir's, not the
         router's — each expert gets the span its OWN rank earns it on the
@@ -187,6 +189,11 @@ class Router:
         # t_hi = T would ask for 13 GB on a long row. Same physical clamp as k_max.
         T_eff = min(T, self.sched.span_max)
         sizes = probe_sizes(T_eff) if probe else None
+        share = None
+        if not probe and rate:
+            tps = np.array([float(rate.get(eid, 0.0)) for eid, _, _ in raw])
+            tot = float(tps.sum())
+            share = (tps / tot) if tot > 0 and (tps > 0).all() else None
         # the probe IS the training allocation: cycling there would spend the
         # run's wall clock covering input the probe schedule is deliberately
         # sampling instead. The guard lives here as well as in plan() so the
@@ -198,8 +205,36 @@ class Router:
             # identity fallback, which is the live state until the law fits)
             # `i` is always 0, so every probe would land on t_lo and the
             # envelopes could never be fitted over a range at all.
-            L = sizes[(self.alloc.n_seen + i) % 3] if sizes else self.alloc.alloc(T_eff, place.get(eid, 0.5))
-            L = max(1, min(int(L), T_eff))
+            if sizes:
+                L = sizes[(self.alloc.n_seen + i) % 3]
+            else:
+                # THE TOKENS ARE NORMALISED (Aman, 2026-09-20): the selection
+                # equation is the total token count, the number of experts, and
+                # the ranking dimension "expert token processing per unit of
+                # time". So each expert's span is its SHARE of the input,
+                # normalised by measured throughput:
+                #
+                #     L_e = T_eff * tps_e / sum(tps over the chosen experts)
+                #
+                # On this machine that share is very nearly 1/n, and that is the
+                # correct answer rather than a shortcut: every expert is the same
+                # 1.5B base with the same rank-8 LoRA, so decode cost is identical
+                # by construction. Measured over 100 experts, sec = 0.219 +
+                # 0.02385*tokens fits at R2 0.978 — ONE shared cost of 41.9 tok/s
+                # — and the 2.3x spread in per-expert tps correlates -0.026 with
+                # output length and -0.806 with seconds per call. It tracks when
+                # the call happened, not how fast the expert is. The share stays
+                # written as a share so that a pool of genuinely unequal experts
+                # (different rank, different quantisation) allocates correctly
+                # without this code changing.
+                #
+                # This replaces alloc(T_eff, rank): apex-nadir's envelopes are
+                # fitted on t in [6.0, 29.5] and were being extrapolated out to
+                # 446, which handed most experts 19-39 tokens whatever the input
+                # size and inverted the rank order (spearman(u, span) = -0.495 at
+                # T=128). A share of T scales with T by construction.
+                L = T_eff * (share[i] if share is not None else 1.0 / n)
+            L = max(1, min(int(round(L)), T_eff))
             # each expert owns a contiguous REGION and reads it in `cycles`
             # fragments. Its fragments are emitted consecutively, so the adapter
             # is made live once and stays live for all of them — the swap is per
