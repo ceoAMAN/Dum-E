@@ -788,11 +788,28 @@ def main() -> int:
     for km in (4.0, 16.0):
         assert abs(small.k_thermal(km) - km ** (1.0 / (1.0 + pr))) < 1e-12, f"k_max ignored at {km}"
 
+    # HOW MUCH RUN IS LEFT SCALES THE HEAT, it does not add to it. Heat is a
+    # forecast -- this machine will be in trouble if it keeps working like this
+    # -- and how much that matters depends on how much working is left.
+    cool = feed(base + [51.0, 50.0, 49.0, 48.0])
+    for left in (1.0, 0.75, 0.5, 0.25, 0.1, 0.0):
+        assert cool.k_thermal(4.0, left) == 4.0, \
+            f"a cool machine was throttled at left={left}: k {cool.k_thermal(4.0, left):.3f}"
+    ks = [big.k_thermal(4.0, x) for x in (1.0, 0.75, 0.5, 0.25, 0.1, 0.0)]
+    assert all(a < b for a, b in zip(ks, ks[1:])), f"k not monotone as the run runs out: {ks}"
+    assert abs(ks[0] - big.k_thermal(4.0)) < 1e-12, "left=1 is not the full heat response"
+    assert ks[-1] == 4.0, f"heat still applied with nothing left to do: k {ks[-1]:.3f}"
+    # and it cannot AMPLIFY: a fraction outside [0,1] is clamped, not trusted
+    assert big.k_thermal(4.0, 5.0) == ks[0] and big.k_thermal(4.0, -1.0) == 4.0, "left not clamped"
+    # the OS veto is underneath all of it, including at the very end of a run
+    assert feed(base + [60.0], level=2.0).k_thermal(4.0, 0.0) == 1.0, "the veto was scaled away"
+
     # ONE READ PER BATCH. `Scheduler.k_thermal` advances the regulator, so every
     # quantity above is in units of "one read". It was read twice -- once by the
     # router and once by the health record -- which halved that clock.
     users = [l for f in ("dume/train.py", "dume/router.py")
-             for l in open(f) if ".k_thermal" in l and "last_k_thermal" not in l]
+             for l in open(f)
+             if ".k_thermal" in l.split("#")[0] and "last_k_thermal" not in l]
     assert len(users) == 1, f"k_thermal read {len(users)}x outside the scheduler: {users}"
 
     print(f"thermal       OK  (die {die_temp():.1f} C off real sensors, span {settled.peak - settled.floor:.1f} C; "

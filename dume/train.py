@@ -288,6 +288,12 @@ class System:
         # training PROBES: spans come from {t_lo, t_mid, t_hi} rather than the
         # fitted allocation, so span size is explored at no extra cost. Only the
         # 2*sqrt(E) extreme-ranked experts (§2) feed the curves.
+        # how much of the RUN is left, as a fraction. It scales the device's
+        # heat response: a die climbing on the last hundred batches has nowhere
+        # to get to before the run ends. Set BEFORE plan(), which is what reads
+        # sched.k_thermal. No horizon declared -> 1.0 -> heat applies in full.
+        self.sched.left = (max(0.0, 1.0 - self.clock / C.RUN_TARGET_TOKENS)
+                           if C.RUN_TARGET_TOKENS > 0 else 1.0)
         plan = self.router.plan(s.prompt, probe=True, curriculum=self.curric)
         y = self.central.target_ids(s.answer)
         # token types are read off the TARGET IDS THEMSELVES, so assign_y[t] pairs with
@@ -418,6 +424,7 @@ class System:
         rec["thermal_peak"] = ts["peak"]
         rec["thermal_level"] = ts["level"]     # the OS ordinal, kept for its veto only
         rec["thermal_z"] = ts["z"]             # the excursion that actually moves k
+        rec["run_left"] = self.sched.left      # ...scaled by how much run is left
         rec["thermal_run"] = ts["run"]
         rec["thermal_p"] = ts["pressure"]
         self.health.put(**rec, clock=self.clock, active_mb=active_mb())

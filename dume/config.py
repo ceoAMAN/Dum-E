@@ -86,6 +86,14 @@ STATE_DIR = "state/dume"
 CHECKPOINT_DIR = "state/dume/ckpt"
 LEGACY_CENTRAL_CKPT = "state/checkpoints/central/weights.safetensors"   # grounded-CE trained; safe to inherit
 
+# The run's token horizon, set by scripts/run_to_500k.sh, which already exports
+# it. It is what makes `left` -- the fraction of the run still to do -- a real
+# fraction rather than a per-cycle one: the supervisor re-sizes each cycle to
+# reach this, so a cycle's own batch count resets to "all of it" every time it
+# relaunches. 0 means no horizon was declared, and then heat applies in full,
+# which is the safe direction to be wrong in.
+RUN_TARGET_TOKENS = int(os.environ.get("TARGET", "0") or 0)
+
 # ── data ────────────────────────────────────────────────────────────────────
 DATASET_BOOT_TIMEOUT = 60
 DATASET_SAMPLE_TIMEOUT = 60

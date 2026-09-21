@@ -7,7 +7,11 @@
 set -u
 REPO=/Users/aman/Sturnus
 PY=/Users/aman/brian-env/bin/python
-TARGET=${TARGET:-500000}
+# exported, not just set: dume.config reads it as RUN_TARGET_TOKENS to know what
+# fraction of the run is left, which is what scales the device's heat response.
+# A bare `bash scripts/run_to_500k.sh` would otherwise leave it a shell variable
+# the python child never sees, and heat would silently apply in full all run.
+export TARGET=${TARGET:-500000}
 MAX_CYCLES=${MAX_CYCLES:-10}
 TOK_PER_BATCH_GUESS=${TOK_PER_BATCH_GUESS:-146}
 SUP=$REPO/logs/supervisor.log

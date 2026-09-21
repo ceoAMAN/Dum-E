@@ -287,15 +287,38 @@ class ThermalRegulator:
         cool or merely steady: normal operation is free."""
         return max(0.0, self.z - self.dev)
 
-    def k_thermal(self, k_max: float) -> float:
+    def k_thermal(self, k_max: float, left: float = 1.0) -> float:
         """How many experts the device is willing to run right now.
 
         Each unit of pressure takes another root of the RAM bound -- the same
         sqrt bracket k_tier, GENERAL_EXPERTS and capacity() are built from, so
-        no new constant enters here either."""
+        no new constant enters here either.
+
+        `left` is the FRACTION of the run still to do, and it SCALES the heat
+        rather than adding to it (Aman, 2026-09-21: "if it close to processing
+        more k, it is far less k but temp low more k"). Multiplying is what
+        makes those three statements hold at once:
+
+            cool, anywhere in the run   pressure 0   -> product 0 -> k_max
+            hot, far from done          left ~ 1     -> heat applies in full
+            hot, nearly done            left ~ 0     -> product 0 -> k_max
+
+        Heat is a forecast: it says this machine will be in trouble if it keeps
+        working like this. How much that matters depends entirely on how much
+        working is left. A die climbing on the last hundred batches will not get
+        anywhere before the run ends, so there is nothing to protect against.
+
+        It also settles what adding could not. A pressure in span-fractions and
+        a time in seconds have no common unit, and every attempt to find one
+        either cancelled (`seconds_left` is itself built from k, so the ratio
+        collapses to 1/k) or pinned k at 1 for most of a long run. A multiplier
+        needs no common unit: `left` is a pure fraction, measured, and is 1
+        before anything is known -- so a run with no horizon gets the full heat
+        response, which is the safe default."""
         if self.out_of_hand():
             return 1.0
-        return float(k_max) ** (1.0 / (1.0 + self.pressure()))
+        p = self.pressure() * min(1.0, max(0.0, float(left)))
+        return float(k_max) ** (1.0 / (1.0 + p))
 
     def state(self) -> Dict[str, float]:
         return {"n": self.n, "mean": self.mean, "dev": self.dev, "run": self.run,

@@ -42,6 +42,7 @@ class Scheduler:
         self.pool = pool
         self.thermal = None      # a ThermalRegulator, set by System._wire()
         self.last_k_thermal = 0.0   # what the property last returned: read this to REPORT
+        self.left = 1.0             # fraction of the RUN still to do; set per batch by System
         R = total_ram_mb()
         ws = working_set_mb()
         # Aman's law:  space for k  =  R - sqrt(R) - central - gate
@@ -121,7 +122,7 @@ class Scheduler:
             self.last_k_thermal = float(self.k_max) ** (1.0 / (1.0 + lvl))
             return self.last_k_thermal
         self.thermal.observe(t, lvl)
-        self.last_k_thermal = self.thermal.k_thermal(float(self.k_max))
+        self.last_k_thermal = self.thermal.k_thermal(float(self.k_max), self.left)
         return self.last_k_thermal
 
     def clamp(self, k_wanted: int) -> int:
