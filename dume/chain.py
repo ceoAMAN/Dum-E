@@ -280,7 +280,17 @@ class ThermalRegulator:
             return self.k
         d = target - self.k
         gap = self.gap_down if d > 0 else self.gap_up   # rising k <=> the machine cooled
-        self.k = target if gap <= 0.0 else self.k + min(1.0, 1.0 / gap) * d
+        w = 1.0 if gap <= 0.0 else min(1.0, 1.0 / gap)
+        if d < 0:
+            # TIGHTENING ONLY. A radical departure is not ramped into: the
+            # ramp fraction rises with excess, and excess is already the ratio
+            # by which the step beat this machine's own interval, so a step ten
+            # times early carries w to 0.9 and one far past that snaps outright.
+            # Relaxing back up stays on the measured cooling pace regardless --
+            # a machine is allowed to be quick to protect itself and slow to
+            # trust that it is safe.
+            w = max(w, self.excess / (1.0 + self.excess))
+        self.k += w * d
         return self.k
 
     def state(self) -> Dict[str, float]:
