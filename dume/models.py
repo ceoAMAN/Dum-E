@@ -524,29 +524,30 @@ class ExpertPool:
             self._opts[eid] = optim.Adam(learning_rate=C.LR)
         return self._opts[eid]
 
-    def prompt(self, span_text: str, question: str) -> str:
+    def prompt(self, span_text: str) -> str:
         system = ("You are a domain specialist. Analyse the excerpt and give the single key "
                   "insight another model should use to answer. Be concise. Do not answer as if "
                   "you were the user, and do not invent facts that are not present.")
-        # ORIENTATION ONLY, bounded BY THE SPAN. Previously the whole question rode
-        # along with every span, which (a) made apex-nadir's allocation meaningless —
-        # the expert saw the entire input regardless of its span — and (b) left the
-        # sequence the backward pass runs over unbounded, at ~12 MB per prompt token.
+        # THE EXPERT SEES ITS FRAGMENT AND NOTHING ELSE (Aman, 2026-09-21).
         #
-        # A flat TARGET_MAX_TOKENS ceiling only fixed (a) for questions LONGER than
-        # it. Measured on the live pool, 80% of inputs are <= 128 tokens, so for four
-        # inputs in five the "head" was the entire question and the span below it was
-        # a slice of text already printed in full above — 84-93% of the prompt was
-        # identical across the k experts and clone_frac sat at 0.30.
+        # The input used to ride along with every span — first in full, then bounded
+        # to TARGET_MAX_TOKENS. Both made apex-nadir's allocation a label rather than
+        # a budget: if every expert reads all of T, the pool costs k*T and dividing
+        # the input buys nothing. 100 small experts are only cheaper than one big
+        # model when the work is ACTUALLY divided.
         #
-        # Capping the head at the span restores the invariant for every input size:
-        # with k experts each holding T/k tokens, an expert reads at most 2T/k of T,
-        # so the whole input can never ride along while k >= 2. Orientation never
-        # outweighs the material it is orienting.
-        q = self.tok.encode(question)
-        cap = max(1, min(len(self.tok.encode(span_text)), C.TARGET_MAX_TOKENS))
-        head = self.tok.decode(q[:cap]) + (" ..." if len(q) > cap else "")
-        user = f"Question under consideration:\n{head}\n\nExcerpt assigned to you:\n{span_text}"
+        # Measured on the live pool, T has median 51 and p90 639, so the 128-token
+        # bound meant the whole input for four rows in five and a truncated head for
+        # the rest: two different contracts decided by row length, which is why
+        # 84-93% of the k prompts were identical and clone_frac sat at 0.30 through
+        # 599 expert updates while the adapters themselves diverged (pairwise cosine
+        # +0.0000 — the updates landed, the prompts gave them nothing to diverge ON).
+        #
+        # So the expert is extractive: it condenses the region it was given. Central
+        # holds the input and assembles the notes. Prompt cost is now T across the
+        # pool however large k grows, and the sequence the backward pass runs over is
+        # bounded by the span, not by the input.
+        user = f"Excerpt:\n{span_text}"
         msgs = [{"role": "system", "content": system}, {"role": "user", "content": user}]
         tmpl = getattr(self.tok, "apply_chat_template", None)
         if tmpl and getattr(self.tok, "chat_template", None):
@@ -563,17 +564,17 @@ class ExpertPool:
         n = max(C.EXPERT_GEN_TOKENS, int(budget)) if budget else C.EXPERT_GEN_TOKENS
         return generate(self._activate(eid), self.tok, prompt=prompt, max_tokens=n, **kw).strip()
 
-    def run(self, eid: int, span_text: str, question: str,
+    def run(self, eid: int, span_text: str,
             budget: Optional[int] = None) -> Tuple[str, float]:
         """Greedy analysis of the span. Returns (text, wall_seconds)."""
         t0 = time.perf_counter()
-        text = self._gen(eid, self.prompt(span_text, question), 0.0, budget)
+        text = self._gen(eid, self.prompt(span_text), 0.0, budget)
         return text, time.perf_counter() - t0
 
-    def sample(self, eid: int, span_text: str, question: str,
+    def sample(self, eid: int, span_text: str,
                budget: Optional[int] = None) -> str:
         """The exploring candidate for self-imitation, at SAMPLE_TEMP."""
-        return self._gen(eid, self.prompt(span_text, question), C.SAMPLE_TEMP, budget)
+        return self._gen(eid, self.prompt(span_text), C.SAMPLE_TEMP, budget)
 
     def update(self, eid: int, prompt: str, texts: List[str], advantages: List[float]) -> Optional[float]:
         """Reward-weighted self-imitation: loss = sum_g A_g * CE(e_g | prompt).

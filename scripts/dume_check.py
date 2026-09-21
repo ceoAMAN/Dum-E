@@ -560,31 +560,30 @@ def main() -> int:
     assert len(rt._spans([(3, 0, False)], assign_t, T, True, cycles=9)) == 1, \
         "cycles leaked into the probe (training) path"
     rt.sched = SimpleNamespace(span_max=1 << 30)
-    # THE ORIENTATION HEAD IS BOUNDED BY THE SPAN, not by a flat constant. A flat
-    # ceiling only bit on questions longer than it, and 80% of live inputs are
-    # shorter — so the head WAS the whole question and the span below it was a
-    # re-print of text already there. The invariant: an expert never reads more
-    # than twice its own span, so the whole input cannot ride along at k >= 2.
-    class _Tok:                                   # words as tokens; enough to pin arithmetic
+    # THE EXPERT SEES ITS FRAGMENT AND NOTHING ELSE. If the input rides along with
+    # every span then apex-nadir allocates labels, not budget: the pool costs k*T
+    # and dividing the input buys nothing. Pins that the prompt is a function of
+    # the span ALONE — same span, same prompt, whatever question it was cut from.
+    class _Tok:                                   # words as tokens; enough to pin the shape
         def encode(self, s): return s.split()
         def decode(self, t): return " ".join(t)
     _pool = SimpleNamespace(tok=_Tok())
     from dume.models import ExpertPool as _EP
-    q_words = 40
-    question = " ".join(f"q{i}" for i in range(q_words))
-    for span_len in (1, 4, 10, 40):
-        span = " ".join(f"s{i}" for i in range(span_len))
-        built = _EP.prompt(_pool, span, question)
-        head = built.split("Question under consideration:\n")[1].split("\n\nExcerpt")[0]
-        n_head = len([w for w in head.split() if w != "..."])
-        assert n_head <= span_len, f"head {n_head} outran its span {span_len}"
-        assert ("..." in head) == (q_words > n_head), "truncation was not signalled"
-    # and the memory bound survives: a long span cannot buy an unbounded head
-    long_q = " ".join(f"q{i}" for i in range(4 * C.TARGET_MAX_TOKENS))
-    long_span = " ".join(f"s{i}" for i in range(4 * C.TARGET_MAX_TOKENS))
-    head = _EP.prompt(_pool, long_span, long_q).split("Question under consideration:\n")[1]
-    assert len(head.split("\n\nExcerpt")[0].split()) <= C.TARGET_MAX_TOKENS + 1, \
-        "span-scaled head escaped TARGET_MAX_TOKENS"
+    import inspect as _iP
+    assert list(_iP.signature(_EP.prompt).parameters) == ["self", "span_text"], \
+        "prompt() takes something other than the span"
+    span = " ".join(f"s{i}" for i in range(12))
+    built = _EP.prompt(_pool, span)
+    for q_len in (4, C.TARGET_MAX_TOKENS, 8 * C.TARGET_MAX_TOKENS):
+        question = " ".join(f"q{i}" for i in range(q_len))
+        assert "q0" not in built, "the input leaked into the expert prompt"
+        assert question.split()[0] not in built.replace(span, ""), "input tokens reached the expert"
+    assert span in built, "the span itself is missing from the prompt"
+    # prompt length is bounded by the SPAN, so k experts cost T between them, not k*T
+    grew = _EP.prompt(_pool, " ".join(f"s{i}" for i in range(120)))
+    assert len(grew) > len(built), "prompt does not track the span"
+    assert len(built.split()) - len(span.split()) == len(grew.split()) - 120, \
+        "prompt carries a length that is not the span"
     print(f"router        OK  (anchors ordered, spans within input; training shares "
           f"{sorted(s.n_tokens for s in probe_spans)}; span_max clamps the share)")
 

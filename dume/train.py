@@ -261,7 +261,7 @@ class System:
             spans[sel.eid] = span_text
             t_run = time.time()
             budget = self.alloc.budget(sel.n_tokens, sel.n_tokens, share)
-            texts[sel.eid], _ = self.pool.run(sel.eid, span_text, s.prompt, budget=budget)
+            texts[sel.eid], _ = self.pool.run(sel.eid, span_text, budget=budget)
             secs[sel.eid] = time.time() - t_run
             emitted[sel.eid] = len(self.pool.tok.encode(texts[sel.eid])) if texts[sel.eid] else 0
         sc = score(self.central, s.prompt, y, plan.w, texts, self.rel)
@@ -405,7 +405,7 @@ class System:
             return None
         eid = sel.eid
         greedy, d_g = texts[eid], sc.deltas[eid]
-        sampled = self.pool.sample(eid, spans[eid], s.prompt,
+        sampled = self.pool.sample(eid, spans[eid],
                                    budget=len(self.pool.tok.encode(greedy)) or None)
         if not sampled or sampled == greedy:
             return None
@@ -422,7 +422,7 @@ class System:
         # No rho on the advantage, scalar or per-token: d is a plain mean over
         # real y, and rho is a deployment deduction, not a training one. The
         # delta already carries reliability on its own (see reward.py header).
-        return self.pool.update(eid, self.pool.prompt(spans[eid], s.prompt), [greedy, sampled],
+        return self.pool.update(eid, self.pool.prompt(spans[eid]), [greedy, sampled],
                                 [d_g - m, d_s - m])
 
     def _imitate(self, sels, spans, texts, sc, s) -> Optional[float]:
@@ -455,7 +455,7 @@ class System:
             return None                       # real data says this note hurt
         if sc.deltas[best.eid] <= sc.deltas.get(trial.eid, -1e9):
             return None                       # nothing superior to imitate
-        return self.pool.update(trial.eid, self.pool.prompt(spans[trial.eid], s.prompt),
+        return self.pool.update(trial.eid, self.pool.prompt(spans[trial.eid]),
                                 [texts[best.eid]], [1.0])
 
     def dead_time(self, prompt: str, delivered: str) -> Dict[str, float]:
@@ -499,7 +499,7 @@ class System:
             if sel.eid not in resident:
                 continue
             span_text = self.gate.tok.decode(plan.ids[sel.start:sel.end])
-            text, _ = self.pool.run(sel.eid, span_text, prompt,
+            text, _ = self.pool.run(sel.eid, span_text,
                                     budget=self.alloc.budget(sel.n_tokens, sel.n_tokens, share))
             st = self.standing.score(sel.eid, sel.cid)
             notes.append((st if st is not None else -1e9, text))
