@@ -840,7 +840,7 @@ def main() -> int:
     # only the mean, and the count a running mean needs -- no per-run history
     stored = _json.loads(jar.read_text())
     assert set(stored) == {"runs", "baseline", "volatility", "gap_up", "gap_down",
-                           "accel_up", "accel_down"}, \
+                           "accel_up", "accel_down", "u_mean", "u_dev"}, \
         f"the jar grew beyond the mean: {sorted(stored)}"
     assert stored["runs"] == 3, stored["runs"]
     # and it lands OUTSIDE state/dume, which a clean start moves aside
@@ -901,9 +901,13 @@ def main() -> int:
     # ...but ONLY when tightening. Coming back up stays on the measured pace.
     back = hard.k_thermal(4.0, 1.0)
     assert back - hard_k < 0.5 * (4.0 - hard_k), f"k snapped back up after a shock: {hard_k:.2f} -> {back:.2f}"
-    # no k value is baked in: the same shock on a different bound scales with it
+    # no k value is baked in. k_max enters as the BASE of k_max**(1/(1+p)) and
+    # nowhere else, so squaring the bound squares the answer -- exactly, on the
+    # same pressure. An absolute margin was the wrong shape here: at a pressure
+    # this high both answers sit near 1 and any margin is a number with nothing
+    # behind it (it broke on 2.87 vs 2.90 once already).
     big_k, _ = shocked(50, 5, k_max=16.0)
-    assert big_k > hard_k + 0.5, f"k_max ignored: {big_k:.2f} vs {hard_k:.2f}"
+    assert abs(big_k - hard_k ** 2) < 1e-9, f"k_max ignored: {big_k:.4f} vs {hard_k ** 2:.4f}"
 
     # k RAMPS. The rate is the machine's own step interval, read per direction:
     # "levels per move" is the constant 1 on an ordinal 0-3 signal and collapses
@@ -937,6 +941,76 @@ def main() -> int:
     assert first.gap_up == 0.0, f"the first step invented an interval: {first.gap_up}"
     assert first.k_thermal(4.0, 2.0) < 2.01, \
         f"a cold regulator ramped into its first jump instead of snapping: k {first.k_thermal(4.0, 2.0):.3f}"
+    # k IS SECOND ORDER. It has a velocity, so a k already moving carries that
+    # into the next read; the first-order ramp met every target from rest and
+    # paid the same fraction of a gap it had been closing for an hour.
+    def mover(prime):
+        r = ThermalRegulator().seed(1.0, 0.0, 10.0, 10.0)
+        for _ in range(3):
+            r.observe(1.0)
+        r.k, r.v = 1.0, 0.0
+        if prime:
+            for _ in range(5):          # build speed toward the target...
+                r.k_thermal(4.0, 1.0)
+            r.k = 1.0                   # ...then put k back, keeping the velocity
+        return r.k_thermal(4.0, 1.0)
+    assert mover(True) > mover(False) + 0.1, \
+        f"k has no momentum; still first order: {mover(True):.3f} vs {mover(False):.3f}"
+
+    # DAMPING IS THE CURRENT RATE OF CHANGE AGAINST THIS MACHINE'S OWN LINE,
+    # not the absolute temperature. A machine getting jumpy stops chasing its
+    # target and holds still -- which is the whole of what k thrash was.
+    # Irregular intervals, so the learned line has a real spread to sit under.
+    def jumpy(tail):
+        r = ThermalRegulator()
+        for g in (12, 6, 14, 5, 13, 7, 11, 8, 12, 6, 14, 5):
+            for _ in range(g - 1):
+                r.observe(1.0)
+            r.observe(2.0)
+            r.observe(1.0)
+        for _ in range(tail - 1):
+            r.observe(1.0)
+        r.k_thermal(4.0, 1.0)
+        r.k, r.v = 4.0, 0.0             # start every arm from the same k
+        r.observe(2.0)
+        d = 4.0 ** (1.0 / (1.0 + r.pressure(2.0))) - 4.0
+        return r, r.urgency() / r.threshold(), (r.k_thermal(4.0, 2.0) - 4.0) / d
+    (_, r0, f0), (_, r1, f1), (_, r2, f2) = jumpy(10), jumpy(8), jumpy(6)
+    assert r0 < r1 < r2 < 1.0, f"the damping fixture did not stay under the line: {r0:.2f} {r1:.2f} {r2:.2f}"
+    assert f0 > f1 > f2, f"the rate of change did not damp: {f0:.4f} {f1:.4f} {f2:.4f}"
+    # ...and past the line the equation is abandoned outright, not damped harder
+    over, ratio, frac = jumpy(4)
+    assert ratio > 1.0 and over.out_of_hand(2.0), f"the fixture did not cross the line: {ratio:.2f}"
+    assert frac > 0.99, f"out of hand was ramped into instead of snapped: {frac:.3f} of the gap"
+
+    # and it does not RING. The textbook 2*sqrt(kappa) is underdamped for this
+    # discretisation (measured: 4 turning points, 2.8% overshoot at kappa=1);
+    # kappa + 2*sqrt(kappa) is where its eigenvalues turn real.
+    ring = ThermalRegulator().seed(0.0, 0.0, 1.0, 1.0)      # kappa 1: stiffest spring
+    for _ in range(3):
+        ring.observe(1.0)
+    ring.k, ring.v = 1.0, 0.0
+    tgt = 4.0 ** (1.0 / (1.0 + ring.pressure(1.0)))
+    assert tgt < 3.9, "the ring fixture is pinned at k_max; the clamp would hide a ring"
+    ks = [ring.k_thermal(4.0, 1.0) for _ in range(30)]
+    assert max(ks) <= tgt + 1e-9, f"k overshot its target: {max(ks):.6f} vs {tgt:.6f}"
+    assert sum(1 for a, b, c in zip(ks, ks[1:], ks[2:]) if (b - a) * (c - b) < 0) == 0, "k is ringing"
+    assert ks[-1] > tgt - 1e-6, f"k never arrived: {ks[-1]:.6f} vs {tgt:.6f}"
+
+    # TWO COMMANDS. Cold, the manual line is the whole of it: Apple's own
+    # critical level, which is not ours to learn our way out of.
+    nothing = ThermalRegulator()
+    assert nothing.threshold() is None, "a cold regulator invented an out-of-hand line"
+    assert not nothing.out_of_hand(ThermalRegulator.CRITICAL - 1.0), "the manual line fired below critical"
+    assert nothing.out_of_hand(ThermalRegulator.CRITICAL), "nothing was out of hand at critical"
+    # Once the machine has its own, that one leads -- a wild machine gets a
+    # high line and is not punished for being itself. The manual one stays as
+    # the floor underneath it.
+    wild, _, _ = jumpy(10)
+    assert wild.threshold() > 0.5, f"a wild machine learned no line: {wild.threshold():.3f}"
+    assert not wild.out_of_hand(2.0), "the learned line did not lead"
+    assert wild.out_of_hand(ThermalRegulator.CRITICAL), "the learned line overrode the manual one"
+
     print(f"thermal       OK  (normal re-learned in 400 reads; spike moves baseline <0.001; "
           f"on-schedule step free, early step {early.excess:.0f}x; k flips {flips(snap_k)} -> 0)")
     print("ALL CHECKS PASS")

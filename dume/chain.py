@@ -11,6 +11,7 @@ of an abstain guard, self-scoring accuracy.
 from __future__ import annotations
 
 import json
+import math
 from collections import deque
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
@@ -194,6 +195,10 @@ class ThermalRegulator:
     run at all, and its volatility is high, so a swinging machine is throttled
     hardest -- which is what it was throttled for."""
 
+    # NSProcessInfoThermalStateCritical. Apple's own number for "this machine
+    # is in trouble", not ours -- see out_of_hand().
+    CRITICAL = 3.0
+
     def __init__(self) -> None:
         self.n = 0.0
         self.baseline = 0.0       # mean level
@@ -215,7 +220,11 @@ class ThermalRegulator:
         self.accel_now = 0.0      # the LAST fractional change: what it is doing right now
         self.n_acc_up = 0.0
         self.n_acc_down = 0.0
-        self.k: Optional[float] = None   # the ramped k, carried between reads
+        self.u_mean = 0.0         # mean urgency PER STEP: this machine's normal surprise
+        self.u_dev = 0.0          # and its spread. together they are the out-of-hand line
+        self.n_u = 0.0
+        self.k: Optional[float] = None   # k, carried between reads
+        self.v = 0.0              # ...and its velocity. k is second order.
 
     def observe(self, level: float) -> None:
         level = float(level)
@@ -259,6 +268,7 @@ class ThermalRegulator:
             self.excess = 0.0
         self.n_up += 1.0
         self.since_up = 0.0
+        self._note_urgency()
 
     def _step_down(self) -> None:
         if self.n_down >= 1.0:
@@ -274,6 +284,7 @@ class ThermalRegulator:
             self.excess = 0.0
         self.n_down += 1.0
         self.since_down = 0.0
+        self._note_urgency()
 
     def urgency(self) -> float:
         """How far out of hand things are, from the two things that can say so.
@@ -295,6 +306,48 @@ class ThermalRegulator:
         Added, because a step can be early without the trend being bad and the
         trend can be bad without any single step standing out."""
         return self.excess + max(0.0, -self.accel_now)
+
+    def _note_urgency(self) -> None:
+        """The machine's own out-of-hand line, built from the same means.
+
+        Taken over STEPS, not over reads. Urgency only exists on a read where
+        the machine moved; averaged over every read it would sit near zero,
+        because most reads do not move, and then any step at all would look
+        extreme.
+
+        Mean plus mean-deviation -- the shape the baseline and volatility
+        already use. A machine whose steps normally arrive hot has a high line
+        and is not punished for being itself; a placid one has a low line and
+        a small surprise is enough."""
+        u = self.urgency()
+        if self.n_u >= 1.0:
+            self.u_dev += (abs(u - self.u_mean) - self.u_dev) / self.n_u
+        self.n_u += 1.0
+        self.u_mean += (u - self.u_mean) / self.n_u
+
+    def threshold(self) -> Optional[float]:
+        """The learned line, or None until there is a mean AND a spread."""
+        return self.u_mean + self.u_dev if self.n_u >= 2.0 else None
+
+    def out_of_hand(self, level: float) -> bool:
+        """Two commands, and the machine's own one leads.
+
+        LEARNED (Aman, 2026-09-21: "machine takes mean all along and use it
+        craft thresholds and we progress"). Once steps have been measured, this
+        machine's mean urgency plus its own spread is the line, and it moves
+        with the machine.
+
+        MANUAL, second in command ("the thresholds we put manually as third
+        party ... makes operator second in command"). A number we did not pick
+        and cannot learn our way out of: NSProcessInfoThermalStateCritical, the
+        level at which Apple itself says the machine is in trouble. It is the
+        whole of the line while the regulator is cold, before a single step has
+        been measured, and it stays afterwards as the floor the learned line is
+        not allowed to talk the machine out of."""
+        if level >= self.CRITICAL:
+            return True
+        t = self.threshold()
+        return t is not None and self.urgency() > t
 
     def pressure(self, level: Optional[float] = None) -> float:
         """How hard to throttle, in the units k_thermal takes its root in. Zero
@@ -319,41 +372,87 @@ class ThermalRegulator:
         return max(0.0, cur - self.baseline) * (1.0 + self.volatility + self.urgency())
 
     def k_thermal(self, k_max: float, level: Optional[float] = None) -> float:
-        """The device's k, RAMPED toward its target rather than snapped to it.
+        """k as a damped second-order system (Aman, 2026-09-21: "we have second
+        order differential equation on f(x) = k, and damping is temp ... as
+        tendency to get f(x) = 4").
 
-        The ramp rate is the rate this machine itself moves, per direction, and
-        the two are not assumed equal: k climbs back at the pace it COOLS and
-        falls at the pace it HEATS.
+            k'' = kappa * (target - k)  -  c * k'
 
-        The rate has to be read as an INTERVAL. macOS publishes the level as an
-        ordinal 0-3, so a move is always exactly one step and "levels per move"
-        is the constant 1 for every machine alive -- measured on the archived
-        run it gave rate_up = rate_down = 1.000 and the ramp degenerated back
-        into a snap. The interval between steps is where the speed actually
-        lives: one step per 50 reads is 1/50, one per 5 reads is ten times
-        that. Rate and gap are reciprocals, so this is the same quantity read
-        in the units the signal exists in.
+        A SPRING toward the target -- the standing tendency back to k_max that
+        the heat is what holds k away from -- and DAMPING set by temperature.
 
-        Until a direction has been seen there is no measured interval to ramp
-        at, so k snaps -- an unmeasured rate is not invented."""
+        The first-order ramp this replaces had no velocity. It could only
+        chase: a k that had been falling all run met each new target as if
+        from rest, and every read paid the same fraction of a gap it had
+        already been closing for an hour. With a velocity, a machine already
+        on its way down carries that into the next read, and one holding still
+        does not twitch.
+
+        Neither coefficient is picked:
+
+          KAPPA -- the measured rate, per direction. 1/gap_down going up and
+          1/gap_up going down, so k climbs back at the pace this machine cools
+          and falls at the pace it heats. Rate and gap are reciprocals; the
+          interval is the only place the speed exists, since macOS publishes an
+          ordinal 0-3 and "levels per move" is the constant 1 on every machine
+          alive.
+
+          C -- critical damping for that spring, PLUS how fast the machine is
+          moving right now measured against its own line.
+
+          The critical part is derived, not chosen. Damping is applied
+          implicitly, v <- (v + kappa*d) / (1 + c), because the explicit
+          v -= c*v form diverges at exactly the c this design produces; that
+          discretisation is non-oscillatory for c >= kappa + 2*sqrt(kappa),
+          not the textbook 2*sqrt(kappa), which leaves it underdamped and
+          rings (measured: 4 turning points and a 2.8% overshoot at kappa=1).
+          Below the line k oscillates around its own target forever, which on
+          a machine that is behaving is the least excusable place to thrash.
+
+          The rest is the temperature term (Aman, 2026-09-21: "damping term is
+          current rate of change in comparison the mean threshold"). Not the
+          absolute level -- the CURRENT rate of change over the line this
+          machine learned for itself, urgency / threshold. It is 0 for a
+          machine moving at its own usual pace, rises to 1 at the line, and
+          past the line there is no damping question left because the equation
+          is abandoned. So a machine getting jumpy stops chasing its target
+          and holds still, which is the whole of what k thrash was.
+
+        A direction with no measured interval has no equation to run, so k
+        snaps. An unmeasured rate is not invented, and a regulator that has
+        never seen the machine move has no business being gentle with it.
+
+        k is clamped into [1, k_max] with the velocity zeroed at the wall: a
+        spring that keeps its momentum at a limit stores energy and rebounds,
+        and this one would rebound to more experts than the RAM holds."""
+        lvl = float(self.last if level is None else level)
         target = float(k_max) ** (1.0 / (1.0 + self.pressure(level)))
         if self.k is None:
-            self.k = target
+            self.k, self.v = target, 0.0
             return self.k
         d = target - self.k
+        if d < 0.0 and self.out_of_hand(lvl):
+            # OUT OF HAND: the equation does not apply. It describes a machine
+            # drifting around its operating point, and this one is not. Snap,
+            # and kill the velocity so the spring cannot carry the overshoot
+            # back out. Tightening only -- a machine is allowed to be quick to
+            # protect itself and slow to trust that it is safe.
+            self.k, self.v = target, 0.0
+            return self.k
         gap = self.gap_down if d > 0 else self.gap_up   # rising k <=> the machine cooled
-        w = 1.0 if gap <= 0.0 else min(1.0, 1.0 / gap)
-        if d < 0:
-            # TIGHTENING ONLY. A radical departure is not ramped into: the
-            # ramp fraction rises with excess, and excess is already the ratio
-            # by which the step beat this machine's own interval, so a step ten
-            # times early carries w to 0.9 and one far past that snaps outright.
-            # Relaxing back up stays on the measured cooling pace regardless --
-            # a machine is allowed to be quick to protect itself and slow to
-            # trust that it is safe.
-            u = self.urgency()
-            w = max(w, u / (1.0 + u))
-        self.k += w * d
+        if gap <= 0.0:
+            self.k, self.v = target, 0.0
+            return self.k
+        kappa = min(1.0, 1.0 / gap)
+        t = self.threshold()
+        heat = self.urgency() / t if t else 0.0     # 0 at its own pace, 1 at the line
+        c = kappa + 2.0 * math.sqrt(kappa) + heat
+        self.v = (self.v + kappa * d) / (1.0 + c)
+        self.k += self.v
+        if self.k > k_max:
+            self.k, self.v = float(k_max), 0.0
+        elif self.k < 1.0:
+            self.k, self.v = 1.0, 0.0
         return self.k
 
     def state(self) -> Dict[str, float]:
@@ -363,11 +462,15 @@ class ThermalRegulator:
                 "accel_up": self.accel_up, "accel_down": self.accel_down,
                 "accel_now": self.accel_now,
                 "urgency": self.urgency(),
+                "u_mean": self.u_mean, "u_dev": self.u_dev,
+                "threshold": float(self.threshold() or 0.0),
+                "v": self.v,
                 "k": float(self.k if self.k is not None else 0.0)}
 
     def seed(self, baseline: float = 0.0, volatility: float = 0.0,
              gap_up: float = 0.0, gap_down: float = 0.0,
-             accel_up: float = 0.0, accel_down: float = 0.0, **_) -> "ThermalRegulator":
+             accel_up: float = 0.0, accel_down: float = 0.0,
+             u_mean: float = 0.0, u_dev: float = 0.0, **_) -> "ThermalRegulator":
         """A SOFT prior from what previous runs measured on this machine.
 
         A cold regulator knows nothing, so it spends its first reads throttling
@@ -398,6 +501,12 @@ class ThermalRegulator:
             self.accel_up, self.n_acc_up = float(accel_up), 1.0
         if gap_down > 0:
             self.accel_down, self.n_acc_down = float(accel_down), 1.0
+        # the out-of-hand line, same one observation's worth. It needs a spread
+        # as well as a mean, so it comes back only once this run has taken a
+        # step of its own: a threshold nothing here has confirmed does not get
+        # to fire on its own authority.
+        if u_dev > 0:
+            self.u_mean, self.u_dev, self.n_u = float(u_mean), float(u_dev), 1.0
         return self
 
 
@@ -453,7 +562,8 @@ def thermal_prior(log: str) -> Optional[Dict[str, float]]:
 # Acceleration needs this: 0.0 accel means "steps at a steady rate", a real
 # reading, where 0.0 gap means "never stepped".
 _PRIOR_FIELDS = {"baseline": "n", "volatility": "n", "gap_up": "n_up",
-                 "gap_down": "n_down", "accel_up": "n_acc_up", "accel_down": "n_acc_down"}
+                 "gap_down": "n_down", "accel_up": "n_acc_up", "accel_down": "n_acc_down",
+                 "u_mean": "n_u", "u_dev": "n_u"}
 
 
 def _prior_path() -> Path:

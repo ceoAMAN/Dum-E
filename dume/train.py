@@ -461,7 +461,10 @@ class System:
         rec["thermal_accel_up"] = ts["accel_up"]
         rec["thermal_accel_down"] = ts["accel_down"]
         rec["thermal_urgency"] = ts["urgency"]
+        rec["thermal_thresh"] = ts["threshold"]   # the learned out-of-hand line
+        rec["thermal_u_dev"] = ts["u_dev"]
         rec["k_ramped"] = ts["k"]
+        rec["k_v"] = ts["v"]                      # k is second order: this is its velocity
         self.health.put(**rec, clock=self.clock, active_mb=active_mb())
         self.health.tick(self.standing.total_n(), self.rel, self.size, self.mig)
         d = " ".join(f"e{sel.eid}{'*' if sel.trial else ''}:{sc.deltas.get(sel.eid, float('nan')):+.3f}" for sel in sels)
