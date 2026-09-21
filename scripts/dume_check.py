@@ -560,6 +560,31 @@ def main() -> int:
     assert len(rt._spans([(3, 0, False)], assign_t, T, True, cycles=9)) == 1, \
         "cycles leaked into the probe (training) path"
     rt.sched = SimpleNamespace(span_max=1 << 30)
+    # THE ORIENTATION HEAD IS BOUNDED BY THE SPAN, not by a flat constant. A flat
+    # ceiling only bit on questions longer than it, and 80% of live inputs are
+    # shorter — so the head WAS the whole question and the span below it was a
+    # re-print of text already there. The invariant: an expert never reads more
+    # than twice its own span, so the whole input cannot ride along at k >= 2.
+    class _Tok:                                   # words as tokens; enough to pin arithmetic
+        def encode(self, s): return s.split()
+        def decode(self, t): return " ".join(t)
+    _pool = SimpleNamespace(tok=_Tok())
+    from dume.models import ExpertPool as _EP
+    q_words = 40
+    question = " ".join(f"q{i}" for i in range(q_words))
+    for span_len in (1, 4, 10, 40):
+        span = " ".join(f"s{i}" for i in range(span_len))
+        built = _EP.prompt(_pool, span, question)
+        head = built.split("Question under consideration:\n")[1].split("\n\nExcerpt")[0]
+        n_head = len([w for w in head.split() if w != "..."])
+        assert n_head <= span_len, f"head {n_head} outran its span {span_len}"
+        assert ("..." in head) == (q_words > n_head), "truncation was not signalled"
+    # and the memory bound survives: a long span cannot buy an unbounded head
+    long_q = " ".join(f"q{i}" for i in range(4 * C.TARGET_MAX_TOKENS))
+    long_span = " ".join(f"s{i}" for i in range(4 * C.TARGET_MAX_TOKENS))
+    head = _EP.prompt(_pool, long_span, long_q).split("Question under consideration:\n")[1]
+    assert len(head.split("\n\nExcerpt")[0].split()) <= C.TARGET_MAX_TOKENS + 1, \
+        "span-scaled head escaped TARGET_MAX_TOKENS"
     print(f"router        OK  (anchors ordered, spans within input; training shares "
           f"{sorted(s.n_tokens for s in probe_spans)}; span_max clamps the share)")
 

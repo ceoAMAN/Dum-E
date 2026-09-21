@@ -528,12 +528,24 @@ class ExpertPool:
         system = ("You are a domain specialist. Analyse the excerpt and give the single key "
                   "insight another model should use to answer. Be concise. Do not answer as if "
                   "you were the user, and do not invent facts that are not present.")
-        # ORIENTATION ONLY, bounded. Previously the whole question rode along with
-        # every span, which (a) made apex-nadir's allocation meaningless — the expert
-        # saw the entire input regardless of its span — and (b) left the sequence the
-        # backward pass runs over unbounded, at ~12 MB per prompt token.
+        # ORIENTATION ONLY, bounded BY THE SPAN. Previously the whole question rode
+        # along with every span, which (a) made apex-nadir's allocation meaningless —
+        # the expert saw the entire input regardless of its span — and (b) left the
+        # sequence the backward pass runs over unbounded, at ~12 MB per prompt token.
+        #
+        # A flat TARGET_MAX_TOKENS ceiling only fixed (a) for questions LONGER than
+        # it. Measured on the live pool, 80% of inputs are <= 128 tokens, so for four
+        # inputs in five the "head" was the entire question and the span below it was
+        # a slice of text already printed in full above — 84-93% of the prompt was
+        # identical across the k experts and clone_frac sat at 0.30.
+        #
+        # Capping the head at the span restores the invariant for every input size:
+        # with k experts each holding T/k tokens, an expert reads at most 2T/k of T,
+        # so the whole input can never ride along while k >= 2. Orientation never
+        # outweighs the material it is orienting.
         q = self.tok.encode(question)
-        head = self.tok.decode(q[:C.TARGET_MAX_TOKENS]) + (" ..." if len(q) > C.TARGET_MAX_TOKENS else "")
+        cap = max(1, min(len(self.tok.encode(span_text)), C.TARGET_MAX_TOKENS))
+        head = self.tok.decode(q[:cap]) + (" ..." if len(q) > cap else "")
         user = f"Question under consideration:\n{head}\n\nExcerpt assigned to you:\n{span_text}"
         msgs = [{"role": "system", "content": system}, {"role": "user", "content": user}]
         tmpl = getattr(self.tok, "apply_chat_template", None)
