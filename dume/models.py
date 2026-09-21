@@ -227,6 +227,45 @@ class Gate:
         mx.eval(h)
         return np.asarray(h.astype(mx.float32))
 
+    def summarise(self, ids: List[int], budget: int) -> str:
+        """A bounded map of the WHOLE input, for experts that only ever see a slice.
+
+        THE GATE WRITES IT, not Central and not an expert (Aman, 2026-09-21). It
+        is the only component that reads all of T already — the routing geometry
+        needs the full hidden states — so the prefill is a pass it was going to
+        make anyway, and it is the smallest model in the stack. It is also FROZEN,
+        so with greedy decoding the summary is a pure function of the input: the
+        same row yields the same context on every epoch, and experts train against
+        a stationary context rather than one that drifts as the pool learns. A
+        summary written by Central would move under their feet.
+
+        THE BUDGET IS APEX-NADIR'S, not a constant. `budget` is the SMALLEST span
+        the law allocated this batch, so the map can never outweigh the material
+        of even the most thinly-fed expert — the same invariant the span itself
+        obeys. Below EXPERT_GEN_TOKENS there is no summary at all: that is the
+        floor a note has to clear to say anything, and a two-token map costs a
+        full prefill to deliver nothing.
+
+        Returns "" when it cannot help, which every caller treats as "no context"
+        rather than as a failure."""
+        budget = int(budget)
+        if budget < C.EXPERT_GEN_TOKENS or not ids:
+            return ""
+        from mlx_lm import generate
+        body = self.tok.decode(list(ids))
+        msgs = [{"role": "system", "content": "Summarise what the document is about in one short sentence. "
+                                              "No preamble, no detail, no answer."},
+                {"role": "user", "content": body}]
+        tmpl = getattr(self.tok, "apply_chat_template", None)
+        text = (tmpl(msgs, tokenize=False, add_generation_prompt=True)
+                if tmpl and getattr(self.tok, "chat_template", None)
+                else f"{msgs[0]['content']}\n\n{body}\n")
+        try:
+            return generate(self.model, self.tok, prompt=text, max_tokens=budget).strip()
+        except Exception as e:                           # noqa: BLE001
+            print(f"[gate] summary failed: {e} — experts run without context")
+            return ""
+
     @staticmethod
     def _z(pooled: np.ndarray) -> mx.array:
         """Raw Qwen hidden states have magnitudes ~50+; a fresh head on them emits
@@ -524,7 +563,7 @@ class ExpertPool:
             self._opts[eid] = optim.Adam(learning_rate=C.LR)
         return self._opts[eid]
 
-    def prompt(self, span_text: str) -> str:
+    def prompt(self, span_text: str, context: str = "") -> str:
         system = ("You are a domain specialist. Analyse the excerpt and give the single key "
                   "insight another model should use to answer. Be concise. Do not answer as if "
                   "you were the user, and do not invent facts that are not present.")
@@ -547,7 +586,7 @@ class ExpertPool:
         # holds the input and assembles the notes. Prompt cost is now T across the
         # pool however large k grows, and the sequence the backward pass runs over is
         # bounded by the span, not by the input.
-        user = f"Excerpt:\n{span_text}"
+        user = f"{context}\n\nExcerpt:\n{span_text}" if context else f"Excerpt:\n{span_text}"
         msgs = [{"role": "system", "content": system}, {"role": "user", "content": user}]
         tmpl = getattr(self.tok, "apply_chat_template", None)
         if tmpl and getattr(self.tok, "chat_template", None):
@@ -564,17 +603,17 @@ class ExpertPool:
         n = max(C.EXPERT_GEN_TOKENS, int(budget)) if budget else C.EXPERT_GEN_TOKENS
         return generate(self._activate(eid), self.tok, prompt=prompt, max_tokens=n, **kw).strip()
 
-    def run(self, eid: int, span_text: str,
+    def run(self, eid: int, span_text: str, context: str = "",
             budget: Optional[int] = None) -> Tuple[str, float]:
         """Greedy analysis of the span. Returns (text, wall_seconds)."""
         t0 = time.perf_counter()
-        text = self._gen(eid, self.prompt(span_text), 0.0, budget)
+        text = self._gen(eid, self.prompt(span_text, context), 0.0, budget)
         return text, time.perf_counter() - t0
 
-    def sample(self, eid: int, span_text: str,
+    def sample(self, eid: int, span_text: str, context: str = "",
                budget: Optional[int] = None) -> str:
         """The exploring candidate for self-imitation, at SAMPLE_TEMP."""
-        return self._gen(eid, self.prompt(span_text), C.SAMPLE_TEMP, budget)
+        return self._gen(eid, self.prompt(span_text, context), C.SAMPLE_TEMP, budget)
 
     def update(self, eid: int, prompt: str, texts: List[str], advantages: List[float]) -> Optional[float]:
         """Reward-weighted self-imitation: loss = sum_g A_g * CE(e_g | prompt).

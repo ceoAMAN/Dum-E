@@ -560,30 +560,53 @@ def main() -> int:
     assert len(rt._spans([(3, 0, False)], assign_t, T, True, cycles=9)) == 1, \
         "cycles leaked into the probe (training) path"
     rt.sched = SimpleNamespace(span_max=1 << 30)
-    # THE EXPERT SEES ITS FRAGMENT AND NOTHING ELSE. If the input rides along with
-    # every span then apex-nadir allocates labels, not budget: the pool costs k*T
-    # and dividing the input buys nothing. Pins that the prompt is a function of
-    # the span ALONE — same span, same prompt, whatever question it was cut from.
+    # THE EXPERT SEES ITS FRAGMENT PLUS A MAP IT CANNOT MISTAKE FOR MATERIAL.
+    # If the input rides along with every span then apex-nadir allocates labels,
+    # not budget: the pool costs k*T and dividing the input buys nothing. The
+    # orientation is allowed, but it is COMPRESSED (the gate writes it) and it is
+    # sized by the law, never by a constant.
     class _Tok:                                   # words as tokens; enough to pin the shape
         def encode(self, s): return s.split()
         def decode(self, t): return " ".join(t)
     _pool = SimpleNamespace(tok=_Tok())
     from dume.models import ExpertPool as _EP
+    from dume import train as _tr_mod
+    from dume.train import orientation as _orient
     import inspect as _iP
-    assert list(_iP.signature(_EP.prompt).parameters) == ["self", "span_text"], \
-        "prompt() takes something other than the span"
+    assert list(_iP.signature(_EP.prompt).parameters) == ["self", "span_text", "context"], \
+        "prompt() takes something other than the span and its context"
     span = " ".join(f"s{i}" for i in range(12))
-    built = _EP.prompt(_pool, span)
+    bare = _EP.prompt(_pool, span)
     for q_len in (4, C.TARGET_MAX_TOKENS, 8 * C.TARGET_MAX_TOKENS):
-        question = " ".join(f"q{i}" for i in range(q_len))
-        assert "q0" not in built, "the input leaked into the expert prompt"
-        assert question.split()[0] not in built.replace(span, ""), "input tokens reached the expert"
-    assert span in built, "the span itself is missing from the prompt"
-    # prompt length is bounded by the SPAN, so k experts cost T between them, not k*T
+        assert " ".join(f"q{i}" for i in range(q_len)).split()[0] not in bare.replace(span, ""), \
+            "input tokens reached the expert"
+    assert span in bare, "the span itself is missing from the prompt"
+    # prompt length tracks the SPAN, so k experts cost T between them, not k*T
     grew = _EP.prompt(_pool, " ".join(f"s{i}" for i in range(120)))
-    assert len(grew) > len(built), "prompt does not track the span"
-    assert len(built.split()) - len(span.split()) == len(grew.split()) - 120, \
-        "prompt carries a length that is not the span"
+    assert len(bare.split()) - 12 == len(grew.split()) - 120, "prompt carries a length that is not the span"
+    # THE POSITION LINE IS THE PART THAT DIFFERS. The old prompt re-printed the
+    # excerpt with no indication of where it sat, so the k prompts shared everything
+    # that carried meaning. Every expert's orientation must be distinct.
+    seen = {_orient("", i, 4, i * 12, (i + 1) * 12, 48) for i in range(4)}
+    assert len(seen) == 4, f"orientation did not differentiate the experts: {seen}"
+    assert all("of 48" in o for o in seen), "position is not stated in the input's own units"
+    withmap = _orient("a map", 0, 4, 0, 12, 48)
+    assert withmap.startswith("a map") and "Section 1 of 4" in withmap, "the map and the position do not compose"
+    # THE CONTEXT BUDGET IS APEX-NADIR'S SMALLEST ALLOCATION, and below the floor a
+    # note has to clear there is no map at all — a two-token summary costs a full
+    # prefill to say nothing. _Gate stands in for the real one: summarise() must
+    # refuse on the budget BEFORE it reaches the model.
+    from dume.models import Gate as _G
+    _gate = SimpleNamespace(tok=_Tok(), model=None)
+    assert _G.summarise(_gate, [1, 2, 3], C.EXPERT_GEN_TOKENS - 1) == "", "map generated below the note floor"
+    assert _G.summarise(_gate, [], C.TARGET_MAX_TOKENS) == "", "map generated for an empty input"
+    src_tr = _iP.getsource(_tr_mod.System._train_one)
+    src_an = _iP.getsource(_tr_mod.System.answer)
+    budget_call = "self.gate.summarise(plan.ids, min((x.n_tokens for x in"
+    assert budget_call in src_tr and budget_call in src_an, \
+        "the map is not sized by the smallest span the law allocated"
+    assert "orientation(summary," in src_tr and "orientation(summary," in src_an, \
+        "training and deployment do not build the context the same way"
     print(f"router        OK  (anchors ordered, spans within input; training shares "
           f"{sorted(s.n_tokens for s in probe_spans)}; span_max clamps the share)")
 

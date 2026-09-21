@@ -53,6 +53,21 @@ def _restored(obj, cls, *args):
     return obj
 
 
+def orientation(summary: str, i: int, n: int, start: int, end: int, T: int) -> str:
+    """What an expert is told about the input it cannot see.
+
+    Two parts, and NEITHER is a copy of anyone's span. `summary` is the gate's
+    bounded map of the whole input, shared by the batch. The position line is
+    free — the router already knows it — and it is the only part that DIFFERS
+    per expert, which is what the old prompt never supplied: it re-printed the
+    excerpt with no indication of where in the input it sat.
+
+    Position is stated in the same units apex-nadir allocates in, so an expert
+    can tell a 12-token slice of 51 from a 12-token slice of 2000."""
+    where = f"Section {i + 1} of {n}, tokens {start}-{end} of {T}."
+    return f"{summary}\n{where}" if summary else where
+
+
 class System:
     def __init__(self):
         self.gate = Gate()
@@ -256,12 +271,20 @@ class System:
         emitted: Dict[int, int] = {}
         secs: Dict[int, float] = {}
         share = self._context_share(len(sels), s.prompt, len(y))
-        for sel in sels:
+        # THE CONTEXT BUDGET IS APEX-NADIR'S SMALLEST ALLOCATION (Aman, 2026-09-21):
+        # deciding how many tokens an expert processes is what the law is for, so
+        # the map of the whole obeys it too. Taking the MINIMUM span rather than the
+        # mean means the map cannot outweigh the material of even the most thinly-fed
+        # expert — one summary per batch, small enough for every seat at the table.
+        ctxs: Dict[int, str] = {}
+        summary = self.gate.summarise(plan.ids, min((x.n_tokens for x in sels), default=0))
+        for i, sel in enumerate(sels):
             span_text = self.gate.tok.decode(plan.ids[sel.start:sel.end])
             spans[sel.eid] = span_text
+            ctxs[sel.eid] = orientation(summary, i, len(sels), sel.start, sel.end, len(plan.ids))
             t_run = time.time()
             budget = self.alloc.budget(sel.n_tokens, sel.n_tokens, share)
-            texts[sel.eid], _ = self.pool.run(sel.eid, span_text, budget=budget)
+            texts[sel.eid], _ = self.pool.run(sel.eid, span_text, ctxs[sel.eid], budget=budget)
             secs[sel.eid] = time.time() - t_run
             emitted[sel.eid] = len(self.pool.tok.encode(texts[sel.eid])) if texts[sel.eid] else 0
         sc = score(self.central, s.prompt, y, plan.w, texts, self.rel)
@@ -299,11 +322,11 @@ class System:
                 if sel.eid in sc.deltas and sel.eid in probe_set:
                     self.alloc.observe(sel.n_tokens, sc.deltas[sel.eid], secs.get(sel.eid))
             rec["gate_loss"] = self.router.gate_step(plan, sc.deltas)
-            loss = self._expert_update(self._update_target(plan, sels, sc), spans, texts, sc, s, y)
+            loss = self._expert_update(self._update_target(plan, sels, sc), spans, ctxs, texts, sc, s, y)
             self.health.update_seen(loss)
             if loss is not None:
                 rec["expert_loss"] = loss
-            imit = self._imitate(sels, spans, texts, sc, s)
+            imit = self._imitate(sels, spans, ctxs, texts, sc, s)
             if imit is not None:
                 rec["imitate_loss"] = imit
         # Central trains on the real answer, at FULL weight, on EVERY sample that
@@ -396,7 +419,7 @@ class System:
         for c in range(self.geo.C):
             self.geo.set_tau(c, self.size.next_tau(c, float(self.geo.tau[c])))
 
-    def _expert_update(self, sel, spans, texts, sc, s, y) -> Optional[float]:
+    def _expert_update(self, sel, spans, ctxs, texts, sc, s, y) -> Optional[float]:
         """Reward-weighted self-imitation on the home expert: a second sampled
         candidate, advantage in the reward's own units, CE on its own text signed
         by which one helped Central more. Returns None when nothing ran, so a
@@ -405,7 +428,7 @@ class System:
             return None
         eid = sel.eid
         greedy, d_g = texts[eid], sc.deltas[eid]
-        sampled = self.pool.sample(eid, spans[eid],
+        sampled = self.pool.sample(eid, spans[eid], ctxs[eid],
                                    budget=len(self.pool.tok.encode(greedy)) or None)
         if not sampled or sampled == greedy:
             return None
@@ -422,10 +445,10 @@ class System:
         # No rho on the advantage, scalar or per-token: d is a plain mean over
         # real y, and rho is a deployment deduction, not a training one. The
         # delta already carries reliability on its own (see reward.py header).
-        return self.pool.update(eid, self.pool.prompt(spans[eid]), [greedy, sampled],
+        return self.pool.update(eid, self.pool.prompt(spans[eid], ctxs[eid]), [greedy, sampled],
                                 [d_g - m, d_s - m])
 
-    def _imitate(self, sels, spans, texts, sc, s) -> Optional[float]:
+    def _imitate(self, sels, spans, ctxs, texts, sc, s) -> Optional[float]:
         """Dormant distillation. The trial seat learns the TEXT of the best-scoring
         seated expert on the same input: idle capacity improving on somebody
         else's gradient, which is the only way a dormant expert climbs out of
@@ -455,7 +478,7 @@ class System:
             return None                       # real data says this note hurt
         if sc.deltas[best.eid] <= sc.deltas.get(trial.eid, -1e9):
             return None                       # nothing superior to imitate
-        return self.pool.update(trial.eid, self.pool.prompt(spans[trial.eid]),
+        return self.pool.update(trial.eid, self.pool.prompt(spans[trial.eid], ctxs[trial.eid]),
                                 [texts[best.eid]], [1.0])
 
     def dead_time(self, prompt: str, delivered: str) -> Dict[str, float]:
@@ -495,11 +518,15 @@ class System:
         resident = self.sched.ensure([sel.eid for sel in plan.selections])
         share = self._context_share(len(plan.selections), prompt, max_tokens)
         notes: List[tuple] = []
-        for sel in plan.selections:
-            if sel.eid not in resident:
-                continue
+        live = [sel for sel in plan.selections if sel.eid in resident]
+        # the deployment context is built EXACTLY as the training one is: an expert
+        # that trained with a map and a position must not meet a bare span in
+        # production. Same budget rule, same gate, same greedy decode.
+        summary = self.gate.summarise(plan.ids, min((x.n_tokens for x in live), default=0))
+        for i, sel in enumerate(live):
             span_text = self.gate.tok.decode(plan.ids[sel.start:sel.end])
-            text, _ = self.pool.run(sel.eid, span_text,
+            ctx = orientation(summary, i, len(live), sel.start, sel.end, len(plan.ids))
+            text, _ = self.pool.run(sel.eid, span_text, ctx,
                                     budget=self.alloc.budget(sel.n_tokens, sel.n_tokens, share))
             st = self.standing.score(sel.eid, sel.cid)
             notes.append((st if st is not None else -1e9, text))
