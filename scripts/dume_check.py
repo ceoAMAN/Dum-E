@@ -762,6 +762,39 @@ def main() -> int:
     assert early.excess > 3.0, f"an early step was not penalised: {early.excess:.3f}"
     assert early.pressure(2.0) > 3 * on_time.pressure(2.0), "early and on-time cost the same"
 
+    # CROSS-RUN. The regulator learns a machine, and the machine outlives the
+    # run. ONLY THE MEAN is kept -- folded once per finished run so a long run
+    # and a short one weigh the same, and stored beside state/dume rather than
+    # inside it, because a clean start wipes the weights and the clock, not
+    # what the machine is.
+    from dume.chain import fold_prior, load_prior
+    import tempfile, json as _json
+    jar = Path(tempfile.mkdtemp()) / "p.json"
+    assert load_prior(jar) is None, "an empty jar produced a prior"
+
+    def finished(baseline, gap_up, gap_down):
+        r = ThermalRegulator()
+        r.baseline, r.gap_up, r.gap_down = baseline, gap_up, gap_down
+        return fold_prior(r, jar)
+    finished(1.0, 50.0, 0.0)
+    m2 = finished(2.0, 10.0, 30.0)
+    assert abs(m2["baseline"] - 1.5) < 1e-9, f"not a mean over runs: {m2['baseline']}"
+    assert abs(m2["gap_up"] - 30.0) < 1e-9, f"not a mean over runs: {m2['gap_up']}"
+    # a run that never stepped contributes NOTHING to that interval: no
+    # observation is not an interval of zero.
+    m3 = finished(0.0, 0.0, 0.0)
+    assert abs(m3["gap_up"] - 30.0) < 1e-9, f"a run with no steps dragged the mean: {m3['gap_up']}"
+    assert abs(m3["baseline"] - 1.0) < 1e-9, f"baseline is not a mean over runs: {m3['baseline']}"
+    # only the mean, and the count a running mean needs -- no per-run history
+    stored = _json.loads(jar.read_text())
+    assert set(stored) == {"runs", "baseline", "volatility", "gap_up", "gap_down"}, \
+        f"the jar grew beyond the mean: {sorted(stored)}"
+    assert stored["runs"] == 3, stored["runs"]
+    # and it lands OUTSIDE state/dume, which a clean start moves aside
+    from dume.chain import _prior_path
+    assert Path(C.STATE_DIR) not in _prior_path().parents and _prior_path().parent == Path(C.STATE_DIR).parent, \
+        f"the cross-run mean would be wiped by a clean start: {_prior_path()}"
+
     # SEEDING. A cold regulator spends its first reads learning a normal that
     # the previous run already measured -- k_thermal was 2.758 at the archived
     # run's first health record and did not reach 3.9 until clock 12k. The
@@ -824,8 +857,9 @@ def main() -> int:
     # the ramp back into a snap (measured: rate_up = rate_down = 1.000).
     # steps ON SCHEDULE: no radicality, so this isolates the ramp itself.
     seq = ([1.0] * 99 + [2.0]) * 7
-    def replay(ramped):
-        r = ThermalRegulator(); out = []
+    def replay(ramped, seeded=True):
+        r = ThermalRegulator().seed(1.0, 0.0, 100.0, 100.0) if seeded else ThermalRegulator()
+        out = []
         for l in seq:
             r.observe(l)
             out.append(r.k_thermal(4.0, l) if ramped else 4.0 ** (1.0 / (1.0 + r.pressure(l))))
@@ -837,6 +871,19 @@ def main() -> int:
     assert flips(ramp_k) == 0, f"k still snapping: {flips(ramp_k)} changes"
     assert rr.gap_up > 2.0 and rr.gap_down > 2.0, f"intervals collapsed: {rr.gap_up} {rr.gap_down}"
     assert rr.excess < 0.01, f"the on-schedule fixture drifted off schedule: excess {rr.excess:.3f}"
+    # ...and the ramp is something a regulator EARNS. Cold, it has no interval
+    # to ramp along, so it snaps: the first step in a direction measures time
+    # since boot, not time between steps, and must not be recorded as a gap.
+    cold_k, cr = replay(True, seeded=False)
+    assert flips(cold_k) > 0, "a cold regulator ramped on a rate it had never measured"
+    first = ThermalRegulator()
+    for _ in range(20):
+        first.observe(1.0)
+    first.k_thermal(4.0, 1.0)
+    first.observe(2.0)
+    assert first.gap_up == 0.0, f"the first step invented an interval: {first.gap_up}"
+    assert first.k_thermal(4.0, 2.0) < 2.01, \
+        f"a cold regulator ramped into its first jump instead of snapping: k {first.k_thermal(4.0, 2.0):.3f}"
     print(f"thermal       OK  (normal re-learned in 400 reads; spike moves baseline <0.001; "
           f"on-schedule step free, early step {early.excess:.0f}x; k flips {flips(snap_k)} -> 0)")
     print("ALL CHECKS PASS")

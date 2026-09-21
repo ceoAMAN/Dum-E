@@ -10,7 +10,9 @@ of an abstain guard, self-scoring accuracy.
 """
 from __future__ import annotations
 
+import json
 from collections import deque
+from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
 import numpy as np
@@ -216,14 +218,26 @@ class ThermalRegulator:
             d = level - self.last
             self.volatility += (abs(d) - self.volatility) / max(self.n, 1.0)
             if d > 0:
-                self.excess = max(0.0, self.gap_up / self.since_up - 1.0) if self.gap_up else 0.0
+                # The FIRST step in a direction yields no interval: since_up
+                # measures time since boot, not time between steps. Recording
+                # it invents a gap out of how long the run happened to be calm,
+                # and that gap then RAMPS the very reaction a cold regulator
+                # most needs -- measured, it turned a first jump into k 3.905
+                # where an unmeasured direction snaps to 2.001.
+                if self.n_up >= 1.0:
+                    self.excess = max(0.0, self.gap_up / self.since_up - 1.0) if self.gap_up else 0.0
+                    self.gap_up += (self.since_up - self.gap_up) / self.n_up
+                else:
+                    self.excess = 0.0
                 self.n_up += 1.0
-                self.gap_up += (self.since_up - self.gap_up) / self.n_up
                 self.since_up = 0.0
             elif d < 0:
-                self.excess = max(0.0, self.gap_down / self.since_down - 1.0) if self.gap_down else 0.0
+                if self.n_down >= 1.0:
+                    self.excess = max(0.0, self.gap_down / self.since_down - 1.0) if self.gap_down else 0.0
+                    self.gap_down += (self.since_down - self.gap_down) / self.n_down
+                else:
+                    self.excess = 0.0
                 self.n_down += 1.0
-                self.gap_down += (self.since_down - self.gap_down) / self.n_down
                 self.since_down = 0.0
             else:
                 self.excess = 0.0          # it did not move: nothing to react to
@@ -362,3 +376,57 @@ def thermal_prior(log: str) -> Optional[Dict[str, float]]:
             "gap_up": mean(gaps_up),
             "gap_down": mean(gaps_down),
             "n": float(len(lv))}
+
+
+# ---------------------------------------------------------------- cross-run
+# The regulator learns a machine, and the machine outlives the run. Everything
+# it learned used to die with state/dume, so every run paid the cold start
+# again: snapping on the first step, and k_thermal 2.758 at the archived run's
+# first health record against 4.0 once settled.
+#
+# ONLY THE MEAN is kept. Not the runs, not their series -- a running mean per
+# field with the count needed to keep it running, folded once per finished run
+# so every run weighs the same however long it was. The file sits beside
+# state/dume rather than inside it, because a clean start is meant to wipe the
+# weights and the clock, not what the machine is.
+_PRIOR_FIELDS = ("baseline", "volatility", "gap_up", "gap_down")
+
+
+def _prior_path() -> Path:
+    return Path(C.STATE_DIR).parent / "thermal_prior.json"
+
+
+def load_prior(path: Optional[Path] = None) -> Optional[Dict[str, float]]:
+    """The cross-run mean, or None if no run has contributed a field yet."""
+    try:
+        raw = json.loads(Path(path or _prior_path()).read_text())
+    except (OSError, ValueError):
+        return None
+    out = {f: float(raw[f][0]) for f in _PRIOR_FIELDS if raw.get(f, [0, 0])[1] >= 1}
+    out["runs"] = float(raw.get("runs", 0))
+    return out if len(out) > 1 else None
+
+
+def fold_prior(reg: "ThermalRegulator", path: Optional[Path] = None) -> Dict[str, float]:
+    """Fold ONE finished run's regulator into the cross-run mean.
+
+    A direction this run never stepped in contributes nothing to that field --
+    no observation is not an interval of zero, and averaging it in as one would
+    drag the mean toward a rate no machine has."""
+    p = Path(path or _prior_path())
+    try:
+        raw = json.loads(p.read_text())
+    except (OSError, ValueError):
+        raw = {}
+    out: Dict[str, object] = {"runs": float(raw.get("runs", 0)) + 1.0}
+    for f in _PRIOR_FIELDS:
+        v = float(getattr(reg, f))
+        m, n = raw.get(f, [0.0, 0.0])
+        if f in ("gap_up", "gap_down") and v <= 0.0:
+            out[f] = [float(m), float(n)]      # never stepped: contributes nothing
+            continue
+        n = float(n) + 1.0
+        out[f] = [float(m) + (v - float(m)) / n, n]
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(out, indent=1))
+    return {f: out[f][0] for f in _PRIOR_FIELDS}

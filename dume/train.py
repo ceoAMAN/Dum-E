@@ -20,7 +20,8 @@ import numpy as np
 from . import config as C
 from . import data, state
 from .alloc import AllocLaw
-from .chain import MigrationChains, SizeChains, ThermalRegulator, thermal_prior
+from .chain import (MigrationChains, SizeChains, ThermalRegulator, fold_prior,
+                    load_prior, thermal_prior)
 from .curriculum import Curriculum
 from .geometry import Geometry
 from .health import Health
@@ -61,6 +62,14 @@ def _seeded_regulator() -> ThermalRegulator:
     must not be overwritten by an older run's. The prior is worth ONE
     observation (see ThermalRegulator.seed), so it removes the warm-up without
     being able to outvote the present."""
+    p = load_prior()
+    if p:
+        r = ThermalRegulator().seed(p.get("baseline", 0.0), p.get("volatility", 0.0),
+                                    p.get("gap_up", 0.0), p.get("gap_down", 0.0))
+        print(f"[thermal] seeded from the cross-run mean of {p['runs']:.0f} run(s): "
+              f"baseline {p.get('baseline', 0.0):.3f} gap_up {p.get('gap_up', 0.0):.1f} "
+              f"gap_down {p.get('gap_down', 0.0):.1f} (worth 1)")
+        return r
     import glob
     logs = sorted(glob.glob("logs/archive/*/dume-cycle*.log") +
                   glob.glob("logs/archive/*/dume-*500k.log"))
@@ -269,6 +278,13 @@ class System:
             if self.batch % C.SAVE_EVERY == 0:
                 self.save()
         self.save()
+        # one finished run, one contribution to what this machine is. Folded
+        # here rather than in save(), which runs many times per run and would
+        # weigh a long run more than a short one.
+        if self.therm is not None and self.therm.n > 0:
+            m = fold_prior(self.therm)
+            print(f"[thermal] folded into the cross-run mean: baseline {m['baseline']:.3f} "
+                  f"gap_up {m['gap_up']:.1f} gap_down {m['gap_down']:.1f}")
         return {"batches": self.batch, "ran": self.batch - (target - int(n_batches)), "graded": admitted,
                 "not_graded": skipped, "sec": time.time() - t0,
                 "standing_n": self.standing.total_n(), "reliability_obs": self.rel.total_obs(),
