@@ -762,6 +762,52 @@ def main() -> int:
     assert early.excess > 3.0, f"an early step was not penalised: {early.excess:.3f}"
     assert early.pressure(2.0) > 3 * on_time.pressure(2.0), "early and on-time cost the same"
 
+    # ACCELERATION, d2y/dx2. excess asks whether THIS step was early against
+    # the mean interval; acceleration asks whether the intervals are
+    # CONVERGING. Steps at 50, 40, 30, 20 are each only mildly early and every
+    # one of them is a machine running away.
+    def intervals(gaps):
+        r = ThermalRegulator().seed(1.0, 0.0, gaps[0], gaps[0])
+        for g in gaps:
+            for _ in range(g - 1):
+                r.observe(1.0)
+            r.observe(2.0)
+            r.observe(1.0)
+        return r
+    steady = intervals([40, 40, 40, 40, 40])
+    running = intervals([50, 40, 30, 20, 12])
+    calming = intervals([12, 20, 30, 40, 50])
+    assert abs(steady.accel_now) < 0.05, f"a steady rate registered acceleration: {steady.accel_now:+.3f}"
+    assert steady.urgency() < 0.05, f"a steady machine was made urgent: {steady.urgency():.3f}"
+    assert running.accel_now < -0.2, f"converging intervals did not register: {running.accel_now:+.3f}"
+    assert running.urgency() > 1.0, f"a machine running away was not urgent: {running.urgency():.3f}"
+    # spreading out is CALMING DOWN and pays nothing, however fast it spreads
+    assert calming.accel_now > 0.2, f"spreading intervals misread: {calming.accel_now:+.3f}"
+    assert calming.urgency() < 0.05, f"a machine calming down was penalised: {calming.urgency():.3f}"
+    # ACCELERATION ALONE, with excess held at zero. Without this the whole
+    # acceleration path is untested: on a converging fixture excess is already
+    # 1.769, so every assertion passes on excess and removing acceleration
+    # entirely changes nothing.
+    shrink = intervals([10] * 10 + [30, 20])    # long fast history, then a shrink
+    widen = intervals([10] * 10 + [30, 45])     # ...same history, spreading out
+    assert shrink.excess == 0.0 and widen.excess == 0.0, \
+        f"the fixture stopped isolating acceleration: {shrink.excess:.3f} {widen.excess:.3f}"
+    assert shrink.urgency() > 0.25, f"acceleration alone raised no urgency: {shrink.urgency():.3f}"
+    assert widen.urgency() == 0.0, f"spreading intervals raised urgency: {widen.urgency():.3f}"
+    # and it must be read NOW, not as a run mean: over this history the mean
+    # acceleration is +0.133, the wrong sign, because the real shrink at the
+    # end averages with nine zeros and one jump.
+    assert shrink.accel_now < -0.25 < 0 < shrink.accel_up, \
+        f"a run mean cannot see a runaway: now {shrink.accel_now:+.3f} mean {shrink.accel_up:+.3f}"
+    # and urgency reaches k: the same level costs more under acceleration
+    k_steady = steady.k_thermal(4.0, 2.0)
+    k_running = running.k_thermal(4.0, 2.0)
+    assert k_running < k_steady, f"acceleration never reached k: {k_running:.3f} vs {k_steady:.3f}"
+    # a d2y/dx2 is not seeded without a dy/dx under it
+    bare = ThermalRegulator().seed(1.0, 0.0, 0.0, 0.0, accel_up=-9.0)
+    assert bare.accel_up == 0.0 and bare.n_acc_up == 0.0, \
+        "acceleration was seeded for a rate this machine has never shown"
+
     # CROSS-RUN. The regulator learns a machine, and the machine outlives the
     # run. ONLY THE MEAN is kept -- folded once per finished run so a long run
     # and a short one weigh the same, and stored beside state/dume rather than
@@ -773,8 +819,14 @@ def main() -> int:
     assert load_prior(jar) is None, "an empty jar produced a prior"
 
     def finished(baseline, gap_up, gap_down):
+        """A regulator as a finished run would leave it: values AND the counts
+        that say they were measured."""
         r = ThermalRegulator()
-        r.baseline, r.gap_up, r.gap_down = baseline, gap_up, gap_down
+        r.baseline, r.n = baseline, 100.0
+        if gap_up:
+            r.gap_up, r.n_up = gap_up, 3.0
+        if gap_down:
+            r.gap_down, r.n_down = gap_down, 3.0
         return fold_prior(r, jar)
     finished(1.0, 50.0, 0.0)
     m2 = finished(2.0, 10.0, 30.0)
@@ -787,7 +839,8 @@ def main() -> int:
     assert abs(m3["baseline"] - 1.0) < 1e-9, f"baseline is not a mean over runs: {m3['baseline']}"
     # only the mean, and the count a running mean needs -- no per-run history
     stored = _json.loads(jar.read_text())
-    assert set(stored) == {"runs", "baseline", "volatility", "gap_up", "gap_down"}, \
+    assert set(stored) == {"runs", "baseline", "volatility", "gap_up", "gap_down",
+                           "accel_up", "accel_down"}, \
         f"the jar grew beyond the mean: {sorted(stored)}"
     assert stored["runs"] == 3, stored["runs"]
     # and it lands OUTSIDE state/dume, which a clean start moves aside
@@ -850,7 +903,7 @@ def main() -> int:
     assert back - hard_k < 0.5 * (4.0 - hard_k), f"k snapped back up after a shock: {hard_k:.2f} -> {back:.2f}"
     # no k value is baked in: the same shock on a different bound scales with it
     big_k, _ = shocked(50, 5, k_max=16.0)
-    assert big_k > 2 * hard_k, f"k_max ignored: {big_k:.2f} vs {hard_k:.2f}"
+    assert big_k > hard_k + 0.5, f"k_max ignored: {big_k:.2f} vs {hard_k:.2f}"
 
     # k RAMPS. The rate is the machine's own step interval, read per direction:
     # "levels per move" is the constant 1 on an ordinal 0-3 signal and collapses

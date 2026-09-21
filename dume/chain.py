@@ -208,6 +208,13 @@ class ThermalRegulator:
         self.n_up = 0.0
         self.n_down = 0.0
         self.excess = 0.0         # how far the last step beat its own mean interval
+        self.prev_gap_up = 0.0    # the previous interval, so the NEXT one can be compared to it
+        self.prev_gap_down = 0.0
+        self.accel_up = 0.0       # d2y/dx2, MEAN over the run: what this machine typically does,
+        self.accel_down = 0.0     # folded across runs and seeded back. Not the live signal.
+        self.accel_now = 0.0      # the LAST fractional change: what it is doing right now
+        self.n_acc_up = 0.0
+        self.n_acc_down = 0.0
         self.k: Optional[float] = None   # the ramped k, carried between reads
 
     def observe(self, level: float) -> None:
@@ -218,27 +225,9 @@ class ThermalRegulator:
             d = level - self.last
             self.volatility += (abs(d) - self.volatility) / max(self.n, 1.0)
             if d > 0:
-                # The FIRST step in a direction yields no interval: since_up
-                # measures time since boot, not time between steps. Recording
-                # it invents a gap out of how long the run happened to be calm,
-                # and that gap then RAMPS the very reaction a cold regulator
-                # most needs -- measured, it turned a first jump into k 3.905
-                # where an unmeasured direction snaps to 2.001.
-                if self.n_up >= 1.0:
-                    self.excess = max(0.0, self.gap_up / self.since_up - 1.0) if self.gap_up else 0.0
-                    self.gap_up += (self.since_up - self.gap_up) / self.n_up
-                else:
-                    self.excess = 0.0
-                self.n_up += 1.0
-                self.since_up = 0.0
+                self._step_up()
             elif d < 0:
-                if self.n_down >= 1.0:
-                    self.excess = max(0.0, self.gap_down / self.since_down - 1.0) if self.gap_down else 0.0
-                    self.gap_down += (self.since_down - self.gap_down) / self.n_down
-                else:
-                    self.excess = 0.0
-                self.n_down += 1.0
-                self.since_down = 0.0
+                self._step_down()
             else:
                 self.excess = 0.0          # it did not move: nothing to react to
         self.n += 1.0
@@ -247,6 +236,65 @@ class ThermalRegulator:
         self.baseline += w * (level - self.baseline)
         self.last = level
         self.peak = max(self.peak, level)
+
+    def _step_up(self) -> None:
+        # The FIRST step in a direction yields no interval: since_up measures
+        # time since BOOT, not time between steps. Recording it invents a gap
+        # out of how long the run happened to be calm, and that gap then RAMPS
+        # the very reaction a cold regulator most needs.
+        if self.n_up >= 1.0:
+            self.excess = max(0.0, self.gap_up / self.since_up - 1.0) if self.gap_up else 0.0
+            if self.prev_gap_up > 0.0:
+                # d2y/dx2. excess asks whether THIS step was early; acceleration
+                # asks whether the steps are converging. Intervals of 50, 40,
+                # 30, 20 are each only mildly early and every one of them is a
+                # machine running away.
+                frac = (self.since_up - self.prev_gap_up) / self.prev_gap_up
+                self.accel_now = frac
+                self.n_acc_up += 1.0
+                self.accel_up += (frac - self.accel_up) / self.n_acc_up
+            self.prev_gap_up = self.since_up
+            self.gap_up += (self.since_up - self.gap_up) / self.n_up
+        else:
+            self.excess = 0.0
+        self.n_up += 1.0
+        self.since_up = 0.0
+
+    def _step_down(self) -> None:
+        if self.n_down >= 1.0:
+            self.excess = max(0.0, self.gap_down / self.since_down - 1.0) if self.gap_down else 0.0
+            if self.prev_gap_down > 0.0:
+                frac = (self.since_down - self.prev_gap_down) / self.prev_gap_down
+                self.accel_now = frac
+                self.n_acc_down += 1.0
+                self.accel_down += (frac - self.accel_down) / self.n_acc_down
+            self.prev_gap_down = self.since_down
+            self.gap_down += (self.since_down - self.gap_down) / self.n_down
+        else:
+            self.excess = 0.0
+        self.n_down += 1.0
+        self.since_down = 0.0
+
+    def urgency(self) -> float:
+        """How far out of hand things are, from the two things that can say so.
+
+        EXCESS -- this step arrived earlier than this machine's own mean
+        interval, by that ratio.
+
+        ACCELERATION -- the intervals are converging: this one shorter than
+        the one before it, by that fraction. Only shrinking counts; a machine
+        whose steps are spreading out is calming down and pays nothing.
+
+        Both are read INSTANTANEOUSLY, not as run means. A mean acceleration
+        cannot see a runaway: over [10]x10, 30, 20 the real shrink at the end
+        averages with nine zeros and one jump to +0.133, the wrong sign. That
+        is the same failure the flat baseline had. The means exist to be the
+        cross-run prior for what this machine typically does, not to be the
+        live signal.
+
+        Added, because a step can be early without the trend being bad and the
+        trend can be bad without any single step standing out."""
+        return self.excess + max(0.0, -self.accel_now)
 
     def pressure(self, level: Optional[float] = None) -> float:
         """How hard to throttle, in the units k_thermal takes its root in. Zero
@@ -268,7 +316,7 @@ class ThermalRegulator:
         steady machine pays 1x, a swinging one pays for the swing, and an
         early step pays for the surprise on top."""
         cur = float(self.last if level is None else level)
-        return max(0.0, cur - self.baseline) * (1.0 + self.volatility + self.excess)
+        return max(0.0, cur - self.baseline) * (1.0 + self.volatility + self.urgency())
 
     def k_thermal(self, k_max: float, level: Optional[float] = None) -> float:
         """The device's k, RAMPED toward its target rather than snapped to it.
@@ -303,7 +351,8 @@ class ThermalRegulator:
             # Relaxing back up stays on the measured cooling pace regardless --
             # a machine is allowed to be quick to protect itself and slow to
             # trust that it is safe.
-            w = max(w, self.excess / (1.0 + self.excess))
+            u = self.urgency()
+            w = max(w, u / (1.0 + u))
         self.k += w * d
         return self.k
 
@@ -311,10 +360,14 @@ class ThermalRegulator:
         return {"n": self.n, "baseline": self.baseline, "volatility": self.volatility,
                 "peak": self.peak, "last": float(self.last or 0.0), "run": self.run,
                 "gap_up": self.gap_up, "gap_down": self.gap_down, "excess": self.excess,
+                "accel_up": self.accel_up, "accel_down": self.accel_down,
+                "accel_now": self.accel_now,
+                "urgency": self.urgency(),
                 "k": float(self.k if self.k is not None else 0.0)}
 
-    def seed(self, baseline: float, volatility: float = 0.0,
-             gap_up: float = 0.0, gap_down: float = 0.0) -> "ThermalRegulator":
+    def seed(self, baseline: float = 0.0, volatility: float = 0.0,
+             gap_up: float = 0.0, gap_down: float = 0.0,
+             accel_up: float = 0.0, accel_down: float = 0.0, **_) -> "ThermalRegulator":
         """A SOFT prior from what previous runs measured on this machine.
 
         A cold regulator knows nothing, so it spends its first reads throttling
@@ -339,6 +392,12 @@ class ThermalRegulator:
             self.gap_up, self.n_up = float(gap_up), 1.0
         if gap_down > 0:
             self.gap_down, self.n_down = float(gap_down), 1.0
+        # acceleration is seeded only where an interval was: a d2y/dx2 without
+        # a dy/dx under it is a trend in a rate this machine has never shown.
+        if gap_up > 0:
+            self.accel_up, self.n_acc_up = float(accel_up), 1.0
+        if gap_down > 0:
+            self.accel_down, self.n_acc_down = float(accel_down), 1.0
         return self
 
 
@@ -389,7 +448,12 @@ def thermal_prior(log: str) -> Optional[Dict[str, float]]:
 # so every run weighs the same however long it was. The file sits beside
 # state/dume rather than inside it, because a clean start is meant to wipe the
 # weights and the clock, not what the machine is.
-_PRIOR_FIELDS = ("baseline", "volatility", "gap_up", "gap_down")
+# field -> the attribute holding how many times THIS run measured it. A field
+# with no observations contributes nothing; it is not folded in as a zero.
+# Acceleration needs this: 0.0 accel means "steps at a steady rate", a real
+# reading, where 0.0 gap means "never stepped".
+_PRIOR_FIELDS = {"baseline": "n", "volatility": "n", "gap_up": "n_up",
+                 "gap_down": "n_down", "accel_up": "n_acc_up", "accel_down": "n_acc_down"}
 
 
 def _prior_path() -> Path:
@@ -419,14 +483,13 @@ def fold_prior(reg: "ThermalRegulator", path: Optional[Path] = None) -> Dict[str
     except (OSError, ValueError):
         raw = {}
     out: Dict[str, object] = {"runs": float(raw.get("runs", 0)) + 1.0}
-    for f in _PRIOR_FIELDS:
-        v = float(getattr(reg, f))
+    for f, counter in _PRIOR_FIELDS.items():
         m, n = raw.get(f, [0.0, 0.0])
-        if f in ("gap_up", "gap_down") and v <= 0.0:
-            out[f] = [float(m), float(n)]      # never stepped: contributes nothing
+        if float(getattr(reg, counter, 0.0)) < 1.0:
+            out[f] = [float(m), float(n)]      # not measured this run: contributes nothing
             continue
         n = float(n) + 1.0
-        out[f] = [float(m) + (v - float(m)) / n, n]
+        out[f] = [float(m) + (float(getattr(reg, f)) - float(m)) / n, n]
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(out, indent=1))
     return {f: out[f][0] for f in _PRIOR_FIELDS}

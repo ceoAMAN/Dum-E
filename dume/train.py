@@ -64,11 +64,10 @@ def _seeded_regulator() -> ThermalRegulator:
     being able to outvote the present."""
     p = load_prior()
     if p:
-        r = ThermalRegulator().seed(p.get("baseline", 0.0), p.get("volatility", 0.0),
-                                    p.get("gap_up", 0.0), p.get("gap_down", 0.0))
+        r = ThermalRegulator().seed(**p)
         print(f"[thermal] seeded from the cross-run mean of {p['runs']:.0f} run(s): "
               f"baseline {p.get('baseline', 0.0):.3f} gap_up {p.get('gap_up', 0.0):.1f} "
-              f"gap_down {p.get('gap_down', 0.0):.1f} (worth 1)")
+              f"gap_down {p.get('gap_down', 0.0):.1f} accel {p.get('accel_up', 0.0):+.3f} (worth 1)")
         return r
     import glob
     logs = sorted(glob.glob("logs/archive/*/dume-cycle*.log") +
@@ -459,6 +458,9 @@ class System:
         rec["thermal_gap_up"] = ts["gap_up"]
         rec["thermal_gap_down"] = ts["gap_down"]
         rec["thermal_excess"] = ts["excess"]
+        rec["thermal_accel_up"] = ts["accel_up"]
+        rec["thermal_accel_down"] = ts["accel_down"]
+        rec["thermal_urgency"] = ts["urgency"]
         rec["k_ramped"] = ts["k"]
         self.health.put(**rec, clock=self.clock, active_mb=active_mb())
         self.health.tick(self.standing.total_n(), self.rel, self.size, self.mig)
