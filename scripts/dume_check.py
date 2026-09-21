@@ -788,6 +788,32 @@ def main() -> int:
     for km in (4.0, 16.0):
         assert abs(small.k_thermal(km) - km ** (1.0 / (1.0 + pr))) < 1e-12, f"k_max ignored at {km}"
 
+    # THE DEADBAND CANNOT LOCK ITSELF SHUT. It is the mean |z| of the very thing
+    # it gates, so z beats it whenever the excursion is above its own average --
+    # ~21% of reads for anything bell-shaped, P(Z > 0.798 sigma), independent of
+    # the machine's scale or noise. Warmup inflates it (at batch 50 of the live
+    # run dev was 0.258, wider than any excursion seen) and that is transient: a
+    # 1/n mean buries 50 warmup reads under 3700 working ones, settling at 0.031.
+    # the warmup JUMPS AND HOLDS, which is what the live die does. A smooth
+    # np.linspace ramp does not test this at all: `run` accumulates every read,
+    # the mean tracks the ramp exactly, z is identically 0 and dev never
+    # inflates -- measured, dev 0.0000 across the whole ramp against 0.158-0.258
+    # on the real run. A fixture whose input never moves proves nothing, which
+    # is the same bug this whole check exists to catch.
+    long_run = (list(47.0 + rng.normal(0, 0.3, 8)) + list(56.0 + rng.normal(0, 0.8, 10))
+                + list(60.5 + rng.normal(0, 0.9, 32)) + list(60.8 + rng.normal(0, 0.6, 3717)))
+    warm = ThermalRegulator()
+    for x in long_run[:50]:
+        warm.observe(float(x))
+    assert warm.dev > 0.1, \
+        f"the fixture's warmup does not inflate the deadband: dev {warm.dev:.4f} — it proves nothing"
+    r = ThermalRegulator()
+    fired = [r.observe(float(x)) or (r.pressure() > 0) for x in long_run]
+    assert r.dev < 0.05, f"the deadband never came down off warmup: dev {r.dev:.4f}"
+    late = fired[2000:]
+    assert 0.1 < sum(late) / len(late) < 0.4, \
+        f"heat inert or always-on over a steady run: fires {100 * sum(late) / len(late):.1f}%"
+
     # HOW MUCH RUN IS LEFT SCALES THE HEAT, it does not add to it. Heat is a
     # forecast -- this machine will be in trouble if it keeps working like this
     # -- and how much that matters depends on how much working is left.
