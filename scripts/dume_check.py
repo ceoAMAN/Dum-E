@@ -715,9 +715,12 @@ def main() -> int:
     assert dirty.std() > 4 * clean.std(), "the std should be the fragile one"
     print("health        OK  (non-finite caught at record time; skipped update is not a loss)")
 
-    # thermal: the baseline must RE-LEARN a sustained normal. A flat 1/n mean
-    # is frozen once n is large, so a machine whose room changes mid-run stays
-    # pinned to a normal that no longer exists and throttles forever after.
+    # thermal. Three mechanisms, each of which failed in a measured way before:
+    #   (a) the baseline was a flat 1/n mean and could not re-learn -- 400 reads
+    #       at level 2 against a settled 1.0 left it at 1.1176;
+    #   (b) pressure scaled by VOLATILITY, which reacts to every move, not by
+    #       whether the move was abnormal FOR THIS MACHINE;
+    #   (c) k was recomputed from scratch each read, so it snapped.
     from dume.chain import ThermalRegulator
 
     def settled(level, n):
@@ -727,10 +730,10 @@ def main() -> int:
         return r
 
     r = settled(1.0, 3000)
-    assert abs(r.baseline - 1.0) < 1e-6 and r.pressure(1.0) == 0.0, "settled machine is throttling itself"
+    assert abs(r.baseline - 1.0) < 1e-6 and r.pressure(1.0) == 0.0, "settled machine throttles itself"
     for _ in range(400):
         r.observe(2.0)                      # the ROOM warmed and stayed warm
-    assert r.baseline > 1.9, f"a sustained new normal was not re-learned: baseline {r.baseline:.4f}"
+    assert r.baseline > 1.9, f"sustained new normal not re-learned: baseline {r.baseline:.4f}"
     assert r.pressure(2.0) < 0.05, f"still throttling its own normal: {r.pressure(2.0):.4f}"
 
     r = settled(1.0, 3000)
@@ -738,13 +741,45 @@ def main() -> int:
     assert r.baseline < 1.001, f"one spike moved the baseline: {r.baseline:.6f}"
     assert r.pressure(2.0) > 0.9, f"a transient was not throttled: {r.pressure(2.0):.4f}"
 
-    r = ThermalRegulator()
-    for i in range(3000):
-        r.observe(1.0 + (i % 2))            # oscillating: run never accumulates
-    assert r.run == 1.0 and r.volatility > 0.9, f"swing not seen: run {r.run} vol {r.volatility:.3f}"
-    assert r.pressure(2.0) > r.pressure(1.0), "a swinging machine must be throttled hardest"
-    print("thermal       OK  (sustained normal re-learned in 400 reads; one spike moves baseline "
-          "<0.001; oscillation throttled hardest)")
+    # a step that arrives ON SCHEDULE is this machine behaving normally and is
+    # free; the SAME step arriving early is not. Nothing here is a constant --
+    # the schedule is the machine's own mean interval.
+    def stepper(period, reps, early=None):
+        r = ThermalRegulator()
+        for _ in range(reps):
+            for _ in range(period - 1):
+                r.observe(1.0)
+            r.observe(2.0)
+            r.observe(1.0)
+        gap = early if early is not None else period
+        for _ in range(gap - 1):
+            r.observe(1.0)
+        r.observe(2.0)
+        return r
+    on_time = stepper(50, 6)
+    early   = stepper(50, 6, early=5)
+    assert on_time.excess < 0.01, f"an on-schedule step was penalised: {on_time.excess:.3f}"
+    assert early.excess > 3.0, f"an early step was not penalised: {early.excess:.3f}"
+    assert early.pressure(2.0) > 3 * on_time.pressure(2.0), "early and on-time cost the same"
+
+    # k RAMPS. The rate is the machine's own step interval, read per direction:
+    # "levels per move" is the constant 1 on an ordinal 0-3 signal and collapses
+    # the ramp back into a snap (measured: rate_up = rate_down = 1.000).
+    seq = [1.0]*200 + [2.0] + [1.0]*100 + [2.0]*60 + [1.0]*120 + [2.0] + [1.0]*80 + [0.0]*40 + [1.0]*80
+    def replay(ramped):
+        r = ThermalRegulator(); out = []
+        for l in seq:
+            r.observe(l)
+            out.append(r.k_thermal(4.0, l) if ramped else 4.0 ** (1.0 / (1.0 + r.pressure(l))))
+        return [max(1, int(round(x))) for x in out], r
+    snap_k, _ = replay(False)
+    ramp_k, rr = replay(True)
+    flips = lambda ks: sum(1 for a, b in zip(ks, ks[1:]) if a != b)
+    assert flips(snap_k) > 0, "the snap baseline did not move; the fixture proves nothing"
+    assert flips(ramp_k) == 0, f"k still snapping: {flips(ramp_k)} changes"
+    assert rr.gap_up > 2.0 and rr.gap_down > 2.0, f"intervals collapsed: {rr.gap_up} {rr.gap_down}"
+    print(f"thermal       OK  (normal re-learned in 400 reads; spike moves baseline <0.001; "
+          f"on-schedule step free, early step {early.excess:.0f}x; k flips {flips(snap_k)} -> 0)")
     print("ALL CHECKS PASS")
     return 0
 
