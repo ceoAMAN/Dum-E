@@ -298,3 +298,67 @@ class ThermalRegulator:
                 "peak": self.peak, "last": float(self.last or 0.0), "run": self.run,
                 "gap_up": self.gap_up, "gap_down": self.gap_down, "excess": self.excess,
                 "k": float(self.k if self.k is not None else 0.0)}
+
+    def seed(self, baseline: float, volatility: float = 0.0,
+             gap_up: float = 0.0, gap_down: float = 0.0) -> "ThermalRegulator":
+        """A SOFT prior from what previous runs measured on this machine.
+
+        A cold regulator knows nothing, so it spends its first reads throttling
+        a machine it has not learned the normal of yet -- on the archived run
+        k_thermal was 2.758 at the first health record and did not reach 3.9
+        until clock 12k. That warm-up is pure loss: the operating point was
+        already measured, 580 records of it, in the run before.
+
+        Seeded with ONE observation's worth, never with the prior run's own
+        count. The prior is a starting guess about a machine whose room, load
+        and fan curve have all moved since; this run's first real read weighs
+        as much as the whole of it, and by ten reads it is a tenth. It removes
+        the cold start without being able to outvote the present.
+
+        A direction with no measured interval is left at zero rather than
+        filled in: the archived 500k run never changed thermal level once, so
+        its logs carry an operating point and nothing about rates."""
+        self.baseline = float(baseline)
+        self.volatility = float(volatility)
+        self.n = 1.0
+        if gap_up > 0:
+            self.gap_up, self.n_up = float(gap_up), 1.0
+        if gap_down > 0:
+            self.gap_down, self.n_down = float(gap_down), 1.0
+        return self
+
+
+def thermal_prior(log: str) -> Optional[Dict[str, float]]:
+    """What a previous run's log says about this machine's thermal behaviour.
+
+    Reads the `thermal=` field of every health record. Returns None rather
+    than a guess when the log carries no records."""
+    import re
+    lv: List[float] = []
+    try:
+        with open(log, errors="ignore") as fh:
+            for ln in fh:
+                if ln.startswith("[health b"):
+                    m = re.search(r" thermal=([0-9.]+)", ln)
+                    if m:
+                        lv.append(float(m.group(1)))
+    except OSError:
+        return None
+    if not lv:
+        return None
+    gaps_up: List[float] = []
+    gaps_down: List[float] = []
+    since_up = since_down = 0.0
+    for a, b in zip(lv, lv[1:]):
+        since_up += 1.0
+        since_down += 1.0
+        if b > a:
+            gaps_up.append(since_up); since_up = 0.0
+        elif b < a:
+            gaps_down.append(since_down); since_down = 0.0
+    mean = lambda xs: sum(xs) / len(xs) if xs else 0.0
+    return {"baseline": mean(lv),
+            "volatility": mean([abs(b - a) for a, b in zip(lv, lv[1:])]),
+            "gap_up": mean(gaps_up),
+            "gap_down": mean(gaps_down),
+            "n": float(len(lv))}

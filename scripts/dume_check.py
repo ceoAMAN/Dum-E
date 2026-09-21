@@ -762,6 +762,32 @@ def main() -> int:
     assert early.excess > 3.0, f"an early step was not penalised: {early.excess:.3f}"
     assert early.pressure(2.0) > 3 * on_time.pressure(2.0), "early and on-time cost the same"
 
+    # SEEDING. A cold regulator spends its first reads learning a normal that
+    # the previous run already measured -- k_thermal was 2.758 at the archived
+    # run's first health record and did not reach 3.9 until clock 12k. The
+    # prior removes that warm-up. It must NOT be able to outvote the present:
+    # the machine's room, load and fan curve have all moved since.
+    from dume.chain import thermal_prior
+    cold = ThermalRegulator()
+    warm = ThermalRegulator().seed(1.0)
+    assert cold.k_thermal(4.0, 1.0) < 3.0, f"the cold start was not a throttle: {cold.k_thermal(4.0,1.0):.3f}"
+    assert warm.k_thermal(4.0, 1.0) > 3.99, f"the seed did not remove the warm-up: {warm.k_thermal(4.0,1.0):.3f}"
+    # SOFT: one real read weighs as much as the whole prior, ten outweigh it.
+    moved = ThermalRegulator().seed(1.0)
+    moved.observe(0.0)
+    assert moved.baseline <= 0.5 + 1e-9, f"one contrary read did not halve the prior: {moved.baseline:.3f}"
+    for _ in range(10):
+        moved.observe(0.0)
+    assert moved.baseline < 0.1, f"the prior outvoted the present: baseline {moved.baseline:.3f}"
+    # a direction with no measured interval is left alone, not invented
+    assert warm.gap_up == 0.0 and warm.gap_down == 0.0, "an unmeasured interval was filled in"
+    # the extractor reports what a log HAS, and None when it has nothing
+    p = thermal_prior("analysis/run_20260921_b2900/raw/dume-fresh-500k.log")
+    assert p and p["n"] == 580 and p["baseline"] == 1.0, f"prior misread: {p}"
+    assert p["gap_up"] == 0.0 and p["gap_down"] == 0.0, \
+        "that run never changed thermal level; intervals cannot come from it"
+    assert thermal_prior("/nonexistent/nope.log") is None, "a missing log produced a prior"
+
     # RADICAL = RADICAL REACTION. The ramp is for drift. Once a step is far out
     # of hand the ramp is not used at all -- excess is already the ratio by
     # which the step beat this machine's own interval, so excess/(1+excess)

@@ -20,7 +20,7 @@ import numpy as np
 from . import config as C
 from . import data, state
 from .alloc import AllocLaw
-from .chain import MigrationChains, SizeChains, ThermalRegulator
+from .chain import MigrationChains, SizeChains, ThermalRegulator, thermal_prior
 from .curriculum import Curriculum
 from .geometry import Geometry
 from .health import Health
@@ -53,6 +53,27 @@ def _restored(obj, cls, *args):
     return obj
 
 
+
+def _seeded_regulator() -> ThermalRegulator:
+    """A cold regulator, given whatever the last run measured on this machine.
+
+    Only on a cold start -- a restored regulator carries its own history and
+    must not be overwritten by an older run's. The prior is worth ONE
+    observation (see ThermalRegulator.seed), so it removes the warm-up without
+    being able to outvote the present."""
+    import glob
+    logs = sorted(glob.glob("logs/archive/*/dume-cycle*.log") +
+                  glob.glob("logs/archive/*/dume-*500k.log"))
+    for log in reversed(logs):
+        p = thermal_prior(log)
+        if p and p["n"] >= 10:
+            r = ThermalRegulator().seed(p["baseline"], p["volatility"], p["gap_up"], p["gap_down"])
+            print(f"[thermal] seeded from {log}: baseline {p['baseline']:.3f} "
+                  f"vol {p['volatility']:.3f} gap_up {p['gap_up']:.1f} gap_down {p['gap_down']:.1f} "
+                  f"({p['n']:.0f} records, worth 1)")
+            return r
+    print("[thermal] no previous log to seed from — cold regulator")
+    return ThermalRegulator()
 def orientation(summary: str, i: int, n: int, start: int, end: int, T: int) -> str:
     """What an expert is told about the input it cannot see.
 
@@ -155,7 +176,7 @@ class System:
         if self.curric is None:
             self.curric = Curriculum()
         if self.therm is None:
-            self.therm = ThermalRegulator()
+            self.therm = _seeded_regulator()
         self.sched.thermal = self.therm
         self.router = Router(self.gate, self.geo, self.standing, self.sched, self.alloc)
 
