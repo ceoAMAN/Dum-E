@@ -169,34 +169,132 @@ class ThermalRegulator:
         pressure = max(0, level - baseline) * (1 + volatility)
 
     Both are means over the run, not constants, and both start at zero, so a
-    cold regulator applies nothing and has to EARN the right to throttle. This
-    is a lifetime mean rather than a window on purpose: unlike reliability,
-    whose subject moves as the model trains, the point where a machine runs
-    happily is a property of the machine."""
+    cold regulator applies nothing and has to EARN the right to throttle.
+
+    The baseline was a flat lifetime mean and could not re-learn (Aman,
+    2026-09-21, on the room going 20C -> 34C mid-session: "need to fix"). A
+    1/n mean is frozen once n is large -- at batch 3000 one reading moves it
+    by 0.0003 -- so a machine whose ROOM changes is pinned to a normal that no
+    longer exists and throttles for the rest of the run. The point where a
+    machine runs happily is a property of the machine AND its environment, and
+    the environment is not stationary.
+
+    So the update is weighted by RUN LENGTH, the count of consecutive reads at
+    the current level, over n:
+
+        baseline += min(1, run / n) * (level - baseline)
+
+    A transient resets run to 1 and moves the baseline by 1/n, as before, so
+    spikes are still throttled. A level that HOLDS accumulates run, and once it
+    has held for a meaningful fraction of the run's history it is by definition
+    the new normal and the baseline follows. Nothing is tuned: the horizon is
+    the history it has to outweigh. A level that oscillates never accumulates
+    run at all, and its volatility is high, so a swinging machine is throttled
+    hardest -- which is what it was throttled for."""
 
     def __init__(self) -> None:
         self.n = 0.0
         self.baseline = 0.0       # mean level
-        self.volatility = 0.0     # mean |change| between consecutive reads
+        self.volatility = 0.0     # mean |change| between reads: HOW MUCH it moves at all
         self.last: Optional[float] = None
         self.peak = 0.0
+        self.run = 0.0            # consecutive reads at the CURRENT level
+        self.gap_up = 0.0         # mean reads BETWEEN upward steps   -> how fast it heats
+        self.gap_down = 0.0       # mean reads BETWEEN downward steps -> how fast it cools
+        self.since_up = 0.0
+        self.since_down = 0.0
+        self.n_up = 0.0
+        self.n_down = 0.0
+        self.excess = 0.0         # how far the last step beat its own mean interval
+        self.k: Optional[float] = None   # the ramped k, carried between reads
 
     def observe(self, level: float) -> None:
         level = float(level)
+        self.since_up += 1.0
+        self.since_down += 1.0
         if self.last is not None:
-            d = abs(level - self.last)
-            self.volatility += (d - self.volatility) / max(self.n, 1.0)
+            d = level - self.last
+            self.volatility += (abs(d) - self.volatility) / max(self.n, 1.0)
+            if d > 0:
+                self.excess = max(0.0, self.gap_up / self.since_up - 1.0) if self.gap_up else 0.0
+                self.n_up += 1.0
+                self.gap_up += (self.since_up - self.gap_up) / self.n_up
+                self.since_up = 0.0
+            elif d < 0:
+                self.excess = max(0.0, self.gap_down / self.since_down - 1.0) if self.gap_down else 0.0
+                self.n_down += 1.0
+                self.gap_down += (self.since_down - self.gap_down) / self.n_down
+                self.since_down = 0.0
+            else:
+                self.excess = 0.0          # it did not move: nothing to react to
         self.n += 1.0
-        self.baseline += (level - self.baseline) / self.n
+        self.run = self.run + 1.0 if level == self.last else 1.0
+        w = min(1.0, self.run / self.n)
+        self.baseline += w * (level - self.baseline)
         self.last = level
         self.peak = max(self.peak, level)
 
     def pressure(self, level: Optional[float] = None) -> float:
         """How hard to throttle, in the units k_thermal takes its root in. Zero
-        at or below the baseline: normal operation is free."""
+        at or below the baseline: normal operation is free.
+
+        Two independent multipliers sit on that deviation, and they answer
+        different questions:
+
+          VOLATILITY - how much this machine moves AT ALL. A machine whose
+          temperature is swinging needs a firmer hand than one drifting gently
+          to the same place.
+
+          EXCESS - whether the LAST step was abnormal for this machine, i.e.
+          arrived sooner than its own mean interval in that direction. A
+          machine heating at the pace it always heats at is behaving normally
+          and pays nothing extra for it; the same step arriving early does.
+
+        They are added, not multiplied, so neither can swamp the other: a
+        steady machine pays 1x, a swinging one pays for the swing, and an
+        early step pays for the surprise on top."""
         cur = float(self.last if level is None else level)
-        return max(0.0, cur - self.baseline) * (1.0 + self.volatility)
+        return max(0.0, cur - self.baseline) * (1.0 + self.volatility + self.excess)
+
+    def k_thermal(self, k_max: float, level: Optional[float] = None) -> float:
+        """The device's k, RAMPED toward its target rather than snapped to it.
+
+        The ramp rate is the rate this machine itself moves, per direction, and
+        the two are not assumed equal: k climbs back at the pace it COOLS and
+        falls at the pace it HEATS.
+
+        The rate has to be read as an INTERVAL. macOS publishes the level as an
+        ordinal 0-3, so a move is always exactly one step and "levels per move"
+        is the constant 1 for every machine alive -- measured on the archived
+        run it gave rate_up = rate_down = 1.000 and the ramp degenerated back
+        into a snap. The interval between steps is where the speed actually
+        lives: one step per 50 reads is 1/50, one per 5 reads is ten times
+        that. Rate and gap are reciprocals, so this is the same quantity read
+        in the units the signal exists in.
+
+        Until a direction has been seen there is no measured interval to ramp
+        at, so k snaps -- an unmeasured rate is not invented."""
+        target = float(k_max) ** (1.0 / (1.0 + self.pressure(level)))
+        if self.k is None:
+            self.k = target
+            return self.k
+        d = target - self.k
+        gap = self.gap_down if d > 0 else self.gap_up   # rising k <=> the machine cooled
+        w = 1.0 if gap <= 0.0 else min(1.0, 1.0 / gap)
+        if d < 0:
+            # TIGHTENING ONLY. A radical departure is not ramped into: the
+            # ramp fraction rises with excess, and excess is already the ratio
+            # by which the step beat this machine's own interval, so a step ten
+            # times early carries w to 0.9 and one far past that snaps outright.
+            # Relaxing back up stays on the measured cooling pace regardless --
+            # a machine is allowed to be quick to protect itself and slow to
+            # trust that it is safe.
+            w = max(w, self.excess / (1.0 + self.excess))
+        self.k += w * d
+        return self.k
 
     def state(self) -> Dict[str, float]:
         return {"n": self.n, "baseline": self.baseline, "volatility": self.volatility,
-                "peak": self.peak, "last": float(self.last or 0.0)}
+                "peak": self.peak, "last": float(self.last or 0.0), "run": self.run,
+                "gap_up": self.gap_up, "gap_down": self.gap_down, "excess": self.excess,
+                "k": float(self.k if self.k is not None else 0.0)}

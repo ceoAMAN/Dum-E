@@ -714,6 +714,105 @@ def main() -> int:
     assert mad_sigma(dirty) < 2 * mad_sigma(clean), "one outlier moved the robust spread"
     assert dirty.std() > 4 * clean.std(), "the std should be the fragile one"
     print("health        OK  (non-finite caught at record time; skipped update is not a loss)")
+
+    # thermal. Three mechanisms, each of which failed in a measured way before:
+    #   (a) the baseline was a flat 1/n mean and could not re-learn -- 400 reads
+    #       at level 2 against a settled 1.0 left it at 1.1176;
+    #   (b) pressure scaled by VOLATILITY, which reacts to every move, not by
+    #       whether the move was abnormal FOR THIS MACHINE;
+    #   (c) k was recomputed from scratch each read, so it snapped.
+    from dume.chain import ThermalRegulator
+
+    def settled(level, n):
+        r = ThermalRegulator()
+        for _ in range(n):
+            r.observe(level)
+        return r
+
+    r = settled(1.0, 3000)
+    assert abs(r.baseline - 1.0) < 1e-6 and r.pressure(1.0) == 0.0, "settled machine throttles itself"
+    for _ in range(400):
+        r.observe(2.0)                      # the ROOM warmed and stayed warm
+    assert r.baseline > 1.9, f"sustained new normal not re-learned: baseline {r.baseline:.4f}"
+    assert r.pressure(2.0) < 0.05, f"still throttling its own normal: {r.pressure(2.0):.4f}"
+
+    r = settled(1.0, 3000)
+    r.observe(2.0)                          # ...versus a single spike
+    assert r.baseline < 1.001, f"one spike moved the baseline: {r.baseline:.6f}"
+    assert r.pressure(2.0) > 0.9, f"a transient was not throttled: {r.pressure(2.0):.4f}"
+
+    # a step that arrives ON SCHEDULE is this machine behaving normally and is
+    # free; the SAME step arriving early is not. Nothing here is a constant --
+    # the schedule is the machine's own mean interval.
+    def stepper(period, reps, early=None):
+        r = ThermalRegulator()
+        for _ in range(reps):
+            for _ in range(period - 1):
+                r.observe(1.0)
+            r.observe(2.0)
+            r.observe(1.0)
+        gap = early if early is not None else period
+        for _ in range(gap - 1):
+            r.observe(1.0)
+        r.observe(2.0)
+        return r
+    on_time = stepper(50, 6)
+    early   = stepper(50, 6, early=5)
+    assert on_time.excess < 0.01, f"an on-schedule step was penalised: {on_time.excess:.3f}"
+    assert early.excess > 3.0, f"an early step was not penalised: {early.excess:.3f}"
+    assert early.pressure(2.0) > 3 * on_time.pressure(2.0), "early and on-time cost the same"
+
+    # RADICAL = RADICAL REACTION. The ramp is for drift. Once a step is far out
+    # of hand the ramp is not used at all -- excess is already the ratio by
+    # which the step beat this machine's own interval, so excess/(1+excess)
+    # turns "how radical" straight into "how much of the gap to close", 0 at
+    # normal and ->1 at extreme. No threshold and no k value is named: on a
+    # different k_max the same curve simply lands elsewhere.
+    def shocked(period, early, k_max=4.0):
+        r = ThermalRegulator()
+        for _ in range(6):                  # history: a step every `period` reads
+            for _ in range(period - 1):
+                r.observe(1.0)
+            r.observe(2.0)
+            r.observe(1.0)
+        for _ in range(early - 1):
+            r.observe(1.0)
+        r.k_thermal(k_max, 1.0)             # settle k at the calm target first
+        r.observe(2.0)                      # ...then the step lands
+        return r.k_thermal(k_max, 2.0), r
+    calm_k, _ = shocked(50, 50)
+    hard_k, hard = shocked(50, 5)
+    worst_k, _ = shocked(50, 1)
+    assert calm_k > 3.9, f"an on-schedule step was treated as a shock: k {calm_k:.3f}"
+    assert hard_k < 2.0, f"a step 10x early was ramped into gently: k {hard_k:.3f}"
+    assert worst_k < hard_k < calm_k, f"reaction not monotone in radicality: {worst_k:.2f} {hard_k:.2f} {calm_k:.2f}"
+    # ...but ONLY when tightening. Coming back up stays on the measured pace.
+    back = hard.k_thermal(4.0, 1.0)
+    assert back - hard_k < 0.5 * (4.0 - hard_k), f"k snapped back up after a shock: {hard_k:.2f} -> {back:.2f}"
+    # no k value is baked in: the same shock on a different bound scales with it
+    big_k, _ = shocked(50, 5, k_max=16.0)
+    assert big_k > 2 * hard_k, f"k_max ignored: {big_k:.2f} vs {hard_k:.2f}"
+
+    # k RAMPS. The rate is the machine's own step interval, read per direction:
+    # "levels per move" is the constant 1 on an ordinal 0-3 signal and collapses
+    # the ramp back into a snap (measured: rate_up = rate_down = 1.000).
+    # steps ON SCHEDULE: no radicality, so this isolates the ramp itself.
+    seq = ([1.0] * 99 + [2.0]) * 7
+    def replay(ramped):
+        r = ThermalRegulator(); out = []
+        for l in seq:
+            r.observe(l)
+            out.append(r.k_thermal(4.0, l) if ramped else 4.0 ** (1.0 / (1.0 + r.pressure(l))))
+        return [max(1, int(round(x))) for x in out], r
+    snap_k, _ = replay(False)
+    ramp_k, rr = replay(True)
+    flips = lambda ks: sum(1 for a, b in zip(ks, ks[1:]) if a != b)
+    assert flips(snap_k) > 0, "the snap baseline did not move; the fixture proves nothing"
+    assert flips(ramp_k) == 0, f"k still snapping: {flips(ramp_k)} changes"
+    assert rr.gap_up > 2.0 and rr.gap_down > 2.0, f"intervals collapsed: {rr.gap_up} {rr.gap_down}"
+    assert rr.excess < 0.01, f"the on-schedule fixture drifted off schedule: excess {rr.excess:.3f}"
+    print(f"thermal       OK  (normal re-learned in 400 reads; spike moves baseline <0.001; "
+          f"on-schedule step free, early step {early.excess:.0f}x; k flips {flips(snap_k)} -> 0)")
     print("ALL CHECKS PASS")
     return 0
 

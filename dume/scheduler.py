@@ -96,14 +96,19 @@ class Scheduler:
         nobody measured.
 
         Pressure is the raw level measured against where this machine NORMALLY
-        sits, scaled by how radically it has been moving — see
-        ThermalRegulator. At the baseline the pressure is 0 and the bound is
-        exactly the physical one, so a machine that simply runs warm is never
-        throttled for it."""
+        sits, scaled by how far its last move ran above its own mean rate —
+        see ThermalRegulator. At the baseline the pressure is 0 and the bound
+        is exactly the physical one, so a machine that simply runs warm is
+        never throttled for it, and neither is one that warms at the pace it
+        always warms at.
+
+        The regulator RAMPS k toward that bound at the rate the machine itself
+        moves, instead of snapping to it, so a single warm read no longer costs
+        a residency reshuffle."""
         lvl = thermal_state()
         if self.thermal is not None:
             self.thermal.observe(lvl)
-            return float(self.k_max) ** (1.0 / (1.0 + self.thermal.pressure(lvl)))
+            return self.thermal.k_thermal(float(self.k_max), lvl)
         return float(self.k_max) ** (1.0 / (1.0 + lvl))
 
     def clamp(self, k_wanted: int) -> int:
