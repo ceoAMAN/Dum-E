@@ -632,6 +632,24 @@ def main() -> int:
         assert src.index("self._split(plan)") < src.index("self.sched.ensure("), \
             f"{name} activates experts before the gate has split the input"
         assert "summarise" not in src, f"{name} generates the map inside the residency window"
+    # ONE ENTRY PER FRAGMENT, NOT PER EXPERT. Deployment emits `cycles` Selections
+    # sharing an eid and differing only in [start, end) — that is how an expert
+    # covers a region wider than its span without paying a swap. Keyed by eid, the
+    # last fragment's text would be handed to every fragment of that expert, and
+    # the cycles would silently read the same slice k times.
+    from dume.router import Selection as _Sel
+    _sys = SimpleNamespace(gate=SimpleNamespace(tok=_Tok(), summarise=lambda ids, b: ""))
+    _plan = SimpleNamespace(ids=[f"t{i}" for i in range(40)],
+                            selections=[_Sel(eid=7, cid=0, start=0, end=10),
+                                        _Sel(eid=7, cid=0, start=10, end=20),
+                                        _Sel(eid=9, cid=1, start=20, end=40)])
+    _cut = _tr_mod.System._split(_sys, _plan)
+    assert len(_cut) == 3, f"a fragment was collapsed: {len(_cut)} of 3"
+    assert [sp for _, sp, _ in _cut] == ["t0 t1 t2 t3 t4 t5 t6 t7 t8 t9",
+                                         "t10 t11 t12 t13 t14 t15 t16 t17 t18 t19",
+                                         " ".join(f"t{i}" for i in range(20, 40))], \
+        "a fragment did not receive its own slice"
+    assert len({cx for _, _, cx in _cut}) == 3, "two fragments share an orientation"
     print(f"router        OK  (anchors ordered, spans within input; training shares "
           f"{sorted(s.n_tokens for s in probe_spans)}; span_max clamps the share)")
 

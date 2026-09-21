@@ -254,7 +254,7 @@ class System:
                 "timeline_a_rate": self.band.rate(), "graded_this_run": self.standing.total_n() - n0,
                 "reliability_this_run": self.rel.total_obs() - r0}
 
-    def _split(self, plan) -> Tuple[Dict[int, str], Dict[int, str]]:
+    def _split(self, plan) -> List[Tuple[object, str, str]]:
         """The gate's whole job on an input: cut it into spans and write each
         expert's prompt material. Runs BEFORE any expert is made resident, and
         reads only `plan`, so what an expert is asked is fixed by the input and
@@ -263,14 +263,19 @@ class System:
         THE MAP'S BUDGET IS APEX-NADIR'S SMALLEST ALLOCATION (Aman, 2026-09-21):
         deciding how many tokens an expert processes is what the law is for, so
         the map of the whole obeys it too. The MINIMUM span rather than the mean,
-        so one summary per batch is small enough for every seat at the table."""
+        so one summary per batch is small enough for every seat at the table.
+
+        Returns a LIST parallel to plan.selections, never a dict keyed by eid.
+        Deployment emits `cycles` fragments per expert — several Selections that
+        share an eid and differ only in [start, end) — so an eid-keyed dict keeps
+        one span per expert and hands every fragment the last one's text. The
+        fragments are the point: they are how an expert covers a region larger
+        than its span without paying a swap."""
         sels = list(plan.selections)
         summary = self.gate.summarise(plan.ids, min((x.n_tokens for x in sels), default=0))
-        spans, ctxs = {}, {}
-        for i, sel in enumerate(sels):
-            spans[sel.eid] = self.gate.tok.decode(plan.ids[sel.start:sel.end])
-            ctxs[sel.eid] = orientation(summary, i, len(sels), sel.start, sel.end, len(plan.ids))
-        return spans, ctxs
+        return [(sel, self.gate.tok.decode(plan.ids[sel.start:sel.end]),
+                 orientation(summary, i, len(sels), sel.start, sel.end, len(plan.ids)))
+                for i, sel in enumerate(sels)]
 
     def _train_one(self, s: data.Sample) -> Dict[str, float]:
         # training PROBES: spans come from {t_lo, t_mid, t_hi} rather than the
@@ -300,7 +305,11 @@ class System:
         #   stationary-context property the frozen gate was chosen for quietly failed.
         #   The law's allocation is what the law allocated; residency is physics that
         #   happens afterwards.
-        spans, ctxs = self._split(plan)
+        cut = self._split(plan)
+        # probe => cycles == 1 => exactly one Selection per eid, so keying the
+        # training maps by eid is exact here. Deployment is NOT: it iterates `cut`.
+        spans = {sel.eid: sp for sel, sp, _ in cut}
+        ctxs = {sel.eid: cx for sel, _, cx in cut}
         resident = self.sched.ensure([sel.eid for sel in plan.selections])
         sels = [sel for sel in plan.selections if sel.eid in resident]
         share = self._context_share(len(sels), s.prompt, len(y))
@@ -541,14 +550,14 @@ class System:
         # same order as training: the gate splits, THEN k are activated. An expert
         # that trained with a map and a position must not meet a bare span in
         # production, and the split must not depend on residency in either path.
-        spans, ctxs = self._split(plan)
+        cut = self._split(plan)
         resident = self.sched.ensure([sel.eid for sel in plan.selections])
         share = self._context_share(len(plan.selections), prompt, max_tokens)
         notes: List[tuple] = []
-        for sel in plan.selections:
+        for sel, span_text, ctx in cut:            # per FRAGMENT, not per expert
             if sel.eid not in resident:
                 continue
-            text, _ = self.pool.run(sel.eid, spans[sel.eid], ctxs[sel.eid],
+            text, _ = self.pool.run(sel.eid, span_text, ctx,
                                     budget=self.alloc.budget(sel.n_tokens, sel.n_tokens, share))
             st = self.standing.score(sel.eid, sel.cid)
             notes.append((st if st is not None else -1e9, text))
