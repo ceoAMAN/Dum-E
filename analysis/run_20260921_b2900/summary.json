@@ -1,0 +1,42 @@
+{
+  "run": "run_20260921_b2900",
+  "finished": "2026-09-21T09:31:42",
+  "batches": 2900,
+  "clock_tokens": 506242,
+  "target": 500000,
+  "code": {
+    "head": "4eef0dc",
+    "branch": "symbiosis-curriculum",
+    "regime": "flat TARGET_MAX_TOKENS=128 question head in every expert prompt"
+  },
+  "decisions": {
+    "ADMIT": 1826,
+    "HELDOUT": 715,
+    "REFUSE": 359
+  },
+  "distinct_experts_trained": 100,
+  "health_records": 580,
+  "batch_rows": 2900,
+  "final": {
+    "clone_frac": 0.25,
+    "delta_mad": 0.068,
+    "delta_neg_frac": 0.81,
+    "expert_updates": 1043.0,
+    "update_frac": 0.62,
+    "k": 4.0,
+    "k_thermal": 3.997,
+    "thermal": 1.0,
+    "thermal_vol": 0.0,
+    "reliability_obs": 52226.0,
+    "standing_n": 7001.0,
+    "rho": 0.326
+  },
+  "clone_frac_by_fifth": [
+    0.3165,
+    0.3064,
+    0.2976,
+    0.2802,
+    0.2343
+  ],
+  "state_version": 7
+}

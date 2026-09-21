@@ -1,0 +1,4 @@
+[23:31:54] waiting for the running job (pid 13089) to finish
+[09:31:42] pid 13089 exited
+[09:31:42] cycle 1: clock=506242 batch=2900 target=500000
+[09:31:42] TARGET REACHED at 506242 tokens. done.

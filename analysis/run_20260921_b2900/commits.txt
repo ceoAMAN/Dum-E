@@ -1,0 +1,6 @@
+4eef0dc Supervisor: keep training in sequential cycles until the clock hits 500k
+90847ed Training divides the allocated tokens by the experts sharing them
+6061ec2 Thermal regulation measured against normal, not against zero
+9188d77 k falls with input length and rises as the device cools
+8590936 Record thermal before health.put, not after
+51eef89 The device gets a vote on k: NSProcessInfo thermal state
