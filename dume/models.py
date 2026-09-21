@@ -233,11 +233,21 @@ class Gate:
         THE GATE WRITES IT, not Central and not an expert (Aman, 2026-09-21). It
         is the only component that reads all of T already — the routing geometry
         needs the full hidden states — so the prefill is a pass it was going to
-        make anyway, and it is the smallest model in the stack. It is also FROZEN,
-        so with greedy decoding the summary is a pure function of the input: the
-        same row yields the same context on every epoch, and experts train against
-        a stationary context rather than one that drifts as the pool learns. A
-        summary written by Central would move under their feet.
+        make anyway, and it is the smallest model in the stack. It is also FROZEN
+        and decoded greedily, so the summary is a pure function of (ids, budget):
+        the gate does not drift as the pool learns, which a summary written by
+        Central would.
+
+        THE BUDGET IS NOT A FUNCTION OF THE INPUT ALONE, so neither is the text.
+        `budget` is the smallest span the law allocated, that span is T_eff/k, and
+        k falls with thermal pressure by design (the tug of war: the device wants k
+        low, the system wants it high). MEASURED at k_max=4, span_max=446: a T=100
+        row gives k=4, L=25 and NO map when the device is nominal, and k=2, L=50
+        and a full map at thermal level 1. The same row therefore gets categorically
+        different prompts on a warm machine. That is a consequence of k being
+        thermally regulated, not of anything here — but the earlier claim that this
+        was stationary across epochs was wrong, and nothing downstream should be
+        built on it.
 
         THE BUDGET IS APEX-NADIR'S, not a constant. `budget` is the SMALLEST span
         the law allocated this batch, so the map can never outweigh the material
@@ -270,7 +280,15 @@ class Gate:
 
         Returns "" when it cannot help, which every caller treats as "no context"
         rather than as a failure."""
-        budget = int(budget)
+        # TWO bounds, and both are somebody else's arithmetic. The law's smallest
+        # span keeps the map from outweighing the material. TARGET_MAX_TOKENS keeps
+        # it inside the reserve the scheduler ALREADY spent on it: span_max is
+        # computed as free/slope - 2*TARGET_MAX_TOKENS on the stated basis that the
+        # backpropped sequence is "span + orientation header + the expert's own
+        # generated text" (scheduler.py:64). The old header was hard-clamped at
+        # TARGET_MAX_TOKENS by construction; dropping that clamp without restoring
+        # it here would let the header outgrow the memory already budgeted for it.
+        budget = min(int(budget), C.TARGET_MAX_TOKENS)
         if budget < C.EXPERT_GEN_TOKENS or not ids:
             return ""
         from mlx_lm import generate

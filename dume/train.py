@@ -257,8 +257,15 @@ class System:
     def _split(self, plan) -> List[Tuple[object, str, str]]:
         """The gate's whole job on an input: cut it into spans and write each
         expert's prompt material. Runs BEFORE any expert is made resident, and
-        reads only `plan`, so what an expert is asked is fixed by the input and
-        the law — never by how many seats happened to be free.
+        reads only `plan`, so nothing decided AFTER the plan — which experts
+        ensure() managed to seat, what it had to evict — can change a prompt.
+
+        That is a narrower guarantee than "a function of the input", and the
+        difference is worth stating because the earlier comment here overclaimed
+        it. `plan` already carries residency and temperature: curriculum.experts()
+        orders its picks resident-first (curriculum.py:136) so WHICH expert gets
+        WHICH span follows what was already loaded, and k is thermally regulated
+        so the span sizes — hence this map's budget — move with the chassis.
 
         THE MAP'S BUDGET IS APEX-NADIR'S SMALLEST ALLOCATION (Aman, 2026-09-21):
         deciding how many tokens an expert processes is what the law is for, so
@@ -294,17 +301,18 @@ class System:
         # into prompts, THEN activate k and move them to processing. Two reasons, and
         # the second is the load-bearing one:
         #
-        #   RAM — summarise() peaks at 959 MB on a long prefill (measured). Run inside
-        #   the residency window it stacks on top of k resident adapters; run before
-        #   ensure() it shares the machine with nothing but the gate itself.
+        #   ORDER — the gate's whole job finishes before the pool's begins, so a
+        #   prompt cannot be changed by anything ensure() does. Budgeting the map off
+        #   `sels` made it depend on ensure()'s OUTCOME: the same row with a different
+        #   seat count got a different budget and a different map. What the law
+        #   allocated is what the law allocated.
         #
-        #   DETERMINISM — the split and the map are now functions of the INPUT alone,
-        #   not of what happened to fit in RAM. Budgeting the map off `sels` made it a
-        #   function of residency: the same row seen in a later epoch with a different
-        #   seat count got a different budget and therefore a different map, and the
-        #   stationary-context property the frozen gate was chosen for quietly failed.
-        #   The law's allocation is what the law allocated; residency is physics that
-        #   happens afterwards.
+        #   RAM — weaker than it looks, and stated here so nobody relies on it.
+        #   summarise() peaks at 959 MB on a long prefill (measured), but residency is
+        #   NOT batch-scoped: unload() is only called from inside ensure()
+        #   (scheduler.py:121), so at this point the previous batch's adapters are
+        #   still loaded. The peak is essentially unchanged; only the first batch of a
+        #   run sees the gate alone.
         cut = self._split(plan)
         # probe => cycles == 1 => exactly one Selection per eid, so keying the
         # training maps by eid is exact here. Deployment is NOT: it iterates `cut`.

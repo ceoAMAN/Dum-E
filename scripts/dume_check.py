@@ -576,14 +576,22 @@ def main() -> int:
     assert list(_iP.signature(_EP.prompt).parameters) == ["self", "span_text", "context"], \
         "prompt() takes something other than the span and its context"
     span = " ".join(f"s{i}" for i in range(12))
-    bare = _EP.prompt(_pool, span)
-    for q_len in (4, C.TARGET_MAX_TOKENS, 8 * C.TARGET_MAX_TOKENS):
-        assert " ".join(f"q{i}" for i in range(q_len)).split()[0] not in bare.replace(span, ""), \
-            "input tokens reached the expert"
-    assert span in bare, "the span itself is missing from the prompt"
-    # prompt length tracks the SPAN, so k experts cost T between them, not k*T
-    grew = _EP.prompt(_pool, " ".join(f"s{i}" for i in range(120)))
-    assert len(bare.split()) - 12 == len(grew.split()) - 120, "prompt carries a length that is not the span"
+    ctx = " ".join(f"c{i}" for i in range(5))
+    built = _EP.prompt(_pool, span, ctx)
+    # EXACT ACCOUNTING, not a substring probe. The earlier version asserted that a
+    # question's first token was absent from a prompt that had never been given a
+    # question, three times over the same dead value — it could not fail. Pin the
+    # whole output instead: system + context + span and NOTHING ELSE, so any future
+    # smuggled-in field shows up as surplus tokens here.
+    surplus = [w for w in built.split() if w not in set(span.split()) | set(ctx.split())]
+    boiler = [w for w in _EP.prompt(_pool, "", "").split()]
+    assert sorted(surplus) == sorted(boiler), \
+        f"the prompt carries {len(surplus) - len(boiler)} tokens that are neither span, context, nor system"
+    assert span in built and ctx in built, "the span or its context is missing from the prompt"
+    assert built.index(ctx) < built.index(span), "the map does not precede the material it orients"
+    # length tracks span and context ONLY, so k experts cost T between them, not k*T
+    grew = _EP.prompt(_pool, " ".join(f"s{i}" for i in range(120)), ctx)
+    assert len(grew.split()) - len(built.split()) == 108, "prompt carries a length that is not the span"
     # THE POSITION LINE IS THE PART THAT DIFFERS. The old prompt re-printed the
     # excerpt with no indication of where it sat, so the k prompts shared everything
     # that carried meaning. Every expert's orientation must be distinct.
@@ -596,10 +604,24 @@ def main() -> int:
     # note has to clear there is no map at all — a two-token summary costs a full
     # prefill to say nothing. _Gate stands in for the real one: summarise() must
     # refuse on the budget BEFORE it reaches the model.
+    # the stub RAISES if the guard is passed, so a removed guard fails loudly. The
+    # earlier version used a tok that returned "" for an empty decode and a model of
+    # None, so summarise() returned "" whether the guard ran or not — unfalsifiable.
     from dume.models import Gate as _G
-    _gate = SimpleNamespace(tok=_Tok(), model=None)
+
+    class _Boom:
+        def decode(self, t): raise AssertionError("summarise reached the model past its guard")
+        def encode(self, s): return s.split()
+    _gate = SimpleNamespace(tok=_Boom(), model=None)
     assert _G.summarise(_gate, [1, 2, 3], C.EXPERT_GEN_TOKENS - 1) == "", "map generated below the note floor"
     assert _G.summarise(_gate, [], C.TARGET_MAX_TOKENS) == "", "map generated for an empty input"
+    # THE HEADER STAYS INSIDE THE RESERVE THE SCHEDULER ALREADY SPENT ON IT.
+    # scheduler.py sizes span_max as free/slope - 2*TARGET_MAX_TOKENS on the stated
+    # basis that the backpropped sequence is span + orientation header + generated
+    # text. The old header was clamped at TARGET_MAX_TOKENS by construction; the
+    # branch deleted that clamp, so summarise() has to carry it.
+    assert "min(int(budget), C.TARGET_MAX_TOKENS)" in _iP.getsource(_G.summarise), \
+        "the map can outgrow the memory the scheduler reserved for the header"
     # THE GATE FINISHES BEFORE THE POOL STARTS: split the input into prompts, THEN
     # activate k. Both paths go through ONE splitter, so what an expert is asked is
     # a function of the input and the law alone — never of how many seats were free.
