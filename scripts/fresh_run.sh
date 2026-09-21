@@ -27,8 +27,11 @@ fi
 
 DEST="logs/archive/$TAG"
 mkdir -p "$DEST"
+# ...except this script's own stdout, which is being written to right now:
+# archiving it leaves the transcript of the launch inside the PREVIOUS run's
+# archive, following a moved inode. Redirect to exactly this name.
 find logs -maxdepth 1 -type f \( -name '*.log' -o -name '*.pid' -o -name '*.out' \) \
-     -exec mv {} "$DEST/" \;
+     -not -name 'fresh_run.out' -exec mv {} "$DEST/" \;
 echo "logs        -> $DEST"
 
 if [ -d state/dume ]; then

@@ -415,6 +415,14 @@ class System:
         rec["thermal_base"] = ts["baseline"]
         rec["thermal_vol"] = ts["volatility"]
         rec["thermal_peak"] = ts["peak"]
+        # the regulator's own mechanisms, for the same reason: a run has to be
+        # able to show whether the baseline ever re-learned, whether a step was
+        # ever abnormal, and whether k ramped rather than snapped.
+        rec["thermal_run"] = ts["run"]
+        rec["thermal_gap_up"] = ts["gap_up"]
+        rec["thermal_gap_down"] = ts["gap_down"]
+        rec["thermal_excess"] = ts["excess"]
+        rec["k_ramped"] = ts["k"]
         self.health.put(**rec, clock=self.clock, active_mb=active_mb())
         self.health.tick(self.standing.total_n(), self.rel, self.size, self.mig)
         d = " ".join(f"e{sel.eid}{'*' if sel.trial else ''}:{sc.deltas.get(sel.eid, float('nan')):+.3f}" for sel in sels)
