@@ -246,6 +246,28 @@ class Gate:
         floor a note has to clear to say anything, and a two-token map costs a
         full prefill to deliver nothing.
 
+        MEASURED on this machine, 0.5B-4bit gate, real prose (2026-09-21):
+
+            T      prefill  decode  total   wrote
+            128     0.13     0.12   0.25 s   28 tok
+            320     0.24     0.26   0.50 s   27
+            639        -        -   0.68 s   33
+            1784    1.16     0.63   1.79 s   65
+
+        sec ~ 0.18 + 0.0009*T. Over this run's real (T, k) distribution the floor
+        gates out 79% of rows, so the map fires on 21%, costs 0.53 s when it fires
+        and 0.113 s amortised — 1.0% of an 11.8 s batch. Weights 268 MB, peak 959 MB
+        on the longest prefill, against the scheduler's 4096 MB sqrt reserve.
+
+        Note the gate stops on EOS far below the budget: it wrote ~30 tokens against
+        a median budget of 148. The law's allocation is therefore a GATE and a hard
+        ceiling here, not a length control — the typical length is the model's.
+
+        At large T the cost is prefill, and hidden() already prefills these same ids
+        for the routing geometry. The chat template wraps them differently so the
+        cache is not reusable as it stands; at 1% of a batch that is headroom worth
+        knowing about and not worth the surgery.
+
         Returns "" when it cannot help, which every caller treats as "no context"
         rather than as a failure."""
         budget = int(budget)

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import math
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -254,37 +254,60 @@ class System:
                 "timeline_a_rate": self.band.rate(), "graded_this_run": self.standing.total_n() - n0,
                 "reliability_this_run": self.rel.total_obs() - r0}
 
+    def _split(self, plan) -> Tuple[Dict[int, str], Dict[int, str]]:
+        """The gate's whole job on an input: cut it into spans and write each
+        expert's prompt material. Runs BEFORE any expert is made resident, and
+        reads only `plan`, so what an expert is asked is fixed by the input and
+        the law — never by how many seats happened to be free.
+
+        THE MAP'S BUDGET IS APEX-NADIR'S SMALLEST ALLOCATION (Aman, 2026-09-21):
+        deciding how many tokens an expert processes is what the law is for, so
+        the map of the whole obeys it too. The MINIMUM span rather than the mean,
+        so one summary per batch is small enough for every seat at the table."""
+        sels = list(plan.selections)
+        summary = self.gate.summarise(plan.ids, min((x.n_tokens for x in sels), default=0))
+        spans, ctxs = {}, {}
+        for i, sel in enumerate(sels):
+            spans[sel.eid] = self.gate.tok.decode(plan.ids[sel.start:sel.end])
+            ctxs[sel.eid] = orientation(summary, i, len(sels), sel.start, sel.end, len(plan.ids))
+        return spans, ctxs
+
     def _train_one(self, s: data.Sample) -> Dict[str, float]:
         # training PROBES: spans come from {t_lo, t_mid, t_hi} rather than the
         # fitted allocation, so span size is explored at no extra cost. Only the
         # 2*sqrt(E) extreme-ranked experts (§2) feed the curves.
         plan = self.router.plan(s.prompt, probe=True, curriculum=self.curric)
-        resident = self.sched.ensure([sel.eid for sel in plan.selections])
-        sels = [sel for sel in plan.selections if sel.eid in resident]
         y = self.central.target_ids(s.answer)
         # token types are read off the TARGET IDS THEMSELVES, so assign_y[t] pairs with
         # b[t] by construction — the reliability writer and the weight reader index the
         # same t. (Resampling a differently-sized assignment silently mismatched them.)
         assign_y = self.geo.assign_tokens(self.gate.hidden(y))
         texts: Dict[int, str] = {}
-        spans: Dict[int, str] = {}
         emitted: Dict[int, int] = {}
         secs: Dict[int, float] = {}
+        # THE GATE FINISHES BEFORE THE POOL STARTS (Aman, 2026-09-21): split the input
+        # into prompts, THEN activate k and move them to processing. Two reasons, and
+        # the second is the load-bearing one:
+        #
+        #   RAM — summarise() peaks at 959 MB on a long prefill (measured). Run inside
+        #   the residency window it stacks on top of k resident adapters; run before
+        #   ensure() it shares the machine with nothing but the gate itself.
+        #
+        #   DETERMINISM — the split and the map are now functions of the INPUT alone,
+        #   not of what happened to fit in RAM. Budgeting the map off `sels` made it a
+        #   function of residency: the same row seen in a later epoch with a different
+        #   seat count got a different budget and therefore a different map, and the
+        #   stationary-context property the frozen gate was chosen for quietly failed.
+        #   The law's allocation is what the law allocated; residency is physics that
+        #   happens afterwards.
+        spans, ctxs = self._split(plan)
+        resident = self.sched.ensure([sel.eid for sel in plan.selections])
+        sels = [sel for sel in plan.selections if sel.eid in resident]
         share = self._context_share(len(sels), s.prompt, len(y))
-        # THE CONTEXT BUDGET IS APEX-NADIR'S SMALLEST ALLOCATION (Aman, 2026-09-21):
-        # deciding how many tokens an expert processes is what the law is for, so
-        # the map of the whole obeys it too. Taking the MINIMUM span rather than the
-        # mean means the map cannot outweigh the material of even the most thinly-fed
-        # expert — one summary per batch, small enough for every seat at the table.
-        ctxs: Dict[int, str] = {}
-        summary = self.gate.summarise(plan.ids, min((x.n_tokens for x in sels), default=0))
-        for i, sel in enumerate(sels):
-            span_text = self.gate.tok.decode(plan.ids[sel.start:sel.end])
-            spans[sel.eid] = span_text
-            ctxs[sel.eid] = orientation(summary, i, len(sels), sel.start, sel.end, len(plan.ids))
+        for sel in sels:
             t_run = time.time()
             budget = self.alloc.budget(sel.n_tokens, sel.n_tokens, share)
-            texts[sel.eid], _ = self.pool.run(sel.eid, span_text, ctxs[sel.eid], budget=budget)
+            texts[sel.eid], _ = self.pool.run(sel.eid, spans[sel.eid], ctxs[sel.eid], budget=budget)
             secs[sel.eid] = time.time() - t_run
             emitted[sel.eid] = len(self.pool.tok.encode(texts[sel.eid])) if texts[sel.eid] else 0
         sc = score(self.central, s.prompt, y, plan.w, texts, self.rel)
@@ -515,18 +538,17 @@ class System:
             # written — deployment has no y, so nothing here could be grounded.
             return {"text": self.central.generate(prompt, [], max_tokens), "k": 0, "timeline": "A",
                     "trust": trust, "notes": [], "home": plan.home, "w": plan.w.round(3).tolist()}
+        # same order as training: the gate splits, THEN k are activated. An expert
+        # that trained with a map and a position must not meet a bare span in
+        # production, and the split must not depend on residency in either path.
+        spans, ctxs = self._split(plan)
         resident = self.sched.ensure([sel.eid for sel in plan.selections])
         share = self._context_share(len(plan.selections), prompt, max_tokens)
         notes: List[tuple] = []
-        live = [sel for sel in plan.selections if sel.eid in resident]
-        # the deployment context is built EXACTLY as the training one is: an expert
-        # that trained with a map and a position must not meet a bare span in
-        # production. Same budget rule, same gate, same greedy decode.
-        summary = self.gate.summarise(plan.ids, min((x.n_tokens for x in live), default=0))
-        for i, sel in enumerate(live):
-            span_text = self.gate.tok.decode(plan.ids[sel.start:sel.end])
-            ctx = orientation(summary, i, len(live), sel.start, sel.end, len(plan.ids))
-            text, _ = self.pool.run(sel.eid, span_text, ctx,
+        for sel in plan.selections:
+            if sel.eid not in resident:
+                continue
+            text, _ = self.pool.run(sel.eid, spans[sel.eid], ctxs[sel.eid],
                                     budget=self.alloc.budget(sel.n_tokens, sel.n_tokens, share))
             st = self.standing.score(sel.eid, sel.cid)
             notes.append((st if st is not None else -1e9, text))

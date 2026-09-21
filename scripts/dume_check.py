@@ -600,13 +600,38 @@ def main() -> int:
     _gate = SimpleNamespace(tok=_Tok(), model=None)
     assert _G.summarise(_gate, [1, 2, 3], C.EXPERT_GEN_TOKENS - 1) == "", "map generated below the note floor"
     assert _G.summarise(_gate, [], C.TARGET_MAX_TOKENS) == "", "map generated for an empty input"
-    src_tr = _iP.getsource(_tr_mod.System._train_one)
-    src_an = _iP.getsource(_tr_mod.System.answer)
-    budget_call = "self.gate.summarise(plan.ids, min((x.n_tokens for x in"
-    assert budget_call in src_tr and budget_call in src_an, \
+    # THE GATE FINISHES BEFORE THE POOL STARTS: split the input into prompts, THEN
+    # activate k. Both paths go through ONE splitter, so what an expert is asked is
+    # a function of the input and the law alone — never of how many seats were free.
+    # Budgeting the map off the RESIDENT experts made it a function of residency:
+    # the same row in a later epoch with a different seat count got a different map,
+    # and the stationary context the frozen gate was chosen for quietly failed.
+    # source assertions read CODE, never prose: these comments discuss summarise()
+    # and residency at length, and a substring check over the raw text passes or
+    # fails on the documentation rather than on what runs.
+    import ast as _ast, textwrap as _tw
+
+    def _code(fn) -> str:
+        node = _ast.parse(_tw.dedent(_iP.getsource(fn))).body[0]
+        for n in _ast.walk(node):                     # drop every docstring in the tree
+            body = getattr(n, "body", None)
+            if isinstance(body, list) and body and isinstance(body[0], _ast.Expr) \
+                    and isinstance(getattr(body[0], "value", None), _ast.Constant) \
+                    and isinstance(body[0].value.value, str):
+                n.body = body[1:] or [_ast.Pass()]
+        return _ast.unparse(node)                     # comments never survive the parse
+
+    src_tr, src_an, src_sp = (_code(_tr_mod.System._train_one), _code(_tr_mod.System.answer),
+                              _code(_tr_mod.System._split))
+    assert "self.gate.summarise(plan.ids, min((x.n_tokens for x in" in src_sp, \
         "the map is not sized by the smallest span the law allocated"
-    assert "orientation(summary," in src_tr and "orientation(summary," in src_an, \
-        "training and deployment do not build the context the same way"
+    assert "plan.selections" in src_sp and "resident" not in src_sp, \
+        "the split reads residency, so the prompt depends on what fitted in RAM"
+    for name, src in (("training", src_tr), ("deployment", src_an)):
+        assert "self._split(plan)" in src, f"{name} does not go through the splitter"
+        assert src.index("self._split(plan)") < src.index("self.sched.ensure("), \
+            f"{name} activates experts before the gate has split the input"
+        assert "summarise" not in src, f"{name} generates the map inside the residency window"
     print(f"router        OK  (anchors ordered, spans within input; training shares "
           f"{sorted(s.n_tokens for s in probe_spans)}; span_max clamps the share)")
 
