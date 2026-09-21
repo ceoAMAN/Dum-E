@@ -714,6 +714,37 @@ def main() -> int:
     assert mad_sigma(dirty) < 2 * mad_sigma(clean), "one outlier moved the robust spread"
     assert dirty.std() > 4 * clean.std(), "the std should be the fragile one"
     print("health        OK  (non-finite caught at record time; skipped update is not a loss)")
+
+    # thermal: the baseline must RE-LEARN a sustained normal. A flat 1/n mean
+    # is frozen once n is large, so a machine whose room changes mid-run stays
+    # pinned to a normal that no longer exists and throttles forever after.
+    from dume.chain import ThermalRegulator
+
+    def settled(level, n):
+        r = ThermalRegulator()
+        for _ in range(n):
+            r.observe(level)
+        return r
+
+    r = settled(1.0, 3000)
+    assert abs(r.baseline - 1.0) < 1e-6 and r.pressure(1.0) == 0.0, "settled machine is throttling itself"
+    for _ in range(400):
+        r.observe(2.0)                      # the ROOM warmed and stayed warm
+    assert r.baseline > 1.9, f"a sustained new normal was not re-learned: baseline {r.baseline:.4f}"
+    assert r.pressure(2.0) < 0.05, f"still throttling its own normal: {r.pressure(2.0):.4f}"
+
+    r = settled(1.0, 3000)
+    r.observe(2.0)                          # ...versus a single spike
+    assert r.baseline < 1.001, f"one spike moved the baseline: {r.baseline:.6f}"
+    assert r.pressure(2.0) > 0.9, f"a transient was not throttled: {r.pressure(2.0):.4f}"
+
+    r = ThermalRegulator()
+    for i in range(3000):
+        r.observe(1.0 + (i % 2))            # oscillating: run never accumulates
+    assert r.run == 1.0 and r.volatility > 0.9, f"swing not seen: run {r.run} vol {r.volatility:.3f}"
+    assert r.pressure(2.0) > r.pressure(1.0), "a swinging machine must be throttled hardest"
+    print("thermal       OK  (sustained normal re-learned in 400 reads; one spike moves baseline "
+          "<0.001; oscillation throttled hardest)")
     print("ALL CHECKS PASS")
     return 0
 

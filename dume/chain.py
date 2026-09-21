@@ -169,10 +169,28 @@ class ThermalRegulator:
         pressure = max(0, level - baseline) * (1 + volatility)
 
     Both are means over the run, not constants, and both start at zero, so a
-    cold regulator applies nothing and has to EARN the right to throttle. This
-    is a lifetime mean rather than a window on purpose: unlike reliability,
-    whose subject moves as the model trains, the point where a machine runs
-    happily is a property of the machine."""
+    cold regulator applies nothing and has to EARN the right to throttle.
+
+    The baseline was a flat lifetime mean and could not re-learn (Aman,
+    2026-09-21, on the room going 20C -> 34C mid-session: "need to fix"). A
+    1/n mean is frozen once n is large -- at batch 3000 one reading moves it
+    by 0.0003 -- so a machine whose ROOM changes is pinned to a normal that no
+    longer exists and throttles for the rest of the run. The point where a
+    machine runs happily is a property of the machine AND its environment, and
+    the environment is not stationary.
+
+    So the update is weighted by RUN LENGTH, the count of consecutive reads at
+    the current level, over n:
+
+        baseline += min(1, run / n) * (level - baseline)
+
+    A transient resets run to 1 and moves the baseline by 1/n, as before, so
+    spikes are still throttled. A level that HOLDS accumulates run, and once it
+    has held for a meaningful fraction of the run's history it is by definition
+    the new normal and the baseline follows. Nothing is tuned: the horizon is
+    the history it has to outweigh. A level that oscillates never accumulates
+    run at all, and its volatility is high, so a swinging machine is throttled
+    hardest -- which is what it was throttled for."""
 
     def __init__(self) -> None:
         self.n = 0.0
@@ -180,6 +198,7 @@ class ThermalRegulator:
         self.volatility = 0.0     # mean |change| between consecutive reads
         self.last: Optional[float] = None
         self.peak = 0.0
+        self.run = 0.0            # consecutive reads at the CURRENT level
 
     def observe(self, level: float) -> None:
         level = float(level)
@@ -187,7 +206,9 @@ class ThermalRegulator:
             d = abs(level - self.last)
             self.volatility += (d - self.volatility) / max(self.n, 1.0)
         self.n += 1.0
-        self.baseline += (level - self.baseline) / self.n
+        self.run = self.run + 1.0 if level == self.last else 1.0
+        w = min(1.0, self.run / self.n)
+        self.baseline += w * (level - self.baseline)
         self.last = level
         self.peak = max(self.peak, level)
 
@@ -199,4 +220,4 @@ class ThermalRegulator:
 
     def state(self) -> Dict[str, float]:
         return {"n": self.n, "baseline": self.baseline, "volatility": self.volatility,
-                "peak": self.peak, "last": float(self.last or 0.0)}
+                "peak": self.peak, "last": float(self.last or 0.0), "run": self.run}
