@@ -32,7 +32,8 @@ import math
 from typing import Iterable, List
 
 from . import config as C
-from .models import ExpertPool, active_mb, thermal_state, total_ram_mb, working_set_mb
+from .models import (ExpertPool, active_mb, die_temp, thermal_state, total_ram_mb,
+                     working_set_mb)
 
 
 class Scheduler:
@@ -40,6 +41,7 @@ class Scheduler:
                  update_slope_mb: float = 0.0, slot_mb: float = 0.0):
         self.pool = pool
         self.thermal = None      # a ThermalRegulator, set by System._wire()
+        self.last_k_thermal = 0.0   # what the property last returned: read this to REPORT
         R = total_ram_mb()
         ws = working_set_mb()
         # Aman's law:  space for k  =  R - sqrt(R) - central - gate
@@ -84,6 +86,12 @@ class Scheduler:
     def k_thermal(self) -> float:
         """How many experts the DEVICE is willing to run right now.
 
+        THIS READ HAS A SIDE EFFECT: it advances the regulator. It must happen
+        exactly ONCE per batch or every derivative the regulator takes is in
+        the wrong time unit — it was read twice, here and in the health record,
+        so `self.last_k_thermal` now carries the value to anyone who only wants
+        to report it.
+
         Each unit of thermal PRESSURE takes another root of the RAM bound —
         the same sqrt bracket k_tier, GENERAL_EXPERTS and capacity() are built
         from, so no new constant enters. On k_max=4 that is 4.00 nominal, 2.00
@@ -105,11 +113,16 @@ class Scheduler:
         The regulator RAMPS k toward that bound at the rate the machine itself
         moves, instead of snapping to it, so a single warm read no longer costs
         a residency reshuffle."""
-        lvl = thermal_state()
-        if self.thermal is not None:
-            self.thermal.observe(lvl)
-            return self.thermal.k_thermal(float(self.k_max), lvl)
-        return float(self.k_max) ** (1.0 / (1.0 + lvl))
+        lvl = float(thermal_state())
+        t = die_temp()
+        if self.thermal is None or t is None:
+            # no regulator, or no die sensors on this box: the ordinal is all
+            # there is, and on this machine it is a constant -- see die_temp()
+            self.last_k_thermal = float(self.k_max) ** (1.0 / (1.0 + lvl))
+            return self.last_k_thermal
+        self.thermal.observe(t, lvl)
+        self.last_k_thermal = self.thermal.k_thermal(float(self.k_max))
+        return self.last_k_thermal
 
     def clamp(self, k_wanted: int) -> int:
         return max(1, min(int(k_wanted), self.k_max))

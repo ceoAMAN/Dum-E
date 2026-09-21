@@ -442,29 +442,28 @@ def main() -> int:
     # THE DEVICE'S SIDE OF THE TUG OF WAR over k. k_gate pulls up, the device
     # pulls down, and its input is real: NSProcessInfo's thermal state, not a
     # proxy and not a constant.
-    from dume.models import thermal_state as _ts
+    from dume.models import thermal_state as _ts, die_temp
     from dume.chain import ThermalRegulator
     assert _ts() in (0, 1, 2, 3), f"thermal state out of range: {_ts()}"
+    # THE SENSOR IS REAL. The ordinal is a CONSTANT on this machine -- `fair`
+    # on all 580 samples of a 2900-batch run and all 541 of the next -- so the
+    # regulator built on it never once moved k. Degrees are what moves.
+    t = die_temp()
+    assert t is not None, "no die sensors: the regulator is back on a constant"
+    assert 0.0 < t < 120.0, f"die temperature implausible: {t}"
+
     # THE REGULATOR IS NOT REACTIVE. It measures against where this machine
-    # NORMALLY sits, and how radically it has been moving.
-    steady = ThermalRegulator()
-    for _ in range(50):
-        steady.observe(1)                      # warm, but warm is its normal
-    assert steady.baseline == 1.0 and steady.volatility == 0.0
+    # NORMALLY sits, over the range it has actually worked in.
+    def feed(temps, level=0.0):
+        r = ThermalRegulator()
+        for x in temps:
+            r.observe(x, level)
+        return r
+    steady = feed([52.0] * 200)                # warm, but warm is its normal
     assert steady.pressure() == 0.0, "a machine that always runs warm was throttled for it"
-    climb = ThermalRegulator()
-    for _ in range(40):
-        climb.observe(0)
-    climb.observe(2)
-    assert climb.pressure() > 0.0, "a real climb above the baseline applied nothing"
-    swing = ThermalRegulator()
-    for i in range(40):
-        swing.observe(i % 3)                   # same mean level, far more movement
-    swing.observe(2)
-    assert swing.volatility > climb.volatility, "volatility did not register"
-    assert swing.pressure() > climb.pressure(), \
-        "a swinging machine was not regulated harder than a calm one at the same level"
-    assert ThermalRegulator().pressure(0.0) == 0.0, "a cold regulator invented pressure"
+    assert steady.k_thermal(4.0) == 4.0, "a settled machine did not get the full bound"
+    assert ThermalRegulator().pressure() == 0.0, "a cold regulator invented pressure"
+    assert ThermalRegulator().k_thermal(4.0) == 4.0, "a cold regulator throttled"
 
     # THE SYSTEM'S SIDE: small input -> max k and less time; longer input ->
     # fewer experts, because past one pass another expert buys no coverage and
@@ -715,104 +714,90 @@ def main() -> int:
     assert dirty.std() > 4 * clean.std(), "the std should be the fragile one"
     print("health        OK  (non-finite caught at record time; skipped update is not a loss)")
 
-    # thermal. Three mechanisms, each of which failed in a measured way before:
-    #   (a) the baseline was a flat 1/n mean and could not re-learn -- 400 reads
-    #       at level 2 against a settled 1.0 left it at 1.1176;
-    #   (b) pressure scaled by VOLATILITY, which reacts to every move, not by
-    #       whether the move was abnormal FOR THIS MACHINE;
-    #   (c) k was recomputed from scratch each read, so it snapped.
+    # thermal. The ordinal this all used to run on is inert: measured over 2900
+    # archived batches and 541 live ones, NSProcessInfo returned `fair` every
+    # time, so baseline, volatility and every interval derived from it were
+    # identically zero and k_thermal sat at k_max for the whole run. The device
+    # never cast a vote. Degrees off the die move 52 -> 67 C in the same minute.
     from dume.chain import ThermalRegulator
+    rng = np.random.default_rng(0)
 
-    def settled(level, n):
+    def feed(temps, level=0.0):
         r = ThermalRegulator()
-        for _ in range(n):
-            r.observe(level)
+        for x in temps:
+            r.observe(float(x), level)
         return r
+    # a machine that idles, then works, then settles at its working temperature
+    base = list(45 + rng.normal(0, 0.4, 60)) + list(52 + rng.normal(0, 0.6, 200))
+    settled = feed(base)
+    assert settled.peak - settled.floor > 5.0, "the fixture never established a span"
 
-    r = settled(1.0, 3000)
-    assert abs(r.baseline - 1.0) < 1e-6 and r.pressure(1.0) == 0.0, "settled machine throttles itself"
-    for _ in range(400):
-        r.observe(2.0)                      # the ROOM warmed and stayed warm
-    assert r.baseline > 1.9, f"sustained new normal not re-learned: baseline {r.baseline:.4f}"
-    assert r.pressure(2.0) < 0.05, f"still throttling its own normal: {r.pressure(2.0):.4f}"
+    # SETTLED IS FREE. Not "small": the jitter deadband is the machine's own
+    # mean |z|, so its ripple costs nothing at all on most reads.
+    calm = ThermalRegulator()
+    ps = [calm.observe(float(x)) or calm.pressure() for x in base]
+    tail = ps[120:]
+    assert max(tail) < 0.1, f"a settled machine throttles itself: max p {max(tail):.4f}"
+    assert sum(1 for x in tail if x > 0) < len(tail) // 4, \
+        f"ripple priced on {sum(1 for x in tail if x > 0)}/{len(tail)} settled reads"
+    assert ThermalRegulator().pressure() == 0.0, "a cold regulator invented pressure"
+    assert ThermalRegulator().k_thermal(4.0) == 4.0, "a cold regulator throttled"
 
-    r = settled(1.0, 3000)
-    r.observe(2.0)                          # ...versus a single spike
-    assert r.baseline < 1.001, f"one spike moved the baseline: {r.baseline:.6f}"
-    assert r.pressure(2.0) > 0.9, f"a transient was not throttled: {r.pressure(2.0):.4f}"
+    # REACTION GROWS WITH THE EXCURSION, measured against the SPAN the machine
+    # works over and not against its noise floor. Taken in the noise (mad
+    # 0.33 C here) a 3 C rise scores 8.7 sigma, pressure 26.6, and k collapses
+    # to 1.05 -- on a die that idles at 45 and works at 67.
+    small, big = feed(base + [55.0]), feed(base + [60.0])
+    assert 0.0 < small.pressure() < big.pressure(), \
+        f"not monotone in excursion: {small.pressure():.3f} {big.pressure():.3f}"
+    assert 2.5 < small.k_thermal(4.0) < 3.8, f"a 3 C rise gave k {small.k_thermal(4.0):.3f}"
+    # the same absolute rise on a machine with a WIDER working range costs less
+    wide = feed(list(30 + rng.normal(0, 0.4, 60)) + list(52 + rng.normal(0, 0.6, 200)) + [55.0])
+    assert wide.peak - wide.floor > small.peak - small.floor
+    assert wide.pressure() < small.pressure(), \
+        f"span is not the scale: {wide.pressure():.4f} vs {small.pressure():.4f}"
 
-    # a step that arrives ON SCHEDULE is this machine behaving normally and is
-    # free; the SAME step arriving early is not. Nothing here is a constant --
-    # the schedule is the machine's own mean interval.
-    def stepper(period, reps, early=None):
-        r = ThermalRegulator()
-        for _ in range(reps):
-            for _ in range(period - 1):
-                r.observe(1.0)
-            r.observe(2.0)
-            r.observe(1.0)
-        gap = early if early is not None else period
-        for _ in range(gap - 1):
-            r.observe(1.0)
-        r.observe(2.0)
-        return r
-    on_time = stepper(50, 6)
-    early   = stepper(50, 6, early=5)
-    assert on_time.excess < 0.01, f"an on-schedule step was penalised: {on_time.excess:.3f}"
-    assert early.excess > 3.0, f"an early step was not penalised: {early.excess:.3f}"
-    assert early.pressure(2.0) > 3 * on_time.pressure(2.0), "early and on-time cost the same"
+    # z IS THE RATE TERM. Same temperature, different history: the mean lags, so
+    # a die that has just arrived scores high and one that has been there scores
+    # zero. This is why the explicit first and second derivatives were removed --
+    # measured, they carried 0.8% and 0.6% of the signal.
+    assert big.z > 0.4, f"a fresh 8 C rise did not register: z {big.z:+.4f}"
+    assert abs(feed(base + [60.0] * 400).z) < 1e-9, "the normal never caught up"
 
-    # RADICAL = RADICAL REACTION. The ramp is for drift. Once a step is far out
-    # of hand the ramp is not used at all -- excess is already the ratio by
-    # which the step beat this machine's own interval, so excess/(1+excess)
-    # turns "how radical" straight into "how much of the gap to close", 0 at
-    # normal and ->1 at extreme. No threshold and no k value is named: on a
-    # different k_max the same curve simply lands elsewhere.
-    def shocked(period, early, k_max=4.0):
-        r = ThermalRegulator()
-        for _ in range(6):                  # history: a step every `period` reads
-            for _ in range(period - 1):
-                r.observe(1.0)
-            r.observe(2.0)
-            r.observe(1.0)
-        for _ in range(early - 1):
-            r.observe(1.0)
-        r.k_thermal(k_max, 1.0)             # settle k at the calm target first
-        r.observe(2.0)                      # ...then the step lands
-        return r.k_thermal(k_max, 2.0), r
-    calm_k, _ = shocked(50, 50)
-    hard_k, hard = shocked(50, 5)
-    worst_k, _ = shocked(50, 1)
-    assert calm_k > 3.9, f"an on-schedule step was treated as a shock: k {calm_k:.3f}"
-    assert hard_k < 2.0, f"a step 10x early was ramped into gently: k {hard_k:.3f}"
-    assert worst_k < hard_k < calm_k, f"reaction not monotone in radicality: {worst_k:.2f} {hard_k:.2f} {calm_k:.2f}"
-    # ...but ONLY when tightening. Coming back up stays on the measured pace.
-    back = hard.k_thermal(4.0, 1.0)
-    assert back - hard_k < 0.5 * (4.0 - hard_k), f"k snapped back up after a shock: {hard_k:.2f} -> {back:.2f}"
-    # no k value is baked in: the same shock on a different bound scales with it
-    big_k, _ = shocked(50, 5, k_max=16.0)
-    assert big_k > 2 * hard_k, f"k_max ignored: {big_k:.2f} vs {hard_k:.2f}"
+    # COOLING IS FREE.
+    cool = feed(base + [51.0, 50.0, 49.0, 48.0])
+    assert cool.z < 0, "cooling did not read as cooling"
+    assert cool.pressure() == 0.0 and cool.k_thermal(4.0) == 4.0, "a cooling machine was throttled"
 
-    # k RAMPS. The rate is the machine's own step interval, read per direction:
-    # "levels per move" is the constant 1 on an ordinal 0-3 signal and collapses
-    # the ramp back into a snap (measured: rate_up = rate_down = 1.000).
-    # steps ON SCHEDULE: no radicality, so this isolates the ramp itself.
-    seq = ([1.0] * 99 + [2.0]) * 7
-    def replay(ramped):
-        r = ThermalRegulator(); out = []
-        for l in seq:
-            r.observe(l)
-            out.append(r.k_thermal(4.0, l) if ramped else 4.0 ** (1.0 / (1.0 + r.pressure(l))))
-        return [max(1, int(round(x))) for x in out], r
-    snap_k, _ = replay(False)
-    ramp_k, rr = replay(True)
-    flips = lambda ks: sum(1 for a, b in zip(ks, ks[1:]) if a != b)
-    assert flips(snap_k) > 0, "the snap baseline did not move; the fixture proves nothing"
-    assert flips(ramp_k) == 0, f"k still snapping: {flips(ramp_k)} changes"
-    assert rr.gap_up > 2.0 and rr.gap_down > 2.0, f"intervals collapsed: {rr.gap_up} {rr.gap_down}"
-    assert rr.excess < 0.01, f"the on-schedule fixture drifted off schedule: excess {rr.excess:.3f}"
-    print(f"thermal       OK  (normal re-learned in 400 reads; spike moves baseline <0.001; "
-          f"on-schedule step free, early step {early.excess:.0f}x; k flips {flips(snap_k)} -> 0)")
+    # THE NORMAL RE-LEARNS. Where a machine runs happily is a property of the
+    # machine AND its room, and the room is not stationary.
+    moved = feed(base + [60.0] * 400)
+    assert moved.mean > 59.0, f"sustained new normal not re-learned: {moved.mean:.3f}"
+    assert moved.pressure() == 0.0, f"still throttling its own normal: {moved.pressure():.4f}"
+    assert abs(small.mean - settled.mean) < 0.1, \
+        f"one spike moved the normal: {settled.mean:.4f} -> {small.mean:.4f}"
+
+    # THE OS KEEPS A VETO UNDERNEATH. Apple's number, not ours, and by `serious`
+    # the OS is already throttling, so adding experts worsens its complaint.
+    assert feed(base, level=2.0).k_thermal(4.0) == 1.0, "nothing was out of hand at serious"
+    assert feed(base, level=1.0).k_thermal(4.0) == settled.k_thermal(4.0), \
+        "`fair` was treated as trouble"
+
+    # no k value is baked in: k_max enters only as the base of the root.
+    pr = small.pressure()
+    for km in (4.0, 16.0):
+        assert abs(small.k_thermal(km) - km ** (1.0 / (1.0 + pr))) < 1e-12, f"k_max ignored at {km}"
+
+    # ONE READ PER BATCH. `Scheduler.k_thermal` advances the regulator, so every
+    # quantity above is in units of "one read". It was read twice -- once by the
+    # router and once by the health record -- which halved that clock.
+    users = [l for f in ("dume/train.py", "dume/router.py")
+             for l in open(f) if ".k_thermal" in l and "last_k_thermal" not in l]
+    assert len(users) == 1, f"k_thermal read {len(users)}x outside the scheduler: {users}"
+
+    print(f"thermal       OK  (die {die_temp():.1f} C off real sensors, span {settled.peak - settled.floor:.1f} C; "
+          f"settled max p {max(tail):.3f}; +3 C -> k {small.k_thermal(4.0):.2f}, +8 C -> k {big.k_thermal(4.0):.2f}; "
+          f"normal re-learned to {moved.mean:.1f} C; OS veto at serious)")
     print("ALL CHECKS PASS")
     return 0
 

@@ -147,154 +147,157 @@ class SizeChains:
 
 
 class ThermalRegulator:
-    """The device's thermal pressure, measured against where it NORMALLY sits.
+    """The device's thermal pressure, read in DEGREES off the silicon.
 
-    The raw level is REACTIVE (Aman, 2026-09-20: "don't you feel like it is
-    reactive to all changes"). It answers a reading identically whether the
-    machine has been sitting there all day or just jumped to it, so a box that
-    idles warm is permanently throttled and one that spikes for a single batch
-    is treated like one that has been climbing for an hour. Two measured
-    components fix that:
+    This used to read `NSProcessInfo.thermalState()`, an ordinal 0-3, and on
+    this machine that ordinal is a CONSTANT. Measured over 2900 archived
+    batches and 541 live ones it returned `fair` every single time. Every
+    quantity derived from it was therefore identically zero -- the baseline
+    converged to the one value the level ever took, volatility sat at 0.000,
+    the up/down intervals were never set because no step ever happened, and
+    `k_thermal` went 2.758 -> 4.000 = k_max and stayed there for the rest of
+    the run. **The device never once cast a vote in the tug of war over k.**
 
-      BASELINE - "mean temp, the temp at which the system normally works
-      happily". The running mean of every level this run has seen. Pressure is
-      only what sits ABOVE it, so the regulator costs nothing at the machine's
-      own normal operating point, whatever that turns out to be.
+    The silicon is not constant. `models.die_temp()` reads 24 SoC die sensors
+    and their mean moved 52 -> 56 C inside one minute of the same run, with
+    max(tdie) touching 67. What was inert was the sensor, not the machine.
 
-      VOLATILITY - "the mean of all change in temp per run, to measure how
-      radically it is changing". The running mean of |level - previous level|.
-      A machine whose temperature is swinging needs a firmer hand than one
-      drifting gently to the same place, so it multiplies the response.
+    With degrees the whole apparatus the ordinal needed disappears. There is no
+    baseline-vs-level subtraction, no volatility, no up/down interval means, no
+    `excess`, no ramp and no learned threshold. Those existed to squeeze a rate
+    out of a four-valued signal that has no usable pointwise derivative. A
+    continuous one does, so the regulator is just the signal and its first two
+    derivatives (Aman, 2026-09-21: "f(x) = y'' + y' + c", and on the regulator
+    it replaces, "it is dumb regulators it feels useless"):
 
-        pressure = max(0, level - baseline) * (1 + volatility)
+        span     = peak - floor        the range this machine has actually worked over
+        z        = (T - mean) / span   how far above normal it sits right now
+        pressure = max(0, z - mean|z|)
 
-    Both are means over the run, not constants, and both start at zero, so a
-    cold regulator applies nothing and has to EARN the right to throttle.
+    THE EXPLICIT DERIVATIVES WERE BUILT, MEASURED, AND REMOVED. Both forms
+    failed on measurement rather than on argument:
 
-    The baseline was a flat lifetime mean and could not re-learn (Aman,
-    2026-09-21, on the room going 20C -> 34C mid-session: "need to fix"). A
-    1/n mean is frozen once n is large -- at batch 3000 one reading moves it
-    by 0.0003 -- so a machine whose ROOM changes is pinned to a normal that no
-    longer exists and throttles for the rest of the run. The point where a
-    machine runs happily is a property of the machine AND its environment, and
-    the environment is not stationary.
+      on the READING, d/dread and d2/dread2 are noise. Differencing doubles it
+      each time, and on a calm fixture -- 0.6 C of ripple over a 10 C span -- a
+      SETTLED machine spiked to pressure 2.06 while a real +3 C step scored
+      LESS than idle. The order came out backwards.
 
-    So the update is weighted by RUN LENGTH, the count of consecutive reads at
-    the current level, over n:
+      on the MEAN, they vanish. The mean re-learns at run/n, so at n = 260 its
+      drift is ~0.001 against a z of 0.5. Audited: z carried 97-99% of the
+      signal, the first derivative 0.8-1.9%, the second 0.4-0.7%. A term that
+      moves the answer by half a percent is a mechanism that runs perfectly and
+      does nothing.
 
-        baseline += min(1, run / n) * (level - baseline)
+    They were redundant, not merely weak. z is ALREADY the rate term, because
+    the mean lags: measured at the same temperature, a die that has just reached
+    60 C scores z = +0.504 and one that has been at 60 C for 400 reads scores
+    z = 0.000. A fast reading against a slowly re-learning normal is a high-pass
+    filter whose time constant is the machine's own history. That is where the
+    second-order behaviour actually lives -- in the gap between the two, not in
+    a difference taken on either.
 
-    A transient resets run to 1 and moves the baseline by 1/n, as before, so
-    spikes are still throttled. A level that HOLDS accumulates run, and once it
-    has held for a meaningful fraction of the run's history it is by definition
-    the new normal and the baseline follows. Nothing is tuned: the horizon is
-    the history it has to outweigh. A level that oscillates never accumulates
-    run at all, and its volatility is high, so a swinging machine is throttled
-    hardest -- which is what it was throttled for."""
+    Dividing by the span is what makes the three ADDABLE without an invented
+    coefficient, and that was the last place a constant could have hidden.
+    Degrees cannot be summed with degrees-per-read; fractions of the span can be
+    summed with fractions-per-read, because the read is the clock the regulator
+    acts on.
+
+    The subtraction is the machine's own jitter: the running mean of |z| while
+    it works. Without it a settled machine pays a permanent tax for its own
+    ripple, which is the whole "don't you feel like it is reactive to all
+    changes" complaint the regulator exists to answer. Nothing is configured --
+    a quiet machine reacts to a small move, a noisy one needs a bigger one, and
+    both pay nothing to idle.
+
+    The span, and NOT the mean absolute deviation. The deviation is the noise
+    floor -- measured at 0.33 C on this machine -- so a z-score taken in it
+    makes every real thermal event tens of sigma: a 3 C rise scored z = 8.7,
+    pressure 26.6, and collapsed k to 1.05. A 3 C rise on a die that idles at 45
+    and works at 67 is not an emergency. The span is the range the machine has
+    been measured over, so pressure reaches 1 -- k halved -- when the excursion
+    is the size of the machine's whole working range, and it re-scales itself if
+    the machine ever works harder than it has before.
+
+    Cooling is negative in all three terms and the max() floors it at zero, so a
+    machine that is cool, or heating no faster than it normally does, pays
+    exactly nothing and k sits at k_max. That is the "tendency to get f(x) = 4".
+
+    The mean RE-LEARNS, because the point a machine runs happily is a property
+    of the machine AND its room, and the room is not stationary (Aman, on 20C ->
+    34C mid-session: "need to fix"). The update is weighted by how long the
+    temperature has held the SAME SIDE of the mean, over n:
+
+        mean += min(1, run / n) * (T - mean)
+
+    A transient flips sides, resets run to 1, and moves the mean by 1/n. A
+    genuine shift holds one side, accumulates run, and once it has held for a
+    meaningful fraction of the run's history it IS the new normal. Nothing is
+    tuned: the horizon is the history it has to outweigh.
+
+    That re-learning is also the one real danger of degrees over an ordinal. An
+    ordinal is capped at 3; a die is not capped at anything, and a mean that
+    always follows would normalise its way into a cooked chip. So the OS keeps a
+    veto underneath, at `serious` -- Apple's number, not one we chose, and by
+    then the OS is already throttling, so adding experts worsens exactly what it
+    is complaining about."""
+
+    SERIOUS = 2.0            # NSProcessInfoThermalStateSerious
 
     def __init__(self) -> None:
         self.n = 0.0
-        self.baseline = 0.0       # mean level
-        self.volatility = 0.0     # mean |change| between reads: HOW MUCH it moves at all
+        self.mean = 0.0          # this machine's normal die temperature, in C
+        self.dev = 0.0           # mean |z|: this machine's own jitter, the deadband
+        self.run = 0.0           # consecutive reads on the same side of the mean
         self.last: Optional[float] = None
         self.peak = 0.0
-        self.run = 0.0            # consecutive reads at the CURRENT level
-        self.gap_up = 0.0         # mean reads BETWEEN upward steps   -> how fast it heats
-        self.gap_down = 0.0       # mean reads BETWEEN downward steps -> how fast it cools
-        self.since_up = 0.0
-        self.since_down = 0.0
-        self.n_up = 0.0
-        self.n_down = 0.0
-        self.excess = 0.0         # how far the last step beat its own mean interval
-        self.k: Optional[float] = None   # the ramped k, carried between reads
+        self.floor = 0.0         # peak - floor is the SPAN: the scale z is taken in
+        self.level = 0.0         # the OS ordinal, kept only for its veto
+        self.z = 0.0             # heat now, as a fraction of the span above normal
 
-    def observe(self, level: float) -> None:
-        level = float(level)
-        self.since_up += 1.0
-        self.since_down += 1.0
-        if self.last is not None:
-            d = level - self.last
-            self.volatility += (abs(d) - self.volatility) / max(self.n, 1.0)
-            if d > 0:
-                self.excess = max(0.0, self.gap_up / self.since_up - 1.0) if self.gap_up else 0.0
-                self.n_up += 1.0
-                self.gap_up += (self.since_up - self.gap_up) / self.n_up
-                self.since_up = 0.0
-            elif d < 0:
-                self.excess = max(0.0, self.gap_down / self.since_down - 1.0) if self.gap_down else 0.0
-                self.n_down += 1.0
-                self.gap_down += (self.since_down - self.gap_down) / self.n_down
-                self.since_down = 0.0
-            else:
-                self.excess = 0.0          # it did not move: nothing to react to
+    def observe(self, temp: float, level: float = 0.0) -> None:
+        t = float(temp)
+        self.level = float(level)
+        if self.last is None:
+            # the first read IS the normal. Starting the mean at zero would make
+            # the first deviation the whole temperature, ~50 C of spread that
+            # then takes hundreds of reads to decay back out of the scale.
+            self.n, self.mean, self.run = 1.0, t, 1.0
+            self.last, self.peak, self.floor = t, t, t
+            return
+        # deviation is measured against the mean BEFORE this read moves it, so
+        # the scale is never flattered by the sample that is widening it
         self.n += 1.0
-        self.run = self.run + 1.0 if level == self.last else 1.0
-        w = min(1.0, self.run / self.n)
-        self.baseline += w * (level - self.baseline)
-        self.last = level
-        self.peak = max(self.peak, level)
+        self.run = (self.run + 1.0 if self.last is not None
+                    and (t >= self.mean) == (self.last >= self.mean) else 1.0)
+        self.mean += min(1.0, self.run / self.n) * (t - self.mean)
+        self.peak, self.floor = max(self.peak, t), min(self.floor, t)
+        span = self.peak - self.floor
+        if span > 0.0:
+            self.z = (t - self.mean) / span
+        self.dev += (abs(self.z) - self.dev) / self.n
+        self.last = t
 
-    def pressure(self, level: Optional[float] = None) -> float:
-        """How hard to throttle, in the units k_thermal takes its root in. Zero
-        at or below the baseline: normal operation is free.
+    def out_of_hand(self) -> bool:
+        """The OS's own call, underneath ours. A third party's number."""
+        return self.level >= self.SERIOUS
 
-        Two independent multipliers sit on that deviation, and they answer
-        different questions:
+    def pressure(self) -> float:
+        """How far above its own normal this die sits, as a fraction of the range
+        it works over, less the jitter it shows while doing nothing. Zero when
+        cool or merely steady: normal operation is free."""
+        return max(0.0, self.z - self.dev)
 
-          VOLATILITY - how much this machine moves AT ALL. A machine whose
-          temperature is swinging needs a firmer hand than one drifting gently
-          to the same place.
+    def k_thermal(self, k_max: float) -> float:
+        """How many experts the device is willing to run right now.
 
-          EXCESS - whether the LAST step was abnormal for this machine, i.e.
-          arrived sooner than its own mean interval in that direction. A
-          machine heating at the pace it always heats at is behaving normally
-          and pays nothing extra for it; the same step arriving early does.
-
-        They are added, not multiplied, so neither can swamp the other: a
-        steady machine pays 1x, a swinging one pays for the swing, and an
-        early step pays for the surprise on top."""
-        cur = float(self.last if level is None else level)
-        return max(0.0, cur - self.baseline) * (1.0 + self.volatility + self.excess)
-
-    def k_thermal(self, k_max: float, level: Optional[float] = None) -> float:
-        """The device's k, RAMPED toward its target rather than snapped to it.
-
-        The ramp rate is the rate this machine itself moves, per direction, and
-        the two are not assumed equal: k climbs back at the pace it COOLS and
-        falls at the pace it HEATS.
-
-        The rate has to be read as an INTERVAL. macOS publishes the level as an
-        ordinal 0-3, so a move is always exactly one step and "levels per move"
-        is the constant 1 for every machine alive -- measured on the archived
-        run it gave rate_up = rate_down = 1.000 and the ramp degenerated back
-        into a snap. The interval between steps is where the speed actually
-        lives: one step per 50 reads is 1/50, one per 5 reads is ten times
-        that. Rate and gap are reciprocals, so this is the same quantity read
-        in the units the signal exists in.
-
-        Until a direction has been seen there is no measured interval to ramp
-        at, so k snaps -- an unmeasured rate is not invented."""
-        target = float(k_max) ** (1.0 / (1.0 + self.pressure(level)))
-        if self.k is None:
-            self.k = target
-            return self.k
-        d = target - self.k
-        gap = self.gap_down if d > 0 else self.gap_up   # rising k <=> the machine cooled
-        w = 1.0 if gap <= 0.0 else min(1.0, 1.0 / gap)
-        if d < 0:
-            # TIGHTENING ONLY. A radical departure is not ramped into: the
-            # ramp fraction rises with excess, and excess is already the ratio
-            # by which the step beat this machine's own interval, so a step ten
-            # times early carries w to 0.9 and one far past that snaps outright.
-            # Relaxing back up stays on the measured cooling pace regardless --
-            # a machine is allowed to be quick to protect itself and slow to
-            # trust that it is safe.
-            w = max(w, self.excess / (1.0 + self.excess))
-        self.k += w * d
-        return self.k
+        Each unit of pressure takes another root of the RAM bound -- the same
+        sqrt bracket k_tier, GENERAL_EXPERTS and capacity() are built from, so
+        no new constant enters here either."""
+        if self.out_of_hand():
+            return 1.0
+        return float(k_max) ** (1.0 / (1.0 + self.pressure()))
 
     def state(self) -> Dict[str, float]:
-        return {"n": self.n, "baseline": self.baseline, "volatility": self.volatility,
-                "peak": self.peak, "last": float(self.last or 0.0), "run": self.run,
-                "gap_up": self.gap_up, "gap_down": self.gap_down, "excess": self.excess,
-                "k": float(self.k if self.k is not None else 0.0)}
+        return {"n": self.n, "mean": self.mean, "dev": self.dev, "run": self.run,
+                "peak": self.peak, "floor": self.floor, "last": float(self.last or 0.0),
+                "level": self.level, "z": self.z, "pressure": self.pressure()}

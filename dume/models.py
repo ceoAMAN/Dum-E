@@ -165,6 +165,109 @@ def thermal_state() -> int:
         return 0
 
 
+_DIES = None             # (iokit, client, [service]) resolved once; False means unavailable
+_IOKIT_FW = "/System/Library/Frameworks/IOKit.framework/IOKit"
+_CF_FW = "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+_UTF8 = 0x08000100
+_TEMP = 15               # kIOHIDEventTypeTemperature
+
+
+def _open_dies():
+    """Bind this SoC's die thermometers through IOKit's HID event system.
+
+    `thermal_state()` is an ordinal and, on this machine, a CONSTANT: measured
+    over 2900 archived batches and 541 live ones it returned `fair` every single
+    time, so its baseline, its volatility and every derivative taken of it are
+    identically zero. The regulator built on it has never cast a vote. The
+    silicon underneath is not constant at all -- 52 to 67 C within a minute of
+    the same run.
+
+    The sensors are matched on HID usage page 0xff00 / usage 5, the temperature
+    page, and read with kIOHIDEventTypeTemperature. This needs NO sudo and no
+    subprocess, which is what the old docstring here got wrong: it claimed
+    degrees were unavailable because `powermetrics` needs root, and never tried
+    the HID path every Mac monitor actually uses.
+
+    Only `tdie` services are kept. The others are board and device sensors, and
+    two of them (`tdev1`) read -22 C, which is not a temperature.
+
+    These are PRIVATE symbols. They have been stable for a decade, but the whole
+    probe is wrapped and any failure falls back to the ordinal, exactly as
+    thermal_state() falls back when Foundation is missing."""
+    import ctypes
+    from ctypes import (c_void_p, c_int, c_int32, c_uint32, c_uint64, c_double,
+                        c_long, c_char_p)
+    iokit, cf = ctypes.CDLL(_IOKIT_FW), ctypes.CDLL(_CF_FW)
+    for lib, fn, res, args in [
+        (iokit, "IOHIDEventSystemClientCreate", c_void_p, [c_void_p]),
+        (iokit, "IOHIDEventSystemClientSetMatching", c_int, [c_void_p, c_void_p]),
+        (iokit, "IOHIDEventSystemClientCopyServices", c_void_p, [c_void_p]),
+        (iokit, "IOHIDServiceClientCopyProperty", c_void_p, [c_void_p, c_void_p]),
+        (iokit, "IOHIDServiceClientCopyEvent", c_void_p, [c_void_p, c_int, c_uint32, c_uint64]),
+        (iokit, "IOHIDEventGetFloatValue", c_double, [c_void_p, c_uint32]),
+        (cf, "CFStringCreateWithCString", c_void_p, [c_void_p, c_char_p, c_uint32]),
+        (cf, "CFNumberCreate", c_void_p, [c_void_p, c_int, c_void_p]),
+        (cf, "CFDictionaryCreate", c_void_p, [c_void_p, c_void_p, c_void_p, c_long, c_void_p, c_void_p]),
+        (cf, "CFArrayGetCount", c_long, [c_void_p]),
+        (cf, "CFArrayGetValueAtIndex", c_void_p, [c_void_p, c_long]),
+        (cf, "CFStringGetCString", c_int, [c_void_p, c_char_p, c_long, c_uint32]),
+    ]:
+        f = getattr(lib, fn)
+        f.restype, f.argtypes = res, args
+    text = lambda t: cf.CFStringCreateWithCString(None, t.encode(), _UTF8)
+
+    def number(n):
+        v = c_int32(n)
+        return cf.CFNumberCreate(None, 3, ctypes.byref(v))
+
+    keys = (c_void_p * 2)(text("PrimaryUsagePage"), text("PrimaryUsage"))
+    vals = (c_void_p * 2)(number(0xff00), number(5))
+    client = iokit.IOHIDEventSystemClientCreate(None)
+    if not client:
+        return False
+    iokit.IOHIDEventSystemClientSetMatching(
+        client, cf.CFDictionaryCreate(None, keys, vals, 2, None, None))
+    svcs = iokit.IOHIDEventSystemClientCopyServices(client)
+    if not svcs:
+        return False
+    buf, dies = ctypes.create_string_buffer(128), []
+    for i in range(cf.CFArrayGetCount(svcs)):
+        svc = cf.CFArrayGetValueAtIndex(svcs, i)
+        name = iokit.IOHIDServiceClientCopyProperty(svc, text("Product"))
+        if name and cf.CFStringGetCString(name, buf, 128, _UTF8) and b"tdie" in buf.value:
+            dies.append(svc)
+    return (iokit, client, dies) if dies else False
+
+
+def die_temp() -> Optional[float]:
+    """MEAN die temperature in C, or None where the sensors are unreachable.
+
+    The mean, not the max. Measured over a 60 s trace at 5 s spacing while
+    training, max(tdie) had std 1.29 C and 4.08 C of range against mean(tdie)'s
+    0.36 C and 1.13 C: the max is a per-core spike detector, and at a control
+    interval of one read per batch it samples noise rather than heat. The mean
+    is 3.6x quieter and still tracks the real excursion.
+
+    Battery temperature is also sudo-free (`ioreg -rn AppleSmartBattery`) and is
+    NOT usable: 31.19 -> 31.20 C over five minutes at full load. The gas gauge
+    is too far from the die to see the work."""
+    global _DIES
+    if _DIES is None:
+        try:
+            _DIES = _open_dies()
+        except Exception:                                # noqa: BLE001
+            _DIES = False
+    if _DIES is False:
+        return None
+    iokit, _client, svcs = _DIES
+    try:
+        evs = [iokit.IOHIDServiceClientCopyEvent(s, _TEMP, 0, 0) for s in svcs]
+        vals = [iokit.IOHIDEventGetFloatValue(e, _TEMP << 16) for e in evs if e]
+    except Exception:                                    # noqa: BLE001
+        return None
+    return float(sum(vals) / len(vals)) if vals else None
+
+
 def total_ram_mb() -> float:
     out = subprocess.check_output(["sysctl", "-n", "hw.memsize"], text=True).strip()
     return float(int(out)) / 2**20
