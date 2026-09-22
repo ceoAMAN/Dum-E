@@ -1,0 +1,63 @@
+{
+ "run": "run_20260922_final",
+ "finished": "2026-09-22T12:07:57",
+ "batches": 3767,
+ "clock_tokens": 639338,
+ "target": 500000,
+ "code": {
+  "head": "473031e",
+  "run_commit": "0666188",
+  "branch": "symbiosis-curriculum",
+  "regime": "die-temperature thermal regulator; heat scaled by fraction of run remaining"
+ },
+ "decisions": {
+  "HELDOUT": 945,
+  "ADMIT": 2381,
+  "REFUSE": 441
+ },
+ "health_records": 753,
+ "losses": {
+  "gate_loss": {
+   "points": 2381,
+   "first10": 0.3868,
+   "last10": 0.1545
+  },
+  "expert_loss": {
+   "points": 1243,
+   "first10": 0.0006,
+   "last10": 0.0229
+  },
+  "central_loss": {
+   "points": 2822,
+   "first10": 1.2801,
+   "last10": 0.3147
+  }
+ },
+ "final": {
+  "k": 2.0,
+  "k_thermal": 4.0,
+  "thermal": 54.617,
+  "thermal_mean": 54.939,
+  "thermal_p": 0.0,
+  "thermal_z": -0.023,
+  "run_left": 0.0,
+  "clone_frac": 0.01,
+  "delta_mad": 0.08,
+  "delta_neg_frac": 0.865,
+  "expert_updates": 1242.0,
+  "update_frac": 0.55,
+  "reliability_obs": 65985.0,
+  "standing_n": 9129.0,
+  "rho": 0.613,
+  "timeline_a": 0.299
+ },
+ "thermal": {
+  "die_min": 52.511,
+  "die_max": 60.84,
+  "k_thermal_min": 3.422,
+  "k_thermal_distinct": 79,
+  "os_ordinal_distinct": 1,
+  "pressure_fired_pct": 15.7
+ },
+ "state_version": 7
+}
