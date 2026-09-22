@@ -428,7 +428,7 @@ story += [TBL([
   ["archive 20260921_1856", "3,156", "506,242", "The 1M-token supervisor line."],
   ["archive 20260921_2145", "542", "94,641", "500k run on caf80b1; stopped deliberately to fix the thermal sensor."],
   ["archive 20260921_2242", "216", "37,292", "Restarted on 6e2adda; stopped again to add the run-fraction scaling."],
-  ["run_20260922_final", "3,767", "639,338", "THE PAPER RUN. Commit 0666188, clean tree, rc=0."],
+  ["run_20260922_final", "3,767", "639,338", "THE PAPER RUN. Commit 089be50, clean tree, rc=0."],
 ], [40*mm, 22*mm, 24*mm, 82*mm], align=[1,2])]
 story += [P("The final run overshot its 500,000-token target to 639,338 because the supervisor sized its cycle from a "
             "146 tokens-per-batch estimate and the run actually averaged 170. Overshoot is harmless; the target is a floor.", "small")]

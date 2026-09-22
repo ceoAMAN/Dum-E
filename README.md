@@ -258,7 +258,7 @@ on. The system decides whether experts are worth activating at all:
 ## The run
 
 3,767 batches, **639,338 tokens**, ~10.5 hours, clean tree, exit 0. Commit
-`0666188`, `logs/DIRTY` empty, so it is reproducible from a commit.
+`089be50`, `logs/DIRTY` empty, so it is reproducible from a commit.
 
 | | Previous baseline | This run |
 |---|---|---|

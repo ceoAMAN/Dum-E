@@ -6,7 +6,7 @@
  "target": 500000,
  "code": {
   "head": "473031e",
-  "run_commit": "0666188",
+  "run_commit": "089be50",
   "branch": "symbiosis-curriculum",
   "regime": "die-temperature thermal regulator; heat scaled by fraction of run remaining"
  },
