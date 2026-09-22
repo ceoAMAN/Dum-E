@@ -146,6 +146,17 @@ class Health:
         self.alarms = [a for a in self.alarms if a.startswith("NONFINITE")] + alarms
         if self.batch % C.HEALTH_EVERY == 0:
             self.print()
+            # ...and the record itself is not history either. `rec` was built in
+            # __init__ and never cleared, so a field written CONDITIONALLY kept
+            # its last value forever and every later record repeated it as if it
+            # had just been measured. Measured over the 639k run: `graded` was
+            # 1.0 on 100% of 753 records because it is only ever assigned on the
+            # admit path and a refusal cannot clear it; `imitate_loss` repeated
+            # on 44% of consecutive records and `expert_loss` on 16%, so those
+            # curves plotted smoother than the run actually was. This is the
+            # same fix as the one above, which the comment above already argues
+            # for -- it was applied to `alarms` and not to `rec`.
+            self.rec.clear()
         return alarms
 
     def print(self) -> None:

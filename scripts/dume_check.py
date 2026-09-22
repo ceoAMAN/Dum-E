@@ -712,6 +712,31 @@ def main() -> int:
     assert abs(mad_sigma(clean) - clean.std()) < 0.02, "MAD disagrees with std on clean data"
     assert mad_sigma(dirty) < 2 * mad_sigma(clean), "one outlier moved the robust spread"
     assert dirty.std() > 4 * clean.std(), "the std should be the fragile one"
+    # THE RECORD IS NOT HISTORY. `rec` was built once and never cleared, so a
+    # field written CONDITIONALLY kept its last value forever and every later
+    # record repeated it as if freshly measured. Measured over the 639k run:
+    # `graded` was 1.0 on 100% of 753 records (it is only assigned on the admit
+    # path, and a refusal cannot clear it), `imitate_loss` repeated on 44% of
+    # consecutive records, `expert_loss` on 16%.
+    class _Rel:
+        def total_obs(self): return 1.0
+        def flatness(self): return None
+    h, rel = Health(), _Rel()
+    for i in range(C.HEALTH_EVERY):          # window 1: the field is measured
+        h.put(sometimes=1.0)
+        h.tick(float(i), rel)
+    assert "sometimes" not in h.rec, "a conditional field survived its own window"
+    for i in range(C.HEALTH_EVERY - 1):      # window 2: it is NOT measured
+        h.tick(float(i), rel)
+    assert "sometimes" not in h.rec, "a field not measured this window was reported anyway"
+    # and a field the batch DOES write every time is still there
+    h.put(always=2.0)
+    assert h.rec.get("always") == 2.0, "clearing ate a field written this window"
+    # `graded` must be able to say 0. It is in the base dict, not the admit path.
+    src = open("dume/train.py").read()
+    base = src.split('rec: Dict[str, float] = {')[1].split('}')[0]
+    assert '"graded": 0.0' in base, "graded is not written unconditionally — it cannot report a refusal"
+
     print("health        OK  (non-finite caught at record time; skipped update is not a loss)")
 
     # thermal. The ordinal this all used to run on is inert: measured over 2900

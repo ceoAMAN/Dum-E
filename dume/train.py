@@ -341,7 +341,11 @@ class System:
         place = AllocLaw.placement(self.standing.rank(self.geo.domain()))
         u_best = max([place.get(sel.eid, 0.5) for sel in sels], default=0.5)
         tl = self.band.decide(self.alloc, len(plan.ids), u_best)
-        rec: Dict[str, float] = {"k": len(sels), "k_wanted": plan.k_wanted, "T": len(plan.ids), "M": len(y),
+        # written UNCONDITIONALLY, 0.0 by default. It used to be assigned only
+        # on the admit path, so a refusal did not write it at all and the last
+        # 1.0 stood -- the field could not express the event it is named for.
+        rec: Dict[str, float] = {"graded": 0.0,
+                                 "k": len(sels), "k_wanted": plan.k_wanted, "T": len(plan.ids), "M": len(y),
                                  "rho": sc.rho, "heldout": float(heldout), "admitted": float(sc.admitted),
                                  "trust": trust, "timeline_a": self.band.rate()}
         if self.band.last_gain is not None:
