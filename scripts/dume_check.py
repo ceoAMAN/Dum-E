@@ -14,6 +14,7 @@ import sys
 from pathlib import Path
 
 import math
+import re
 
 from types import SimpleNamespace
 
@@ -732,6 +733,15 @@ def main() -> int:
     # and a field the batch DOES write every time is still there
     h.put(always=2.0)
     assert h.rec.get("always") == 2.0, "clearing ate a field written this window"
+    # EVERY MEASURED LOSS REACHES THE BATCH LINE. The health record carries a
+    # conditional field forward, so the per-batch line is the honest source --
+    # and imitate_loss was missing from it, which is why its only record was the
+    # 44%-stale one. A loss with no per-batch source cannot be reconstructed.
+    tsrc = open("dume/train.py").read()
+    printed = tsrc.split("losses = ")[1].split(")\n")[0]
+    for loss in re.findall(r'rec\["(\w+_loss)"\]', tsrc):
+        assert loss in printed, f"{loss} is recorded but never printed per batch — health is its only source"
+
     # `graded` must be able to say 0. It is in the base dict, not the admit path.
     src = open("dume/train.py").read()
     base = src.split('rec: Dict[str, float] = {')[1].split('}')[0]
