@@ -1,13 +1,41 @@
 # Dum-E
 
-A 157B-parameter mixture of experts that runs on one laptop.
+**A self-supervising horizontal mixture-of-experts architecture for consumer
+hardware.**
 
 A Qwen2.5-0.5B gate routes over 100 Qwen2.5-1.5B LoRA experts into a Qwen3-4B
-synthesiser, on an Apple M4 with 16 GB of unified memory. It fits because the
-100 experts are LoRA adapters over a single frozen 4-bit base — 35 MB each, not
-1.5B weights each — so the pool costs 3.5 GB of disk and one resident base.
+synthesiser. Reference implementation on an Apple M4 with 16 GB of unified
+memory.
 
-The architecture is ordinary. The rule it is built under is not.
+### Horizontal, not vertical
+
+In a conventional MoE the experts are FFN sub-blocks *inside* one transformer's
+layers, routed per token, all resident in one forward pass. Scale demands a
+machine that can hold the whole network at once, and `k` — the number of experts
+a token activates — is fixed at design time.
+
+Dum-E is horizontal. An expert is a **whole model**, not a sub-block. It is
+activated as a unit, reads its own fragment of the input rather than a token
+stream, and writes a note in text. A separate synthesiser composes the notes.
+Nothing routes inside a forward pass, so nothing requires the pool to be
+co-resident: experts are paged from disk into unified memory in cycles, so the
+pool is bounded by disk rather than by RAM.
+
+That makes the memory ceiling a **scheduling problem instead of an architectural
+one**, which is the property consumer hardware needs. Here the pool is nominally
+~157B parameters against 16 GB of RAM. It fits because the 100 experts are LoRA
+adapters over a single frozen 4-bit base — 35 MB each, not 1.5B weights each —
+so the pool costs 3.5 GB of disk and one resident base, and because `k_max` is
+fitted to the machine rather than chosen for it.
+
+And `k` is not fixed. It is the system's primary observable: a tug of war between
+what the input needs, what memory permits and what the silicon's temperature
+allows, re-decided every batch. A correct run drives it *down* — when
+apex-nadir predicts the experts buy nothing, `k` is zero and the synthesiser
+answers alone. On the run below that reached 30.4% of inputs.
+
+The architecture is the contribution. The rule it is built under is the other
+one.
 
 > **No quantity in this system is a number anyone chose.**
 
@@ -29,6 +57,7 @@ described below.
 
 ## Contents
 
+- [Horizontal, not vertical](#horizontal-not-vertical)
 - [Specification](#specification)
 - [How it works](#how-it-works)
 - [The run](#the-run)

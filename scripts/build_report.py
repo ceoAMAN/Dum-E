@@ -372,14 +372,19 @@ F, T = fin["final"], fin["thermal"]
 
 story = []
 story += [P("Dum-E", "title"),
-          P("A 157 B-parameter mixture of experts on a 16 GB laptop<br/>"
+          P("A self-supervising horizontal mixture-of-experts architecture for consumer hardware<br/>"
             "Run report, specification changes, and the final configuration for the paper", "sub"),
           RULEROW(), Spacer(1, 10)]
 
 story += [P("Summary", "h1")]
 story += [P(
- "Dum-E routes a Qwen2.5-0.5B gate over 100 Qwen2.5-1.5B LoRA experts into a Qwen3-4B synthesiser, "
- "entirely on one Apple M4 with 16 GB of unified memory. The architecture is ordinary; the discipline is not. "
+ "Dum-E routes a Qwen2.5-0.5B gate over 100 Qwen2.5-1.5B LoRA experts into a Qwen3-4B synthesiser. "
+ "It is HORIZONTAL: an expert is a whole model, activated as a unit, reading its own fragment of the input "
+ "and writing a note in text, rather than an FFN sub-block routed per token inside one forward pass. Nothing "
+ "routes within a pass, so nothing requires the pool to be co-resident -- experts page from disk into unified "
+ "memory in cycles, and the memory ceiling becomes a scheduling problem instead of an architectural one. "
+ "That is the property consumer hardware needs, and the reference implementation runs on one Apple M4 with "
+ "16 GB. The discipline is the other contribution. "
  "Almost no quantity in the system is a number anyone chose. <b>k</b> comes from a RAM fit, the allocation law "
  "from a log-log regression that refuses itself when inadmissible, the reward from paired cross-entropy deltas "
  "rather than cosine self-agreement, the span bound from a measured backward-pass slope, and — as of this run — "
